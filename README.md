@@ -135,6 +135,8 @@ The background loop executes non-synchronized tasks immediately and delays synch
 
 ## Viser Integration Example
 
+![Orchestrion Viser Demo](assets/orchestrion.gif)
+
 See:
 
 - `integrations/viser/viser_modular_robot_task.py`

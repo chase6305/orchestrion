@@ -87,7 +87,7 @@ if __name__ == "__main__":
         executor_owned=executor,
     )
     supervisior.initialize()
-
+    from IPython import embed; embed()
     # Generate trajectory from init_qpos to target_qpos
     steps = 200
     pick_traj = [

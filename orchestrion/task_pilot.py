@@ -277,9 +277,10 @@ class TaskPilot(object):
 
                 # Else execute this
                 if task.srv_name in self._task_map:
-                    task: GenericTask = self._task_map[task.srv_name]
+                    request_id, content = task.request_id, task.content
+                    mapped_task: GenericTask = self._task_map[task.srv_name]
                     # TODO: Handle exceptions here
-                    task.invoke_async(task.request_id, task.content)
+                    mapped_task.invoke_async(request_id, content)
 
             # Update the tasks
             local_tasks_sync = remaining_tasks
