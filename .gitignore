@@ -1,0 +1,77 @@
+# Python cache and artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.dll
+
+# Packaging and build outputs
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+wheels/
+pip-wheel-metadata/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Virtual environments and local env files
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# Test, coverage, and type-check caches
+.pytest_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+
+# Python tools
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+__pypackages__/
+
+# Framework and docs byproducts
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+instance/
+.webassets-cache
+.scrapy
+docs/_build/
+site/
+
+# IDE/editor
+.vscode/
+.vs/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# AI notes
+CLAUDE.md
+GEMINI.md

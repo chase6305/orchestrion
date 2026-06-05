@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orchestrion"
+version = "0.1.0"
+description = "A framework for orchestrating robot tasks and managing function calls with synchronization options."
+authors = [
+    { name = "Jietao Chen" }
+]
+readme = "README.md"
+requires-python = ">=3.7"

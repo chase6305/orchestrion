@@ -1,0 +1,10 @@
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 120
+UseTab: Never
+Standard: c++17
+ContinuationIndentWidth: 4
+AccessModifierOffset: -4
+BinPackParameters: false
+SortIncludes: true
+AlignTrailingComments: true
