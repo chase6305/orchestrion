@@ -1,199 +1,350 @@
+import threading
 import time
-import queue
+
+import pytest
+
 from orchestrion.tasks.modular_reduced_robot_task import (
     ModularReducedRobotTask,
     SubModuleTask,
 )
 
 
-def test_modular_robot_task_basic():
-    print("[Test] Creating submodules...")
-    sub1 = SubModuleTask()
-    sub1.name = "arm"
-    sub1.dof_begin = 0
-    sub1.dof_end = 3
-    sub2 = SubModuleTask()
-    sub2.name = "gripper"
-    sub2.dof_begin = 3
-    sub2.dof_end = 4
-    submodules = [sub1, sub2]
+class RobotTaskStub(ModularReducedRobotTask):
+    def _on_robot_state_bg_thread(self, jps, jps_move_id):
+        pass
 
-    print(f"[Test] Submodules: {[sub.name for sub in submodules]}")
+    def _on_initial_state_bg_thread(self, jps):
+        pass
 
-    # Initial joint positions
-    init_q = [0.0, 0.0, 0.0, 0.0]
-    print(f"[Test] Initial joint positions: {init_q}")
-    robot_task = ModularReducedRobotTask(init_q, submodules)
-    robot_task.initialize()
-    print("[Test] ModularReducedRobotTask initialized.")
 
-    # Test move_sub_module for arm
-    arm_traj = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
-    print(f"[Test] Sending arm trajectory: {arm_traj}")
-    move_id = robot_task.move_sub_module(
-        "arm", [q + [0.0] for q in arm_traj], interval=0.01
+class RecordingRobotTaskStub(RobotTaskStub):
+    def __init__(self, *args, **kwargs):
+        self.updates = []
+        super().__init__(*args, **kwargs)
+
+    def _on_robot_state_bg_thread(self, jps, jps_move_id):
+        self.updates.append(jps.copy())
+
+
+def make_robot(interval=0.005):
+    main = SubModuleTask(name="arm", dof_begin=0, n_dof=3)
+    gripper = SubModuleTask(name="gripper", dof_begin=3, n_dof=1)
+    return RobotTaskStub([0.0] * 4, main, [gripper], interval=interval)
+
+
+@pytest.mark.parametrize("interval", [0.0, -0.01, float("nan"), float("inf")])
+def test_scheduler_rejects_invalid_interval(interval):
+    with pytest.raises(ValueError, match="interval"):
+        make_robot(interval)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), "0.0", True])
+def test_robot_rejects_invalid_initial_joints(value):
+    with pytest.raises(ValueError, match="Initial joints"):
+        RobotTaskStub(
+            [value, 0.0],
+            SubModuleTask("arm", 0, 1),
+            [SubModuleTask("gripper", 1, 1)],
+        )
+
+
+def test_module_layout_rejects_duplicate_name_and_overlapping_dofs():
+    main = SubModuleTask(name="arm", dof_begin=0, n_dof=3)
+    with pytest.raises(ValueError, match="names"):
+        RobotTaskStub(
+            [0.0] * 4,
+            main,
+            [SubModuleTask(name="arm", dof_begin=3, n_dof=1)],
+        )
+    with pytest.raises(ValueError, match="overlap"):
+        RobotTaskStub(
+            [0.0] * 4,
+            main,
+            [SubModuleTask(name="gripper", dof_begin=2, n_dof=1)],
+        )
+
+
+@pytest.mark.parametrize("name", ["", 1, None])
+def test_module_layout_rejects_invalid_names(name):
+    with pytest.raises(ValueError, match="name"):
+        RobotTaskStub([0.0], SubModuleTask(name, 0, 1), [])
+
+
+@pytest.mark.parametrize(
+    "dof_begin,n_dof", [(0.0, 1), (0, 1.0), (False, 1), (0, True)]
+)
+def test_module_layout_rejects_non_integer_dof_ranges(dof_begin, n_dof):
+    with pytest.raises(TypeError, match="integers"):
+        RobotTaskStub([0.0], SubModuleTask("arm", dof_begin, n_dof), [])
+
+
+@pytest.mark.parametrize("interval", [0.0, -0.01, float("nan"), float("inf")])
+def test_motion_rejects_invalid_interval(interval):
+    robot = make_robot()
+    assert robot.move_joint_trajectory_async([[0.0, 0.0, 0.0]], interval) == -1
+    assert robot.move_submodule_trajectory_async("gripper", [[0.0]], interval) == -1
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), "0.1", True])
+def test_motion_rejects_non_finite_or_non_numeric_joints(value):
+    robot = make_robot()
+    assert robot.move_joint_trajectory_async([[value, 0.0, 0.0]]) == -1
+    assert robot.move_submodule_trajectory_async("gripper", [[value]]) == -1
+
+
+@pytest.mark.parametrize("endpoints", [[], [1.0], [True]])
+def test_main_motion_rejects_invalid_endpoint_types(endpoints):
+    robot = make_robot()
+    assert (
+        robot.move_joint_trajectory_async(
+            [[0.0, 0.0, 0.0]], endpoint_index=endpoints
+        )
+        == -1
     )
-    print(f"[Test] move_id for arm: {move_id}")
-    assert move_id >= 0
-
-    # Test move_sub_module for gripper
-    grip_traj = [[0.0, 0.0, 0.0, 0.7], [0.0, 0.0, 0.0, 0.8]]
-    print(f"[Test] Sending gripper trajectory: {grip_traj}")
-    move_id2 = robot_task.move_sub_module("gripper", grip_traj, interval=0.01)
-    print(f"[Test] move_id for gripper: {move_id2}")
-    assert move_id2 >= 0
-
-    # Allow some time for background thread to process
-    time.sleep(0.1)
-
-    # Print submodule queues (may be empty if consumed)
-    for sub in submodules:
-        items = []
-        try:
-            while True:
-                items.append(sub.task_queue.get_nowait())
-        except queue.Empty:
-            pass
-        print(f"[Test] Submodule '{sub.name}' task_queue contents after run: {items}")
-
-    # Print current state
-    state = robot_task.query_state()
-    print(f"[Test] ModularReducedRobotTask state: {state}")
-
-    robot_task.stop()
-    print("[Test] ModularReducedRobotTask stopped.")
-    print("test_modular_robot_task_basic passed.")
 
 
-def test_modular_robot_task_basic_1():
-    """
-    Basic test for ModularReducedRobotTask:
-    - Initialization
-    - Valid trajectory
-    - State query
-    - Submodule queue update
-    - Stop
-    """
+@pytest.mark.parametrize(
+    "time_out,interval",
+    [
+        (float("nan"), 0.01),
+        (float("inf"), 0.01),
+        (0.1, 0.0),
+        (0.1, -0.01),
+        (0.1, float("nan")),
+    ],
+)
+def test_wait_move_rejects_invalid_timing(time_out, interval):
+    with pytest.raises(ValueError):
+        make_robot().wait_move(time_out=time_out, interval=interval)
 
-    def make_submodules():
-        # Create two submodules, each controlling 2 DOF
-        return [SubModuleTask(), SubModuleTask()]
 
-    submodules = make_submodules()
-    submodules[0].name = "arm"
-    submodules[0].dof_begin = 0
-    submodules[0].dof_end = 6
-    submodules[1].name = "gripper"
-    submodules[1].dof_begin = 6
-    submodules[1].dof_end = 8
-    init_q = [0.0] * 8
-    robot_task = ModularReducedRobotTask(init_q, submodules)
-    robot_task.initialize()
+@pytest.mark.parametrize("timeout", [-0.1, float("nan"), float("inf")])
+def test_robot_stop_rejects_invalid_timeout(timeout):
+    with pytest.raises(ValueError, match="timeout"):
+        make_robot().stop(timeout=timeout)
 
-    # Valid trajectory: 2 steps
-    traj = [
-        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-        [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
-        [0.0, 0.0, 0.0, 0.0, 0.0, 5.0, 8.0, 9.0],
-        [0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 8.0, 9.0],
-        [0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 8.0, 9.0],
+
+def test_wait_move_timeout_is_not_extended_by_poll_interval():
+    robot = make_robot()
+    robot.move_joint_trajectory_async([[0.1, 0.0, 0.0]])
+    started = time.monotonic()
+    assert not robot.wait_move(time_out=0.02, interval=1.0)
+    assert time.monotonic() - started < 0.1
+
+
+def test_wait_move_is_woken_by_completion_before_poll_interval():
+    robot = make_robot(interval=0.002)
+    robot.initialize()
+    try:
+        robot.move_joint_trajectory_async([[0.1, 0.0, 0.0]])
+        started = time.monotonic()
+        assert robot.wait_move(time_out=0.5, interval=1.0)
+        assert time.monotonic() - started < 0.1
+    finally:
+        robot.stop()
+
+
+def wait_until(predicate, timeout=0.5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return False
+
+
+def test_main_trajectory_updates_state_and_move_ids():
+    robot = make_robot()
+    robot.initialize()
+    try:
+        begin = robot.move_joint_trajectory_async(
+            [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]], endpoint_index=[1, 2]
+        )
+        assert begin == 0
+        assert robot.wait_move(time_out=0.5)
+        state = robot.query_state()
+        assert state.latest_sent_id == 1
+        assert state.latest_finished_id == 1
+        assert state.jps == [0.4, 0.5, 0.6, 0.0]
+    finally:
+        robot.stop()
+
+
+def test_submodule_trajectory_updates_only_its_joints():
+    robot = make_robot()
+    robot.initialize()
+    try:
+        assert robot.move_submodule_async("gripper", [[0.4], [0.8]])
+        assert wait_until(lambda: robot.query_state().jps[3] == 0.8)
+        assert robot.query_state().jps[:3] == [0.0, 0.0, 0.0]
+    finally:
+        robot.stop()
+
+
+def test_invalid_trajectories_are_rejected():
+    robot = make_robot()
+    assert robot.move_joint_trajectory_async([]) == -1
+    assert robot.move_joint_trajectory_async([[1.0, 2.0]]) == -1
+    assert (
+        robot.move_joint_trajectory_async(
+            [[1.0, 2.0, 3.0]], endpoint_index=[0]
+        )
+        == -1
+    )
+    assert not robot.move_submodule_async("missing", [[1.0]])
+    assert not robot.move_submodule_async("gripper", [[1.0, 2.0]])
+
+
+def test_query_state_returns_a_copy():
+    robot = make_robot()
+    state = robot.query_state()
+    state.jps[0] = 99.0
+    assert robot.query_state().jps[0] == 0.0
+
+
+def test_robot_can_restart():
+    robot = make_robot()
+    robot.initialize()
+    robot.stop()
+    robot.initialize()
+    robot.stop()
+
+
+def test_restart_does_not_execute_main_motion_queued_before_stop():
+    robot = make_robot(interval=0.002)
+    robot.initialize()
+    robot.move_joint_trajectory_async(
+        [[0.1, 0.0, 0.0], [0.2, 0.0, 0.0]], interval=0.1
+    )
+    robot.move_joint_trajectory_async([[0.9, 0.0, 0.0]], interval=0.002)
+    time.sleep(0.01)
+    robot.stop()
+    stopped_position = robot.query_state().jps.copy()
+    robot.initialize()
+    try:
+        time.sleep(0.05)
+        assert robot.query_state().jps == stopped_position
+    finally:
+        robot.stop()
+
+
+def test_submodule_move_has_state_and_completion_id():
+    robot = make_robot(interval=0.002)
+    robot.initialize()
+    try:
+        move_id = robot.move_submodule_trajectory_async(
+            "gripper", [[0.1], [0.2], [0.3]]
+        )
+        assert move_id == 0
+        assert robot.query_submodule_state("gripper").latest_sent_id == 0
+        assert robot.wait_submodule_move("gripper", move_id, timeout=0.5)
+        state = robot.query_submodule_state("gripper")
+        assert state.positions == [0.3]
+        assert state.latest_finished_id == 0
+    finally:
+        robot.stop()
+
+
+def test_submodule_move_can_be_cancelled():
+    robot = make_robot(interval=0.01)
+    robot.initialize()
+    try:
+        move_id = robot.move_submodule_trajectory_async(
+            "gripper", [[value / 100.0] for value in range(50)]
+        )
+        assert robot.cancel_submodule_move("gripper", move_id)
+        assert not robot.wait_submodule_move("gripper", move_id, timeout=0.5)
+        state = robot.query_submodule_state("gripper")
+        assert state.active_move_id is None
+        assert state.cancelled_move_ids == (move_id,)
+        assert not robot.cancel_submodule_move("gripper", move_id + 1)
+        next_move = robot.move_submodule_trajectory_async("gripper", [[0.2]])
+        assert robot.wait_submodule_move("gripper", next_move, timeout=0.5)
+        assert not robot.wait_submodule_move("gripper", move_id, timeout=0.01)
+    finally:
+        robot.stop()
+
+
+def test_submodule_respects_slower_request_interval():
+    robot = make_robot(interval=0.002)
+    robot.initialize()
+    try:
+        started = time.monotonic()
+        move_id = robot.move_submodule_trajectory_async(
+            "gripper", [[0.1], [0.2], [0.3]], interval=0.03
+        )
+        assert robot.wait_submodule_move("gripper", move_id, timeout=0.5)
+        assert time.monotonic() - started >= 0.055
+    finally:
+        robot.stop()
+
+
+def test_main_motion_respects_slower_request_interval():
+    robot = make_robot(interval=0.002)
+    robot.initialize()
+    try:
+        started = time.monotonic()
+        robot.move_joint_trajectory_async(
+            [[0.1, 0.0, 0.0], [0.2, 0.0, 0.0], [0.3, 0.0, 0.0]],
+            interval=0.03,
+        )
+        assert robot.wait_move(time_out=0.5)
+        assert time.monotonic() - started >= 0.055
+    finally:
+        robot.stop()
+
+
+def test_submodule_callbacks_continue_while_main_waits_for_next_step():
+    robot = RecordingRobotTaskStub(
+        [0.0] * 4,
+        SubModuleTask(name="arm", dof_begin=0, n_dof=3),
+        [SubModuleTask(name="gripper", dof_begin=3, n_dof=1)],
+        interval=0.002,
+    )
+    robot.initialize()
+    try:
+        robot.move_joint_trajectory_async(
+            [[0.1, 0.0, 0.0], [0.2, 0.0, 0.0]], interval=0.1
+        )
+        move_id = robot.move_submodule_trajectory_async(
+            "gripper", [[0.4], [0.6]], interval=0.002
+        )
+        assert robot.wait_submodule_move("gripper", move_id, timeout=0.2)
+        assert any(update[-1] == 0.6 for update in robot.updates)
+        assert not robot.wait_move(time_out=0.01)
+    finally:
+        robot.stop()
+
+
+def test_state_change_callback_is_notified_by_main_and_submodule_motion():
+    robot = make_robot(interval=0.002)
+    notified = threading.Event()
+    robot.set_state_change_callback(notified.set)
+    robot.initialize()
+    try:
+        robot.move_joint_trajectory_async([[0.1, 0.0, 0.0]])
+        assert notified.wait(0.2)
+        notified.clear()
+        robot.move_submodule_trajectory_async("gripper", [[0.5]])
+        assert notified.wait(0.2)
+    finally:
+        robot.stop()
+
+
+def test_stopping_robot_cancels_all_unfinished_submodule_moves():
+    robot = make_robot(interval=0.005)
+    robot.initialize()
+    move_ids = [
+        robot.move_submodule_trajectory_async(
+            "gripper", [[value / 100.0] for value in range(50)]
+        )
+        for _ in range(3)
     ]
-    move_id = robot_task.move_joint_trajectory_async(traj, interval=0.05)
-    assert move_id == 0
-    print(f"[ModularReducedRobotTask] Valid input test passed, move_id={move_id}.")
-
-    gripper_traj = [[1.0, 2.0], [3.0, 4.0]]
-
-    print(f"[Debug] gripper_traj: {gripper_traj}")
-    move_id = robot_task.move_sub_module(
-        submodule_name="gripper", motion_target=gripper_traj, interval=0.05
+    robot.stop()
+    state = robot.query_submodule_state("gripper")
+    assert state.active_move_id is None
+    assert set(move_ids).issubset(state.cancelled_move_ids)
+    assert all(
+        not robot.wait_submodule_move("gripper", move_id, timeout=0.01)
+        for move_id in move_ids
     )
-    print(f"[Debug] move_id for gripper: {move_id}")
-    time.sleep(0.2)
-    state = robot_task.query_state()
-    print(f"[Debug] State after gripper move: {state}")
-
-    # Check gripper submodule queue
-    gripper_sub = None
-    for sub in submodules:
-        if sub.name == "gripper":
-            gripper_sub = sub
-            break
-    if gripper_sub:
-        items = []
-        while not gripper_sub.task_queue.empty():
-            items.append(gripper_sub.task_queue.get())
-        print(f"[Debug] gripper task_queue: {items}")
-        # assert that items contain the expected trajectory commands
-        assert len(items) > 0, f"Submodule gripper queue is empty!"
-        assert any(isinstance(i, tuple) or hasattr(i, "motion_target") for i in items)
-
-    # Wait for execution
-    time.sleep(0.3)
-    state = robot_task.query_state()
-    print(f"[ModularReducedRobotTask] State after trajectory: {state}")
-    assert state.latest_sent_id == 1
-    assert state.latest_finished_id >= -1
-    assert len(state.jps) == 8
-
-    # Debug: print submodule config
-    for sub in submodules:
-        print(
-            f"Submodule config: name={sub.name}, dof_begin={sub.dof_begin}, dof_end={sub.dof_end}"
-        )
-
-    # Debug: print submodule queues
-    for sub in submodules:
-        print(f"Submodule {sub.name} received: (skip check, already consumed above)")
-
-    # Stop
-    robot_task.stop()
-    print("[ModularReducedRobotTask] Stop test passed.")
-
-
-def test_modular_robot_task_left_right_arm():
-    """
-    Test ModularReducedRobotTask with left_arm and right_arm, each with 6 DOF.
-    """
-    left_arm = SubModuleTask()
-    right_arm = SubModuleTask()
-    left_arm.name = "left_arm"
-    left_arm.dof_begin = 0
-    left_arm.dof_end = 6
-    right_arm.name = "right_arm"
-    right_arm.dof_begin = 6
-    right_arm.dof_end = 12
-    submodules = [left_arm, right_arm]
-
-    init_q = [0.0] * 12
-    robot_task = ModularReducedRobotTask(init_q, submodules)
-    robot_task.initialize()
-
-    traj = [[i + 1.0 for i in range(12)], [i + 2.0 for i in range(12)]]
-    move_id = robot_task.move_joint_trajectory_async(traj, interval=0.05)
-    assert move_id == 0
-
-    time.sleep(0.2)
-    state = robot_task.query_state()
-    print(f"[ModularReducedRobotTask] State after trajectory: {state}")
-    assert state.latest_sent_id == 0
-    assert state.latest_finished_id >= -1
-    assert len(state.jps) == 12
-
-    for sub in submodules:
-        print(
-            f"Submodule config: name={sub.name}, dof_begin={sub.dof_begin}, dof_end={sub.dof_end}"
-        )
-        items = []
-        while not sub.task_queue.empty():
-            items.append(sub.task_queue.get())
-        print(f"Submodule {sub.name} received: {items}")
-
-    robot_task.stop()
-    print("[ModularReducedRobotTask] Stop test passed.")
-
-
-if __name__ == "__main__":
-    test_modular_robot_task_basic()
-    test_modular_robot_task_basic_1()
-    test_modular_robot_task_left_right_arm()

@@ -1,10 +1,19 @@
-import heapq
 import concurrent.futures
-from typing import Dict, Optional, Tuple, List
+import heapq
+import threading
+from abc import abstractmethod
+from typing import Dict, List, Optional, Tuple
 
-from orchestrion.utils.types import PeekResponseResult, PeekResponseResultType
 from orchestrion.tasks.generic_task import GenericTask
 from orchestrion.utils.logger import logger
+from orchestrion.utils.types import PeekResponseResult, PeekResponseResultType
+
+
+def _validate_max_result_count(max_result_count: int) -> None:
+    if isinstance(max_result_count, bool) or not isinstance(max_result_count, int):
+        raise TypeError("max_result_count must be an integer")
+    if max_result_count == 0:
+        raise ValueError("max_result_count must be positive or negative for unlimited")
 
 
 class InPlaceFunctionCallTask(GenericTask):
@@ -18,19 +27,22 @@ class InPlaceFunctionCallTask(GenericTask):
                                     If negative, unlimited.
         """
         super().__init__()
+        _validate_max_result_count(max_result_count)
         self._result_map: Dict[int, Optional[Dict]] = (
             dict()
         )  # Stores results for each request_id
-        self._lastest_sent_request = -1  # Tracks the latest request_id sent
+        self._latest_sent_request = -1  # Tracks the latest request_id sent
         self._max_result_count = max_result_count  # Maximum number of results to retain
+        self._lock = threading.Lock()
         # Priority queue to manage request_ids for result eviction when max_result_count is set
         self._request_id_pq: Optional[List[Tuple[int, int]]] = (
             None if max_result_count < 0 else list()
         )
 
+    @abstractmethod
     def _call_fn(self, request_id: int, content: Optional[Dict]) -> Optional[Dict]:
         """
-        Internal function to process the request. Should be overridden by subclasses.、
+        Internal function to process the request. Should be overridden by subclasses.
 
         Args:
             request_id (int): The request identifier.
@@ -39,7 +51,7 @@ class InPlaceFunctionCallTask(GenericTask):
         Returns:
             Optional[Dict]: The result of the function call, or None if not implemented.
         """
-        return None
+        raise NotImplementedError
 
     def invoke_async(self, request_id: int, content: Optional[Dict] = None) -> bool:
         """
@@ -53,24 +65,21 @@ class InPlaceFunctionCallTask(GenericTask):
             bool: True if the request was accepted and processed, False otherwise.
         """
         # Check if the request_id is valid and not duplicated
-        if request_id <= self._lastest_sent_request or request_id in self._result_map:
-            return False
-
-        # Update the latest sent request
-        self._lastest_sent_request = request_id
+        with self._lock:
+            if request_id <= self._latest_sent_request:
+                return False
+            self._latest_sent_request = request_id
         out = self._call_fn(request_id, content)
 
-        # Remove oldest results if exceeding max_result_count
-        if self._max_result_count > 0:
-            while len(self._request_id_pq) > self._max_result_count:
-                pop_request_id, _ = heapq.heappop(self._request_id_pq)
-                assert pop_request_id in self._result_map
-                self._result_map.pop(pop_request_id)
+        with self._lock:
+            self._result_map[request_id] = out
+            if self._max_result_count > 0:
+                heapq.heappush(self._request_id_pq, (request_id, request_id))
+                while len(self._request_id_pq) > self._max_result_count:
+                    pop_request_id, _ = heapq.heappop(self._request_id_pq)
+                    self._result_map.pop(pop_request_id, None)
 
-        # Store the result for this request_id
-        self._result_map[request_id] = out
-        if self._max_result_count > 0:
-            heapq.heappush(self._request_id_pq, (request_id, request_id))
+        self._notify_completion()
 
         return True
 
@@ -84,14 +93,33 @@ class InPlaceFunctionCallTask(GenericTask):
         Returns:
             PeekResponseResult: The result of the peek operation. Returns error if not found.
         """
-        if request_id not in self._result_map:
-            return PeekResponseResult.error_unknown()
-
-        # Return the stored result
-        out = self._result_map[request_id]
+        with self._lock:
+            if request_id not in self._result_map:
+                result_type = (
+                    PeekResponseResultType.ResponseReceivedButFlushed
+                    if request_id <= self._latest_sent_request
+                    else PeekResponseResultType.ErrorRequestNotSent
+                )
+                return PeekResponseResult(result_type, request_id=request_id)
+            out = self._result_map[request_id]
         return PeekResponseResult(
             PeekResponseResultType.ResponseFound, request_id=request_id, content=out
         )
+
+    def cancel_request(self, request_id: int) -> bool:
+        return False
+
+    def forget_response(self, request_id: int) -> bool:
+        with self._lock:
+            if request_id not in self._result_map:
+                return False
+            self._result_map.pop(request_id)
+            if self._request_id_pq is not None:
+                self._request_id_pq = [
+                    entry for entry in self._request_id_pq if entry[0] != request_id
+                ]
+                heapq.heapify(self._request_id_pq)
+            return True
 
 
 class ThreadedPoolFunctionCallTask(GenericTask):
@@ -105,14 +133,16 @@ class ThreadedPoolFunctionCallTask(GenericTask):
                                     If negative, unlimited.
         """
         super().__init__()
+        _validate_max_result_count(max_result_count)
         self._executor_not_own: Optional[concurrent.futures.ThreadPoolExecutor] = (
             None  # External thread pool executor
         )
         self._future_map: Dict[int, concurrent.futures.Future] = (
             dict()
         )  # Maps request_id to Future objects
-        self._lastest_sent_request = -1  # Tracks the latest request_id sent
+        self._latest_sent_request = -1  # Tracks the latest request_id sent
         self._max_result_count = max_result_count  # Maximum number of results to retain
+        self._lock = threading.Lock()
         # Priority queue to manage request_ids for result eviction when max_result_count is set
         self._request_id_pq: Optional[List[Tuple[int, int]]] = (
             None if max_result_count < 0 else list()
@@ -127,16 +157,22 @@ class ThreadedPoolFunctionCallTask(GenericTask):
         """
         # Does NOT init executor, maintained outside
         executor = kwargs.get("executor", None)
-        assert executor is not None
-        self._executor_not_own = executor
+        if executor is None:
+            raise ValueError("ThreadedPoolFunctionCallTask requires an executor")
+        with self._lock:
+            self._executor_not_own = executor
 
     def stop(self):
         """
         Stop the task and cancel all pending futures. Does NOT destruct the executor.
         """
-        for _, v in self._future_map.items():
-            v.cancel()
+        with self._lock:
+            futures = list(self._future_map.values())
+            self._executor_not_own = None
+        for future in futures:
+            future.cancel()
 
+    @abstractmethod
     def _call_fn(self, request_id: int, content: Optional[Dict]) -> Optional[Dict]:
         """
         Internal function to process the request. Should be overridden by subclasses.
@@ -148,7 +184,7 @@ class ThreadedPoolFunctionCallTask(GenericTask):
         Returns:
             Optional[Dict]: The result of the function call, or None if not implemented.
         """
-        return None
+        raise NotImplementedError
 
     def invoke_async(self, request_id: int, content: Optional[Dict] = None) -> bool:
         """
@@ -162,27 +198,23 @@ class ThreadedPoolFunctionCallTask(GenericTask):
             bool: True if the request was accepted and processed, False otherwise.
         """
         # Check if the request_id is valid and not duplicated
-        if request_id <= self._lastest_sent_request or request_id in self._future_map:
-            return False
-
-        # Update the latest sent request
-        self._lastest_sent_request = request_id
-        invoke_future = self._executor_not_own.submit(
-            self._call_fn, request_id, content
-        )
-
-        # Remove oldest results if exceeding max_result_count
-        if self._max_result_count > 0:
-            while len(self._request_id_pq) > self._max_result_count:
-                pop_request_id, _ = heapq.heappop(self._request_id_pq)
-                assert pop_request_id in self._future_map
-                pop_future = self._future_map.pop(pop_request_id)
-                pop_future.cancel()
-
-        # Store the future for this request_id
-        self._future_map[request_id] = invoke_future
-        if self._max_result_count > 0:
-            heapq.heappush(self._request_id_pq, (request_id, request_id))
+        with self._lock:
+            executor = self._executor_not_own
+            if executor is None:
+                raise RuntimeError("Task must be initialized before use")
+            if request_id <= self._latest_sent_request:
+                return False
+            invoke_future = executor.submit(self._call_fn, request_id, content)
+            invoke_future.add_done_callback(lambda _: self._notify_completion())
+            self._latest_sent_request = request_id
+            self._future_map[request_id] = invoke_future
+            if self._max_result_count > 0:
+                heapq.heappush(self._request_id_pq, (request_id, request_id))
+                while len(self._request_id_pq) > self._max_result_count:
+                    pop_request_id, _ = heapq.heappop(self._request_id_pq)
+                    pop_future = self._future_map.pop(pop_request_id, None)
+                    if pop_future is not None:
+                        pop_future.cancel()
 
         return True
 
@@ -197,15 +229,16 @@ class ThreadedPoolFunctionCallTask(GenericTask):
             PeekResponseResult: The result of the peek operation.
                                 Returns error if not found or not ready.
         """
-        if request_id not in self._future_map:
-            return PeekResponseResult(
-                PeekResponseResultType.ErrorRequestNotSent,
-                request_id=request_id,
-                content=None,
+        with self._lock:
+            future = self._future_map.get(request_id)
+            latest_sent_request = self._latest_sent_request
+        if future is None:
+            result_type = (
+                PeekResponseResultType.ResponseReceivedButFlushed
+                if request_id <= latest_sent_request
+                else PeekResponseResultType.ErrorRequestNotSent
             )
-
-        # Get the future object for this request
-        future: concurrent.futures.Future = self._future_map[request_id]
+            return PeekResponseResult(result_type, request_id=request_id)
         if future.done():
             if future.cancelled():
                 return PeekResponseResult(
@@ -214,6 +247,14 @@ class ThreadedPoolFunctionCallTask(GenericTask):
                     content=None,
                 )
             else:
+                exception = future.exception()
+                if exception is not None:
+                    logger.error("Request %s failed: %s", request_id, exception)
+                    return PeekResponseResult(
+                        PeekResponseResultType.ErrorUnknown,
+                        request_id=request_id,
+                        error=str(exception),
+                    )
                 out = future.result()
                 return PeekResponseResult(
                     PeekResponseResultType.ResponseFound,
@@ -226,3 +267,21 @@ class ThreadedPoolFunctionCallTask(GenericTask):
                 request_id=request_id,
                 content=None,
             )
+
+    def cancel_request(self, request_id: int) -> bool:
+        with self._lock:
+            future = self._future_map.get(request_id)
+        return future is not None and future.cancel()
+
+    def forget_response(self, request_id: int) -> bool:
+        with self._lock:
+            future = self._future_map.get(request_id)
+            if future is None or not future.done():
+                return False
+            self._future_map.pop(request_id)
+            if self._request_id_pq is not None:
+                self._request_id_pq = [
+                    entry for entry in self._request_id_pq if entry[0] != request_id
+                ]
+                heapq.heapify(self._request_id_pq)
+            return True

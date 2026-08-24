@@ -1,12 +1,13 @@
+import concurrent.futures
 import time
 
-import concurrent.futures
+import pytest
 
-from orchestrion.utils.types import PeekResponseResultType
 from orchestrion.tasks.function_call_task import (
     InPlaceFunctionCallTask,
     ThreadedPoolFunctionCallTask,
 )
+from orchestrion.utils.types import PeekResponseResultType
 
 
 # Subclass for testing, override _call_fn
@@ -25,12 +26,31 @@ class ThreadedPoolTaskStub(ThreadedPoolFunctionCallTask):
         return {"result": content["value"] + 1}
 
 
+@pytest.mark.parametrize("task_type", [InPlaceTaskStub, ThreadedPoolTaskStub])
+@pytest.mark.parametrize("value", [0, 1.5, True])
+def test_invalid_max_result_count_is_rejected(task_type, value):
+    expected = TypeError if value in (1.5, True) else ValueError
+    with pytest.raises(expected):
+        task_type(max_result_count=value)
+
+
 def test_task_inplace():
     task = InPlaceTaskStub()
     assert task.invoke_async(1, {"value": 10})
     resp = task.peek_response(1)
     print("InPlace resp:", resp.content)
     assert resp.content["result"] == 20
+
+
+def test_failing_completion_callback_does_not_fail_request():
+    task = InPlaceTaskStub()
+
+    def fail_callback():
+        raise RuntimeError("callback failure")
+
+    task.set_completion_callback(fail_callback)
+    assert task.invoke_async(1, {"value": 10})
+    assert task.peek_response(1).result_type is PeekResponseResultType.ResponseFound
 
 
 def test_task_threaded():
@@ -69,8 +89,8 @@ def test_task_inplace_max_result_count():
     print("resp2.result_type:", resp2.result_type)
     print("resp3.result_type:", resp3.result_type)
     print("resp4.result_type:", resp4.result_type)
-    assert resp1.result_type == PeekResponseResultType.ErrorUnknown
-    assert resp2.result_type == PeekResponseResultType.ResponseFound
+    assert resp1.result_type == PeekResponseResultType.ResponseReceivedButFlushed
+    assert resp2.result_type == PeekResponseResultType.ResponseReceivedButFlushed
     assert resp3.result_type == PeekResponseResultType.ResponseFound
     assert resp4.result_type == PeekResponseResultType.ResponseFound
 
@@ -103,8 +123,8 @@ def test_task_threaded_max_result_count():
         print("resp2.result_type:", resp2.result_type)
         print("resp3.result_type:", resp3.result_type)
         print("resp4.result_type:", resp4.result_type)
-        assert resp1.result_type == PeekResponseResultType.ErrorRequestNotSent
-        assert resp2.result_type == PeekResponseResultType.ResponseFound
+        assert resp1.result_type == PeekResponseResultType.ResponseReceivedButFlushed
+        assert resp2.result_type == PeekResponseResultType.ResponseReceivedButFlushed
         assert resp3.result_type == PeekResponseResultType.ResponseFound
         assert resp4.result_type == PeekResponseResultType.ResponseFound
 
@@ -122,7 +142,19 @@ def test_task_threaded_cancel():
             PeekResponseResultType.ErrorUnknown,
             PeekResponseResultType.ErrorRequestNotSent,
             PeekResponseResultType.ResponseFound,
+            PeekResponseResultType.ResponseReceivedButFlushed,
         )
+
+
+def test_threaded_task_rejects_requests_after_stop_until_reinitialized():
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task = ThreadedPoolTaskStub()
+        task.initialize(executor=executor)
+        task.stop()
+        with pytest.raises(RuntimeError, match="initialized"):
+            task.invoke_async(1, {"value": 1})
+        task.initialize(executor=executor)
+        assert task.invoke_async(1, {"value": 1})
 
 
 if __name__ == "__main__":

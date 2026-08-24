@@ -1,11 +1,11 @@
-import copy
+import math
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, List
+from numbers import Real
+from typing import List, Optional
 
-from orchestrion.utils.logger import logger
 
-
-class ReducedRobotTaskInterface(object):
+class ReducedRobotTaskInterface(ABC):
 
     @dataclass
     class ReducedRobotState(object):
@@ -15,7 +15,7 @@ class ReducedRobotTaskInterface(object):
 
         jps: List[float]  # Joint positions
         latest_finished_id: int = -1  # Last finished movement ID
-        latest_sent_id: int = 1  # Last sent movement ID
+        latest_sent_id: int = -1  # Last sent movement ID
 
     @dataclass
     class MovementRequest(object):
@@ -28,44 +28,41 @@ class ReducedRobotTaskInterface(object):
         motion_id_begin: int = 0  # Starting movement ID
         endpoint_index: Optional[List[int]] = None  # Segment endpoints
 
-    def __init__(self):
-        """
-        Initialize the reduced robot task, including state, movement queue, and thread safety.
-        """
-        pass
-
+    @abstractmethod
     def initialize(self):
         """
         Initialize the robot state. Can be extended to read real robot state.
         Returns:
             bool: True if initialization succeeded.
         """
-        pass
+        raise NotImplementedError
 
+    @abstractmethod
     def stop(self):
         """
         Stop the reduced robot task, clear movement queue, and invoke cancellation callbacks.
         Returns:
             bool: True if stopped successfully.
         """
-        pass
+        raise NotImplementedError
 
+    @abstractmethod
     def move_joint_trajectory_async(
         self,
         motion_target: List[List[float]],
         interval: float = 0.01,
         endpoint_index: Optional[List[int]] = None,
     ) -> int:
-        return -1
+        raise NotImplementedError
 
+    @abstractmethod
     def query_state(self) -> Optional[ReducedRobotState]:
         """
         Query the current robot state in a thread-safe manner.
         Returns:
             Optional[ReducedRobotState]: A copy of the current state.
         """
-        with self._lock:
-            return copy.deepcopy(self._state)
+        raise NotImplementedError
 
     def full_task(self):
         """
@@ -73,7 +70,7 @@ class ReducedRobotTaskInterface(object):
         Returns:
             ReducedRobotTaskInterface: The current instance.
         """
-        return None
+        return self
 
     @staticmethod
     def _check_assigned_endpoint_index(
@@ -88,13 +85,15 @@ class ReducedRobotTaskInterface(object):
             bool: True if valid, False otherwise.
         """
         if endpoint_index is None or len(endpoint_index) == 0:
-            return True
+            return False
 
         # Check each endpoint index is greater than previous
         prev_endpoint = 0
         n_endpoints = len(endpoint_index)
         for i in range(n_endpoints):
             endpoint_i = endpoint_index[i]
+            if isinstance(endpoint_i, bool) or not isinstance(endpoint_i, int):
+                return False
             if endpoint_i <= prev_endpoint:
                 return False
             prev_endpoint = endpoint_i
@@ -105,5 +104,16 @@ class ReducedRobotTaskInterface(object):
 
         return True
 
+    @staticmethod
+    def _is_finite_trajectory(motion_target: List[List[float]]) -> bool:
+        return all(
+            not isinstance(value, bool)
+            and isinstance(value, Real)
+            and math.isfinite(float(value))
+            for point in motion_target
+            for value in point
+        )
+
+    @abstractmethod
     def wait_move(self, time_out: float = -1, interval: float = 0.05) -> bool:
-        return False
+        raise NotImplementedError

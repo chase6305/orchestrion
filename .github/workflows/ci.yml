@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -e ".[dev,viser]"
+      - run: ruff check orchestrion integrations tests examples
+      - run: python -m pytest -q
+      - run: python -m examples.simulated_pick_and_place
+      - run: python -m examples.viser.02_pick_and_place --startup-delay 0 --duration 0 --steps 2 --interval 0.001

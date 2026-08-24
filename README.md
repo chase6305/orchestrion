@@ -13,7 +13,9 @@ Orchestrion centers around TaskPilot, which schedules robot trajectories and sid
   - sync with latest robot move
   - sync with an explicit move ID
 - Modular robot abstraction with main module plus submodules.
-- Background scheduling loop that dispatches synchronized tasks only when robot motion conditions are satisfied.
+- Unified request lifecycle with wait, cancellation, failures, and bounded timelines.
+- Event-driven scheduling with polling fallback for legacy robot backends.
+- Hardware-free `SimulatedRobotTask` for demos and integration tests.
 
 ## Package Overview
 
@@ -25,6 +27,7 @@ Orchestrion centers around TaskPilot, which schedules robot trajectories and sid
   - Sync policy object for peripheral task calls.
 - `orchestrion.tasks.modular_reduced_robot_task.ModularReducedRobotTask`
   - Base implementation for modular robot movement handling.
+  - Exposes independent submodule move IDs, state, waiting, and cancellation.
 - `orchestrion.tasks.function_call_task.InPlaceFunctionCallTask`
   - Executes function calls inline and stores responses in memory.
 - `orchestrion.tasks.function_call_task.ThreadedPoolFunctionCallTask`
@@ -36,7 +39,7 @@ Orchestrion centers around TaskPilot, which schedules robot trajectories and sid
 
 ### Prerequisites
 
-- Python `>= 3.7`
+- Python `>= 3.9`
 
 ### Install from source
 
@@ -49,57 +52,63 @@ pip install -e .
 - Logging colors:
 
 ```bash
-pip install colorlog
+pip install -e ".[color]"
 ```
 
 - Viser demo stack:
 
 ```bash
-pip install viser yourdfpy numpy
+pip install -e ".[viser]"
 ```
 
 ## Quick Start
 
 ```python
-import concurrent.futures
+from orchestrion import MoveSyncOption, SimulatedRobotTask, TaskPilot
+from orchestrion.tasks import InPlaceFunctionCallTask
 
-from orchestrion.task_pilot import TaskPilot
-from orchestrion.move_sync_option import MoveSyncOption
+class GripperTask(InPlaceFunctionCallTask):
+    def _call_fn(self, request_id, content):
+        return {"applied": content["action"]}
 
-# Your robot task should implement/extend ModularReducedRobotTask.
-robot_task = ...
-
-# Your peripheral task should implement GenericTask-like invoke_async/peek_response behavior.
-gripper_task = ...
-
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-
-pilot = TaskPilot(
-  robot_task=robot_task,
-  task_map={"gripper": gripper_task},
-  executor_owned=executor,
-)
-
+pilot = TaskPilot(SimulatedRobotTask([0.0, 0.0]), {"gripper": GripperTask()})
 pilot.initialize()
-
-# 1) Send robot trajectory
-move_begin, move_end = pilot.move_joint_trajectory_async(
-  motion_target=[[0.0, 0.1], [0.2, 0.3]],
-  interval=0.01,
-)
-
-# 2) Trigger peripheral task synchronized with latest move
-request_id = pilot.call_srv_async(
-  "gripper",
-  content={"action": "close"},
-  sync_option=MoveSyncOption.sync_w_latest_move(),
-)
-
-# 3) Wait for robot completion
-pilot.wait_move()
-
-pilot.stop()
+try:
+    _, move_end = pilot.move_joint_trajectory_async(
+        [[0.0, 0.1], [0.2, 0.3]], interval=0.01
+    )
+    request_id = pilot.call_srv_async(
+        "gripper",
+        {"action": "close"},
+        MoveSyncOption.sync_w_explicit_id(move_end - 1),
+    )
+    result = pilot.wait_request(request_id, timeout=2.0)
+    print(result.status, result.content)
+finally:
+    pilot.stop()
 ```
+
+Run the complete example from the repository root with
+`python -m examples.simulated_pick_and_place`.
+
+## Request Lifecycle
+
+Every peripheral request progresses through `QUEUED`, optionally
+`WAITING_FOR_MOVE`, then `RUNNING`, and finally `SUCCEEDED`, `FAILED`, or
+`CANCELLED`.
+
+```python
+snapshot = pilot.query_request(request_id)
+result = pilot.wait_request(request_id, timeout=1.0)
+cancelled = pilot.cancel_request(request_id)
+events = pilot.timeline(request_id)
+removed = pilot.prune_completed_requests(keep_last=1000)
+```
+
+`wait_request` raises `TimeoutError` without cancelling the request. Cancellation
+is guaranteed before execution and best-effort once a task is running.
+Long-running processes can call `prune_completed_requests()` periodically to bound
+stored terminal request results without removing active work.
 
 ## Synchronization Model
 
@@ -111,6 +120,22 @@ pilot.stop()
   - Task is associated with the latest known move ID at dispatch time.
 - `MoveSyncOption.sync_w_explicit_id(move_id)`
   - Task runs only after robot state reports finishing that move ID.
+
+## Submodule Motion
+
+Modular robots expose completion-aware motion for components such as grippers:
+
+```python
+move_id = robot.move_submodule_trajectory_async(
+    "gripper", [[0.1], [0.2], [0.3]], interval=0.01
+)
+state = robot.query_submodule_state("gripper")
+finished = robot.wait_submodule_move("gripper", move_id, timeout=1.0)
+cancelled = robot.cancel_submodule_move("gripper", move_id)
+```
+
+`move_submodule_async()` remains as a boolean compatibility wrapper. New backends
+should prefer the completion-aware API.
 
 ## Architecture
 
@@ -140,7 +165,8 @@ The background loop executes non-synchronized tasks immediately and delays synch
 See:
 
 - `integrations/viser/viser_modular_robot_task.py`
-- `examples/viser/viser_modular_robot_task.py`
+- `examples/viser/README.md` for eight runnable visualization demos
+- `examples/viser/viser_modular_robot_task.py` for the legacy entry point
 
 The example demonstrates:
 
@@ -152,9 +178,11 @@ The example demonstrates:
 ## Running Tests
 
 ```bash
+python -m pytest -q
 python -m pytest -q tests/test_task.py
 python -m pytest -q tests/test_task_pilot.py
 python -m pytest -q tests/test_modular_robot_task.py
+ruff check orchestrion integrations tests examples
 ```
 
 ## Development Workflow
@@ -170,7 +198,7 @@ Example:
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
-pip install pytest colorlog
+pip install -e ".[dev,color]"
 python -m pytest -q tests/test_task.py
 ```
 
@@ -180,11 +208,13 @@ python -m pytest -q tests/test_task.py
 orchestrion/
   task_pilot.py
   move_sync_option.py
+  request.py
   tasks/
     generic_task.py
     function_call_task.py
     modular_reduced_robot_task.py
     reduced_robot_task_interface.py
+    simulated_robot_task.py
   utils/
     logger.py
     types.py
@@ -194,6 +224,7 @@ integrations/
     viser_modular_robot_task.py
 
 examples/
+  simulated_pick_and_place.py
   viser/
     viser_modular_robot_task.py
 
@@ -205,12 +236,13 @@ tests/
 ## Notes
 
 - This repository is framework-oriented: concrete robot backends should subclass or implement the provided task interfaces.
-- `ThreadedPoolFunctionCallTask` expects an externally managed `ThreadPoolExecutor` passed through `initialize(executor=...)`.
+- `executor_owned` is shut down by `TaskPilot.stop()`; do not reuse it afterward.
+- `stop(timeout=...)` does not wait indefinitely for a running Python callback that
+  ignores cancellation; such a callback must still arrange its own cooperative exit.
 
 ## Troubleshooting
 
-- `ModuleNotFoundError: colorlog`
-  - Install `colorlog`, since logger setup imports it at runtime.
+- Colored logs are optional; install them with `pip install -e ".[color]"`.
 - `pytest: command not found`
   - Use `python -m pytest ...` inside your virtual environment, or install `pytest` first.
 - Synchronized peripheral calls do not run yet

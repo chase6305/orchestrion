@@ -1,167 +1,167 @@
 import concurrent.futures
-from unittest.mock import MagicMock
+import time
+
+import pytest
+
 from orchestrion.move_sync_option import MoveSyncOption
 from orchestrion.task_pilot import TaskPilot
+from orchestrion.tasks.reduced_robot_task_interface import ReducedRobotTaskInterface
 
 
-class MockRobotTask:
-
+class RobotTaskStub:
     def __init__(self):
-        self._initialized = False
-        self._stopped = False
-        self._latest_sent_id = 10
-        self._latest_finished_id = 10
+        self.initialized = False
+        self.stopped = False
+        self.latest_sent_id = 10
+        self.latest_finished_id = 10
 
     def initialize(self):
-        self._initialized = True
+        self.initialized = True
 
     def stop(self):
-        self._stopped = True
+        self.stopped = True
 
     def query_state(self):
-        return MagicMock(
-            latest_sent_id=self._latest_sent_id,
-            latest_finished_id=self._latest_finished_id,
+        return ReducedRobotTaskInterface.ReducedRobotState(
+            [], self.latest_finished_id, self.latest_sent_id
         )
 
-    def move_joint_trajectory_async(
-        self, motion_target, interval=0.01, endpoint_index=None
-    ):
+    def move_joint_trajectory_async(self, **kwargs):
         return 5
 
-
-class MockGenericTask:
-
-    def __init__(self):
-        self._initialized = False
-        self._stopped = False
-        self._invoked = []
-
-    def initialize(self, executor=None):
-        self._initialized = True
-
-    def stop(self):
-        self._stopped = True
-
-    def invoke_async(self, request_id, content):
-        self._invoked.append((request_id, content))
+    def wait_move(self, time_out=-1, interval=0.05):
         return True
 
 
-def test_initialize():
-    robot_task = MockRobotTask()
-    task_map = {"task1": MockGenericTask(), "task2": MockGenericTask()}
-    supervisor = TaskPilot(robot_task, task_map)
-    supervisor.initialize()
-    assert robot_task._initialized
-    assert task_map["task1"]._initialized
-    assert task_map["task2"]._initialized
-    print("test_initialize passed")
+class GenericTaskStub:
+    def __init__(self):
+        self.initialized = False
+        self.stopped = False
+        self.invoked = []
+
+    def initialize(self, executor=None):
+        self.initialized = True
+
+    def stop(self):
+        self.stopped = True
+
+    def invoke_async(self, request_id, content=None):
+        self.invoked.append((request_id, content))
+        return True
 
 
-def test_call_srv_async_no_sync():
-    robot_task = MockRobotTask()
-    task_map = {"task1": MockGenericTask()}
-    supervisor = TaskPilot(robot_task, task_map)
-    supervisor.initialize()
-    req_id = supervisor.call_srv_async("task1", {"data": 123}, MoveSyncOption.no_sync())
-    assert req_id == 0
-    print("test_call_srv_async_no_sync passed")
+class ClearCallbackFailingRobot(RobotTaskStub):
+    def set_state_change_callback(self, callback):
+        if callback is None:
+            raise RuntimeError("cannot clear robot callback")
 
 
-def test_move_joint_trajectory_async():
-    robot_task = MockRobotTask()
-    task_map = {}
-    supervisor = TaskPilot(robot_task, task_map)
-    begin_id, end_id = supervisor.move_joint_trajectory_async([[1, 2, 3], [4, 5, 6]])
-    assert begin_id == 5 and end_id == 6
-    print("test_move_joint_trajectory_async passed")
+class ClearCallbackFailingTask(GenericTaskStub):
+    def set_completion_callback(self, callback):
+        if callback is None:
+            raise RuntimeError("cannot clear task callback")
 
 
-def test_query_robot_state():
-    robot_task = MockRobotTask()
-    task_map = {}
-    supervisor = TaskPilot(robot_task, task_map)
-    state = supervisor.query_robot_state()
-    assert state.latest_sent_id == 10
-    print("test_query_robot_state passed")
+def wait_until(predicate, timeout=0.5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return False
 
 
-def test_wait_move():
-    robot_task = MockRobotTask()
-    task_map = {}
-    supervisor = TaskPilot(robot_task, task_map)
-    supervisor.wait_move(time_out=0.2)
-    print("test_wait_move passed")
-
-
-def test_call_srv_async_sync_latest():
-    robot_task = MockRobotTask()
-    task_map = {"task1": MockGenericTask()}
-    supervisor = TaskPilot(robot_task, task_map)
-    supervisor.initialize()
-    req_id = supervisor.call_srv_async(
-        "task1", {"data": 456}, MoveSyncOption.sync_w_latest_move()
-    )
-    assert req_id == 0
-    print("test_call_srv_async_sync_latest passed")
-
-
-def test_call_srv_async_sync_explicit_id():
-    robot_task = MockRobotTask()
-    task_map = {"task1": MockGenericTask()}
-    supervisor = TaskPilot(robot_task, task_map)
-    supervisor.initialize()
-    req_id = supervisor.call_srv_async(
-        "task1", {"data": 789}, MoveSyncOption.sync_w_explicit_id(5)
-    )
-    assert req_id == 0
-    print("test_call_srv_async_sync_explicit_id passed")
-
-
-def test_multiple_requests():
-    robot_task = MockRobotTask()
-    task_map = {"task1": MockGenericTask()}
-    supervisor = TaskPilot(robot_task, task_map)
-    supervisor.initialize()
-    for i in range(5):
-        req_id = supervisor.call_srv_async(
-            "task1", {"data": i}, MoveSyncOption.no_sync()
+def test_lifecycle_and_immediate_request():
+    robot = RobotTaskStub()
+    task = GenericTaskStub()
+    pilot = TaskPilot(robot, {"gripper": task})
+    pilot.initialize()
+    try:
+        request_id = pilot.call_srv_async(
+            "gripper", {"close": True}, MoveSyncOption.no_sync()
         )
-        assert req_id == i
-    print("test_multiple_requests passed")
+        assert request_id == 0
+        assert wait_until(lambda: task.invoked == [(0, {"close": True})])
+    finally:
+        pilot.stop()
+    assert robot.stopped and task.stopped
 
 
-def test_stop():
-    robot_task = MockRobotTask()
-    task_map = {"task1": MockGenericTask()}
-    supervisor = TaskPilot(robot_task, task_map)
-    supervisor.initialize()
-    supervisor.stop()
-    assert robot_task._stopped
-    assert task_map["task1"]._stopped
-    print("test_stop passed")
+def test_stop_continues_when_callback_cleanup_fails():
+    robot = ClearCallbackFailingRobot()
+    task = ClearCallbackFailingTask()
+    pilot = TaskPilot(robot, {"task": task})
+    pilot.initialize()
+    pilot.stop()
+    assert robot.stopped
+    assert task.stopped
 
 
-def test_executor_shutdown():
-    robot_task = MockRobotTask()
-    task_map = {"task1": MockGenericTask()}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        supervisor = TaskPilot(robot_task, task_map, executor_owned=executor)
-        supervisor.initialize()
-        supervisor.stop()
-    print("test_executor_shutdown passed")
+def test_synchronized_request_waits_for_move():
+    robot = RobotTaskStub()
+    robot.latest_finished_id = 4
+    task = GenericTaskStub()
+    pilot = TaskPilot(robot, {"gripper": task})
+    pilot.initialize()
+    try:
+        pilot.call_srv_async(
+            "gripper", {}, MoveSyncOption.sync_w_explicit_id(5)
+        )
+        time.sleep(0.08)
+        assert task.invoked == []
+        robot.latest_finished_id = 5
+        assert wait_until(lambda: len(task.invoked) == 1)
+    finally:
+        pilot.stop()
 
 
-if __name__ == "__main__":
-    test_initialize()
-    test_call_srv_async_no_sync()
-    test_move_joint_trajectory_async()
-    test_query_robot_state()
-    test_wait_move()
-    test_call_srv_async_sync_latest()
-    test_call_srv_async_sync_explicit_id()
-    test_multiple_requests()
-    test_stop()
-    test_executor_shutdown()
-    print("All TaskPilot tests passed.")
+def test_unknown_service_is_rejected():
+    pilot = TaskPilot(RobotTaskStub())
+    with pytest.raises(KeyError):
+        pilot.call_srv_async("missing", {}, MoveSyncOption.no_sync())
+
+
+def test_request_before_initialization_is_rejected():
+    pilot = TaskPilot(RobotTaskStub(), {"task": GenericTaskStub()})
+    with pytest.raises(RuntimeError):
+        pilot.call_srv_async("task", {}, MoveSyncOption.no_sync())
+
+
+@pytest.mark.parametrize("move_id", [True, 1.5, "1"])
+def test_explicit_sync_rejects_non_integer_move_ids(move_id):
+    with pytest.raises(TypeError, match="integer"):
+        MoveSyncOption.sync_w_explicit_id(move_id)
+
+
+def test_move_sync_option_rejects_invalid_direct_combinations():
+    with pytest.raises(TypeError, match="need_sync"):
+        MoveSyncOption(need_sync=1)
+    with pytest.raises(ValueError, match="move ID"):
+        MoveSyncOption(need_sync=False, associated_move_id=0)
+    with pytest.raises(ValueError, match="-1"):
+        MoveSyncOption(need_sync=True, associated_move_id=-2)
+
+
+def test_move_and_wait_are_forwarded():
+    pilot = TaskPilot(RobotTaskStub())
+    assert pilot.move_joint_trajectory_async([[1, 2, 3]]) == (5, 6)
+    assert pilot.wait_move(time_out=0.1)
+
+
+def test_owned_executor_is_shutdown():
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    pilot = TaskPilot(RobotTaskStub(), {}, executor_owned=executor)
+    pilot.initialize()
+    pilot.stop()
+    with pytest.raises(RuntimeError):
+        executor.submit(lambda: None)
+    with pytest.raises(RuntimeError, match="cannot restart"):
+        pilot.initialize()
+
+
+def test_pilot_can_restart():
+    pilot = TaskPilot(RobotTaskStub())
+    pilot.initialize()
+    pilot.stop()
+    pilot.initialize()
+    pilot.stop()

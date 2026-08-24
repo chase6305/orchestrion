@@ -1,6 +1,6 @@
-from enum import Enum
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, List
+from enum import Enum
+from typing import Dict, Optional
 
 
 class PeekResponseResultType(Enum):
@@ -20,6 +20,7 @@ class PeekResponseResult(object):
     result_type: PeekResponseResultType = PeekResponseResultType.ErrorUnknown
     request_id: int = -1
     content: Optional[Dict] = None
+    error: Optional[str] = None
 
     @staticmethod
     def error_unknown():

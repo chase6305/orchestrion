@@ -1,16 +1,23 @@
-from .generic_task import GenericTask
 from .function_call_task import (
     InPlaceFunctionCallTask,
     ThreadedPoolFunctionCallTask,
 )
+from .generic_task import GenericTask
+from .modular_reduced_robot_task import (
+    ModularReducedRobotTask,
+    SubModuleState,
+    SubModuleTask,
+)
 from .reduced_robot_task_interface import ReducedRobotTaskInterface
-from .modular_reduced_robot_task import ModularReducedRobotTask, SubModuleTask
+from .simulated_robot_task import SimulatedRobotTask
 
-all = [
+__all__ = [
     "GenericTask",
     "InPlaceFunctionCallTask",
     "ThreadedPoolFunctionCallTask",
     "ReducedRobotTaskInterface",
     "ModularReducedRobotTask",
     "SubModuleTask",
+    "SubModuleState",
+    "SimulatedRobotTask",
 ]

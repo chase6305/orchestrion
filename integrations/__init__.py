@@ -1,9 +1,6 @@
 from .viser.viser_modular_robot_task import (
-    ViserModularReducedRobotTask,
     ViserGripperTask,
+    ViserModularReducedRobotTask,
 )
 
-all = [
-    "ViserModularReducedRobotTask",
-    "ViserGripperTask",
-]
+__all__ = ["ViserGripperTask", "ViserModularReducedRobotTask"]
