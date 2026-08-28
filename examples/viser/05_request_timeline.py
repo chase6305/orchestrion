@@ -1,5 +1,11 @@
 """Display a live Orchestrion request timeline in the Viser GUI."""
 
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import time
 
 from examples.viser.common import PICK_Q, ViserDemoRuntime, run_demo

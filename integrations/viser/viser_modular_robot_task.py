@@ -72,12 +72,23 @@ class ViserModularReducedRobotTask(ModularReducedRobotTask):
 class ViserGripperTask(ThreadedPoolFunctionCallTask):
     """Animate a Robotiq gripper and report completion at the target position."""
 
+    MIN_ANIMATION_INTERVAL = 1.0 / 60.0
+
+    task_kind = "actuator"
+
     OPEN_POSITION = 0.0
     CLOSED_POSITION = 0.72
     POSITION_LIMIT = 0.725
 
     def __init__(self, robot_task: ModularReducedRobotTask):
-        super().__init__()
+        super().__init__(
+            metadata={
+                "device_type": "parallel_gripper",
+                "commands": ["open", "close", "set_position"],
+                "position_unit": "radian",
+                "position_range": [self.OPEN_POSITION, self.POSITION_LIMIT],
+            }
+        )
         self._robot_task = robot_task
         self._request_move_ids: Dict[int, int] = {}
         self._cancelled_requests = set()
@@ -93,7 +104,7 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
         # calls (or a duplicate ID) can overwrite a queued request's sequence.
         with self._submission_lock:
             with self._lock:
-                if request_id <= self._latest_sent_request:
+                if self._request_id_is_reserved_locked(request_id):
                     return False
             with self._order_condition:
                 self._request_sequences[request_id] = self._next_assigned_sequence
@@ -164,10 +175,15 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
             raise ValueError("Gripper speed must be positive")
 
         current = self._robot_task.query_submodule_state("gripper").positions[0]
-        timeout = float(content.get("timeout", abs(target - current) / speed + 1.0))
+        timeout = float(content.get("timeout", abs(target - current) / speed + 2.0))
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Gripper timeout must be positive")
-        interval = self._robot_task.scheduler_interval
+        # Rendering hundreds of configurations per second only adds WebSocket and
+        # browser overhead. Keep the command speed stable when a demo uses a very
+        # small robot scheduler interval for headless smoke tests.
+        interval = max(
+            self._robot_task.scheduler_interval, self.MIN_ANIMATION_INTERVAL
+        )
         steps = max(2, math.ceil(abs(target - current) / (speed * interval)) + 1)
         trajectory = [[float(value)] for value in np.linspace(current, target, steps)]
         move_id = self._robot_task.move_submodule_trajectory_async(
@@ -199,6 +215,30 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
         for request_id in pending_ids:
             self.cancel_request(request_id)
         super().stop()
+
+    def peek_status(self) -> Dict:
+        status = super().peek_status()
+        state = self._robot_task.query_submodule_state("gripper")
+        if state.active_move_id is not None:
+            activity = "moving"
+        elif (
+            state.latest_sent_id > state.latest_finished_id
+            and state.latest_sent_id not in state.cancelled_move_ids
+        ):
+            activity = "queued"
+        else:
+            activity = "idle"
+        status.update(
+            {
+                "activity": activity,
+                "position": state.positions[0],
+                "active_move_id": state.active_move_id,
+                "latest_move_id": state.latest_sent_id,
+                "latest_finished_move_id": state.latest_finished_id,
+                "cancelled_move_ids": state.cancelled_move_ids,
+            }
+        )
+        return status
 
     def cancel_request(self, request_id: int) -> bool:
         with self._lock:

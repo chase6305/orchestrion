@@ -2,6 +2,8 @@
 
 import concurrent.futures
 import copy
+import heapq
+import json
 import math
 import queue
 import threading
@@ -11,6 +13,7 @@ from dataclasses import dataclass, replace
 from numbers import Real
 from typing import Any, Dict, List, Optional, Tuple
 
+from orchestrion.health import DeviceHealth
 from orchestrion.move_sync_option import MoveSyncOption
 from orchestrion.request import RequestResult, RequestStatus, TimelineEvent
 from orchestrion.tasks.generic_task import GenericTask
@@ -28,6 +31,7 @@ class TaskPilot:
         request_id: int
         content: Optional[Dict] = None
         associated_move_id: int = -1
+        priority: int = 0
 
     def __init__(
         self,
@@ -58,16 +62,19 @@ class TaskPilot:
         self._executor_shutdown = False
         self._poll_interval = poll_interval
         self._timeline_capacity = timeline_capacity
+        self._lifecycle_lock = threading.RLock()
 
-        self._task_queue: queue.SimpleQueue[TaskPilot.BackgroundRequest] = (
-            queue.SimpleQueue()
-        )
+        self._task_queue: queue.PriorityQueue[
+            Tuple[int, int, TaskPilot.BackgroundRequest]
+        ] = queue.PriorityQueue()
         self._next_request_id = 0
         self._state_condition = threading.Condition()
         self._requests: Dict[int, RequestResult] = {}
+        self._idempotency_requests: Dict[Tuple[str, str], int] = {}
         self._request_waiters: Dict[int, int] = {}
         self._timeline: deque[TimelineEvent] = deque(maxlen=timeline_capacity)
         self._running_requests: Dict[int, TaskPilot.BackgroundRequest] = {}
+        self._health_revision = 0
         self._wake_event = threading.Event()
         self._stop_event = threading.Event()
         self._bg_thread: Optional[threading.Thread] = None
@@ -75,11 +82,45 @@ class TaskPilot:
 
     @property
     def task_map(self) -> Dict[str, GenericTask]:
-        return self._task_map
+        """Return a shallow copy of the fixed service registry."""
+        return dict(self._task_map)
+
+    @property
+    def service_names(self) -> Tuple[str, ...]:
+        """Return peripheral service names in registration order."""
+        return tuple(self._task_map)
+
+    @property
+    def is_running(self) -> bool:
+        """Whether the pilot and its scheduler thread are running."""
+        thread = self._bg_thread
+        return self._initialized and thread is not None and thread.is_alive()
+
+    @property
+    def health_revision(self) -> int:
+        """Monotonic version incremented when observable runtime state changes."""
+        with self._state_condition:
+            return self._health_revision
 
     @property
     def robot_task(self) -> ReducedRobotTaskInterface:
         return self._robot_task
+
+    def __enter__(self) -> "TaskPilot":
+        self.initialize()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.stop()
+
+    def _on_component_change(self) -> None:
+        with self._state_condition:
+            self._mark_health_changed_locked()
+        self._wake_event.set()
+
+    def _mark_health_changed_locked(self) -> None:
+        self._health_revision += 1
+        self._state_condition.notify_all()
 
     def _rollback_initialization(self, initialized_tasks: List[GenericTask]) -> None:
         for task in reversed(initialized_tasks):
@@ -108,6 +149,11 @@ class TaskPilot:
             logger.exception("Failed to roll back robot task")
 
     def initialize(self) -> None:
+        """Initialize the pilot once, serializing concurrent lifecycle calls."""
+        with self._lifecycle_lock:
+            self._initialize_locked()
+
+    def _initialize_locked(self) -> None:
         if self._initialized:
             logger.warning("TaskPilot is already initialized.")
             return
@@ -130,7 +176,7 @@ class TaskPilot:
             for task in self._task_map.values():
                 set_completion_callback = getattr(task, "set_completion_callback", None)
                 if callable(set_completion_callback):
-                    set_completion_callback(self._wake_event.set)
+                    set_completion_callback(self._on_component_change)
                 initialized_tasks.append(task)
                 task.initialize(executor=self._executor)
         except Exception:
@@ -142,19 +188,31 @@ class TaskPilot:
                 self._robot_task, "set_state_change_callback", None
             )
             if callable(set_callback):
-                set_callback(self._wake_event.set)
+                set_callback(self._on_component_change)
             self._bg_thread = threading.Thread(
                 target=self._bg_thread_loop, name="orchestrion-task-pilot"
             )
             self._bg_thread.start()
-            self._initialized = True
+            with self._state_condition:
+                self._initialized = True
+                self._mark_health_changed_locked()
         except Exception:
             self._rollback_initialization(initialized_tasks)
             self._bg_thread = None
             raise
 
     def stop(self, timeout: float = 5.0) -> None:
-        if not math.isfinite(timeout) or timeout < 0:
+        """Stop the pilot, serializing against initialization and other stops."""
+        with self._lifecycle_lock:
+            self._stop_locked(timeout)
+
+    def _stop_locked(self, timeout: float) -> None:
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, Real)
+            or not math.isfinite(timeout)
+            or timeout < 0
+        ):
             raise ValueError("timeout must be non-negative and finite")
         if not self._initialized:
             logger.warning("TaskPilot is not running or already stopped.")
@@ -205,7 +263,9 @@ class TaskPilot:
                 try:
                     self._robot_task.stop()
                 finally:
-                    self._initialized = False
+                    with self._state_condition:
+                        self._initialized = False
+                        self._mark_health_changed_locked()
         if thread_timed_out:
             raise TimeoutError("TaskPilot background thread did not stop in time")
         if task_stop_error is not None:
@@ -216,11 +276,27 @@ class TaskPilot:
         srv_name: str,
         content: Optional[Dict] = None,
         sync_option: Optional[MoveSyncOption] = None,
+        priority: int = 0,
+        idempotency_key: Optional[str] = None,
     ) -> int:
         if srv_name not in self._task_map:
             raise KeyError("Unknown service: {}".format(srv_name))
         if not self._initialized:
             raise RuntimeError("TaskPilot must be initialized before accepting requests")
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise TypeError("priority must be an integer")
+        if idempotency_key is not None and not isinstance(idempotency_key, str):
+            raise TypeError("idempotency_key must be a string or None")
+        if idempotency_key == "":
+            raise ValueError("idempotency_key must not be empty")
+        deduplication_key = (
+            None if idempotency_key is None else (srv_name, idempotency_key)
+        )
+        if deduplication_key is not None:
+            with self._state_condition:
+                existing_id = self._idempotency_requests.get(deduplication_key)
+                if existing_id is not None:
+                    return existing_id
         sync_option = sync_option or MoveSyncOption.sync_w_latest_move()
 
         associated_move_id = -1
@@ -235,6 +311,10 @@ class TaskPilot:
 
         request_content = copy.deepcopy(content)
         with self._state_condition:
+            if deduplication_key is not None:
+                existing_id = self._idempotency_requests.get(deduplication_key)
+                if existing_id is not None:
+                    return existing_id
             request_id = self._next_request_id
             self._next_request_id += 1
             now = time.time()
@@ -243,17 +323,22 @@ class TaskPilot:
                 service_name=srv_name,
                 status=RequestStatus.QUEUED,
                 associated_move_id=associated_move_id,
+                priority=priority,
+                idempotency_key=idempotency_key,
                 created_at=now,
             )
+            if deduplication_key is not None:
+                self._idempotency_requests[deduplication_key] = request_id
             self._record_event_locked(request_id, RequestStatus.QUEUED)
-            self._task_queue.put(
-                self.BackgroundRequest(
-                    service_name=srv_name,
-                    request_id=request_id,
-                    content=request_content,
-                    associated_move_id=associated_move_id,
-                )
+            request = self.BackgroundRequest(
+                service_name=srv_name,
+                request_id=request_id,
+                content=request_content,
+                associated_move_id=associated_move_id,
+                priority=priority,
             )
+            self._task_queue.put((-priority, request_id, request))
+            self._mark_health_changed_locked()
         self._wake_event.set()
         return request_id
 
@@ -264,8 +349,186 @@ class TaskPilot:
             except KeyError:
                 raise KeyError("Unknown request: {}".format(request_id)) from None
 
+    def query_task_status(self, service_name: str) -> Optional[Dict]:
+        try:
+            task = self._task_map[service_name]
+        except KeyError:
+            raise KeyError("Unknown service: {}".format(service_name)) from None
+        peek_status = getattr(task, "peek_status", None)
+        if not callable(peek_status):
+            return None
+        status = copy.deepcopy(peek_status())
+        if status is None:
+            return None
+        if not isinstance(status, dict):
+            raise TypeError("Task status must be a dictionary or None")
+        health = status.setdefault("health", DeviceHealth.ONLINE.value)
+        try:
+            status["health"] = DeviceHealth(health).value
+        except (TypeError, ValueError):
+            raise ValueError("Task status contains an invalid health state") from None
+        status.setdefault(
+            "available", status["health"] != DeviceHealth.OFFLINE.value
+        )
+        status.setdefault("observed_at", time.time())
+        observed_at = status["observed_at"]
+        if (
+            isinstance(observed_at, bool)
+            or not isinstance(observed_at, Real)
+            or not math.isfinite(observed_at)
+        ):
+            raise ValueError("Task status observed_at must be finite")
+        return status
+
+    def describe_services(self) -> Dict[str, Dict]:
+        """Return static service capabilities without querying device state."""
+        descriptions = {}
+        for service_name, task in self._task_map.items():
+            description = copy.deepcopy(task.describe())
+            if not isinstance(description, dict):
+                raise TypeError("Task description must be a dictionary")
+            description["service_name"] = service_name
+            try:
+                json.dumps(description, allow_nan=False)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Task description for {!r} must be JSON-compatible".format(
+                        service_name
+                    )
+                ) from exc
+            descriptions[service_name] = description
+        return descriptions
+
+    def query_all_task_statuses(self) -> Dict[str, Optional[Dict]]:
+        """Return a best-effort snapshot without one device hiding the others."""
+        statuses: Dict[str, Optional[Dict]] = {}
+        for service_name in self._task_map:
+            try:
+                statuses[service_name] = self.query_task_status(service_name)
+            except Exception as exc:
+                statuses[service_name] = {
+                    "available": False,
+                    "health": DeviceHealth.OFFLINE.value,
+                    "observed_at": time.time(),
+                    "error": str(exc),
+                }
+        return statuses
+
+    def query_health(self, stale_after: Optional[float] = None) -> Dict[str, Any]:
+        """Return a JSON-compatible health snapshot for monitoring integrations."""
+        if stale_after is not None and (
+            isinstance(stale_after, bool)
+            or not isinstance(stale_after, Real)
+            or not math.isfinite(stale_after)
+            or stale_after <= 0
+        ):
+            raise ValueError("stale_after must be positive and finite, or None")
+        with self._state_condition:
+            request_counts = {status.value: 0 for status in RequestStatus}
+            for result in self._requests.values():
+                request_counts[result.status.value] += 1
+            initialized = self._initialized
+            scheduler_alive = (
+                self._bg_thread is not None and self._bg_thread.is_alive()
+            )
+            revision = self._health_revision
+
+        try:
+            robot_state = self._robot_task.query_state()
+            if robot_state is None:
+                robot = {"available": False, "error": "state unavailable"}
+            else:
+                robot = {
+                    "available": True,
+                    "joint_positions": list(robot_state.jps),
+                    "latest_move_id": robot_state.latest_sent_id,
+                    "latest_finished_move_id": robot_state.latest_finished_id,
+                }
+        except Exception as exc:
+            robot = {"available": False, "error": str(exc)}
+
+        peripherals = self.query_all_task_statuses()
+        now = time.time()
+        if stale_after is not None:
+            for status in peripherals.values():
+                if status is None:
+                    continue
+                observed_at = status.get("observed_at")
+                stale = (
+                    isinstance(observed_at, Real)
+                    and not isinstance(observed_at, bool)
+                    and math.isfinite(observed_at)
+                    and now - observed_at > stale_after
+                )
+                status["stale"] = stale
+                if stale and status.get("health") == DeviceHealth.ONLINE.value:
+                    status["health"] = DeviceHealth.DEGRADED.value
+        peripherals_available = all(
+            status is None
+            or (
+                status.get("available", True)
+                and status.get("health") == DeviceHealth.ONLINE.value
+            )
+            for status in peripherals.values()
+        )
+        return {
+            "healthy": (
+                initialized
+                and scheduler_alive
+                and robot["available"]
+                and peripherals_available
+            ),
+            "revision": revision,
+            "generated_at": now,
+            "pilot": {
+                "initialized": initialized,
+                "scheduler_alive": scheduler_alive,
+                "services": list(self.service_names),
+            },
+            "robot": robot,
+            "requests": {
+                "total": sum(request_counts.values()),
+                **request_counts,
+            },
+            "peripherals": peripherals,
+        }
+
+    def wait_health_change(
+        self, after_revision: int, timeout: Optional[float] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Wait for observable state newer than ``after_revision``.
+
+        Returns a fresh health snapshot, or ``None`` when the timeout expires.
+        """
+        if isinstance(after_revision, bool) or not isinstance(after_revision, int):
+            raise TypeError("after_revision must be an integer")
+        if after_revision < 0:
+            raise ValueError("after_revision must be non-negative")
+        if timeout is not None and (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, Real)
+            or not math.isfinite(timeout)
+            or timeout < 0
+        ):
+            raise ValueError("timeout must be non-negative and finite, or None")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._state_condition:
+            if after_revision > self._health_revision:
+                raise ValueError("after_revision is newer than the current revision")
+            while self._health_revision <= after_revision:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return None
+                self._state_condition.wait(remaining)
+        return self.query_health()
+
     def wait_request(self, request_id: int, timeout: Optional[float] = None) -> RequestResult:
-        if timeout is not None and (not math.isfinite(timeout) or timeout < 0):
+        if timeout is not None and (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, Real)
+            or not math.isfinite(timeout)
+            or timeout < 0
+        ):
             raise ValueError("timeout must be non-negative and finite, or None")
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._state_condition:
@@ -290,6 +553,32 @@ class TaskPilot:
                 else:
                     self._request_waiters.pop(request_id)
 
+    def wait_requests(
+        self, request_ids: List[int], timeout: Optional[float] = None
+    ) -> List[RequestResult]:
+        """Wait for requests in order using one shared timeout budget."""
+        if timeout is not None and (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, Real)
+            or not math.isfinite(timeout)
+            or timeout < 0
+        ):
+            raise ValueError("timeout must be non-negative and finite, or None")
+        ids = list(request_ids)
+        if any(
+            isinstance(request_id, bool) or not isinstance(request_id, int)
+            for request_id in ids
+        ):
+            raise TypeError("request_ids must contain integers")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        results = []
+        for request_id in ids:
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            results.append(self.wait_request(request_id, timeout=remaining))
+        return results
+
     def cancel_request(self, request_id: int) -> bool:
         with self._state_condition:
             result = self._requests.get(request_id)
@@ -311,6 +600,26 @@ class TaskPilot:
             )
         self._wake_event.set()
         return True
+
+    def cancel_all_requests(self, service_name: Optional[str] = None) -> List[int]:
+        """Best-effort cancel all nonterminal requests, optionally for one service."""
+        if service_name is not None and service_name not in self._task_map:
+            raise KeyError("Unknown service: {}".format(service_name))
+        with self._state_condition:
+            request_ids = [
+                request_id
+                for request_id, result in self._requests.items()
+                if not result.status.terminal
+                and (service_name is None or result.service_name == service_name)
+            ]
+        cancelled = []
+        for request_id in request_ids:
+            try:
+                if self.cancel_request(request_id):
+                    cancelled.append(request_id)
+            except KeyError:
+                continue
+        return cancelled
 
     def timeline(self, request_id: Optional[int] = None) -> List[TimelineEvent]:
         with self._state_condition:
@@ -342,7 +651,13 @@ class TaskPilot:
                 for request_id in prune_ids
             ]
             for request_id, _ in pruned:
-                self._requests.pop(request_id)
+                result = self._requests.pop(request_id)
+                if result.idempotency_key is not None:
+                    self._idempotency_requests.pop(
+                        (result.service_name, result.idempotency_key), None
+                    )
+            if pruned:
+                self._mark_health_changed_locked()
 
         for request_id, service_name in pruned:
             forget = getattr(self._task_map[service_name], "forget_response", None)
@@ -406,7 +721,7 @@ class TaskPilot:
             if status.terminal:
                 self._running_requests.pop(request_id, None)
             self._record_event_locked(request_id, status, error)
-            self._state_condition.notify_all()
+            self._mark_health_changed_locked()
             return True
 
     def _invoke_request(self, request: BackgroundRequest) -> None:
@@ -420,7 +735,7 @@ class TaskPilot:
                 current, status=RequestStatus.RUNNING, started_at=now
             )
             self._record_event_locked(request.request_id, RequestStatus.RUNNING)
-            self._state_condition.notify_all()
+            self._mark_health_changed_locked()
         try:
             accepted = self._task_map[request.service_name].invoke_async(
                 request.request_id, request.content
@@ -494,12 +809,12 @@ class TaskPilot:
             self._transition(request_id, RequestStatus.CANCELLED, error=reason)
 
     def _bg_thread_loop(self) -> None:
-        waiting: deque[TaskPilot.BackgroundRequest] = deque()
+        waiting: List[Tuple[int, int, TaskPilot.BackgroundRequest]] = []
         while not self._stop_event.is_set():
             self._wake_event.clear()
             while True:
                 try:
-                    request = self._task_queue.get_nowait()
+                    _, _, request = self._task_queue.get_nowait()
                 except queue.Empty:
                     break
                 with self._state_condition:
@@ -510,7 +825,9 @@ class TaskPilot:
                     self._invoke_request(request)
                 else:
                     self._transition(request.request_id, RequestStatus.WAITING_FOR_MOVE)
-                    waiting.append(request)
+                    heapq.heappush(
+                        waiting, (-request.priority, request.request_id, request)
+                    )
 
             if waiting:
                 try:
@@ -519,9 +836,10 @@ class TaskPilot:
                     logger.exception("Failed to query robot state")
                     robot_state = None
                 if robot_state is not None:
-                    remaining = deque()
+                    remaining = []
                     while waiting:
-                        request = waiting.popleft()
+                        priority_entry = heapq.heappop(waiting)
+                        request = priority_entry[2]
                         with self._state_condition:
                             result = self._requests.get(request.request_id)
                         if result is None or result.status.terminal:
@@ -529,7 +847,7 @@ class TaskPilot:
                         if request.associated_move_id <= robot_state.latest_finished_id:
                             self._invoke_request(request)
                         else:
-                            remaining.append(request)
+                            heapq.heappush(remaining, priority_entry)
                     waiting = remaining
 
             self._refresh_running()

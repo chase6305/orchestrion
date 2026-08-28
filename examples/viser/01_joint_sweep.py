@@ -1,5 +1,11 @@
 """Visualize a smooth UR5 joint-space sweep and return home."""
 
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from examples.viser.common import HOME_Q, PICK_Q, ViserDemoRuntime, run_demo
 
 

@@ -1,5 +1,11 @@
 """Render the end-effector Cartesian trail while animating the robot."""
 
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import numpy as np
 
 from examples.viser.common import (

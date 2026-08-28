@@ -1,5 +1,11 @@
 """Control robot poses and gripper actions from Viser GUI buttons."""
 
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import threading
 
 from examples.viser.common import HOME_Q, PICK_Q, PLACE_Q, ViserDemoRuntime, run_demo

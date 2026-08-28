@@ -30,6 +30,8 @@ class RequestResult:
     created_at: float = 0.0
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
+    priority: int = 0
+    idempotency_key: Optional[str] = None
 
 
 @dataclass(frozen=True)

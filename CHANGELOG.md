@@ -30,3 +30,24 @@
 - Make Viser demos wait for a browser, remain open by default, and report phases.
 - Add a consistent camera/world frame and replace the abstract trail with EE FK.
 - Hide payload props from demos that do not perform grasping.
+- Add direct-script support and a unified `python -m examples.viser` launcher.
+- Add TaskPilot peripheral-status APIs and live gripper health in the Viser GUI.
+- Isolate peripheral monitoring failures so one offline device cannot stop a snapshot.
+- Add a JSON-compatible system health snapshot for dashboards and health endpoints.
+- Add context-managed lifecycle helpers and protect the service registry from mutation.
+- Normalize device health/freshness and add a callable adapter plus multi-device example.
+- Add revision-based health change waiting for event-driven monitoring clients.
+- Add a generated multi-device orchestration illustration to the README.
+- Add a reference-style architecture infographic and refresh the Mermaid source map.
+- Add opt-in bounded retry/backoff for idempotent callable peripheral services.
+- Add `PollingTask` for cached continuous telemetry and sensor health reporting.
+- Add shared-deadline multi-request waiting and service-filtered bulk cancellation.
+- Serialize concurrent TaskPilot initialize/stop lifecycle calls.
+- Add stable integer priorities for queued and motion-synchronized requests.
+- Add service-scoped idempotency keys for safe command retransmission.
+- Add side-effect-free service discovery with capabilities and adapter metadata.
+- Add declarative command schemas with validation before device I/O and discovery metadata.
+- Refresh the Viser presentation with a dark control panel and real runtime capture.
+- Cap Viser gripper rendering at 60 Hz so fast headless demos remain reliable.
+- Expose Viser gripper commands, units, and position range through service discovery.
+- Replace the static Viser preview with a compact recording of the real demo 02 workflow.

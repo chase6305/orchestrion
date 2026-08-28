@@ -1,3 +1,5 @@
+import copy
+import json
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Optional
 
@@ -7,11 +9,37 @@ from orchestrion.utils.types import PeekResponseResult
 
 class GenericTask(ABC):
 
-    def __init__(self):
+    task_kind = "custom"
+    execution_mode = "custom"
+    supports_cancellation = False
+    supports_response_pruning = False
+
+    def __init__(self, metadata: Optional[Dict] = None):
         """
         Initialize the task instance.
         """
+        if metadata is not None and not isinstance(metadata, dict):
+            raise TypeError("metadata must be a dictionary or None")
+        try:
+            json.dumps(metadata or {}, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("metadata must be JSON-compatible") from exc
+        self._metadata = copy.deepcopy(metadata or {})
         self._completion_callback: Optional[Callable[[], None]] = None
+
+    def describe(self) -> Dict:
+        """Return static, side-effect-free service discovery information."""
+        return {
+            "task_type": type(self).__name__,
+            "kind": self.task_kind,
+            "execution": self.execution_mode,
+            "capabilities": {
+                "cancellation": self.supports_cancellation,
+                "response_pruning": self.supports_response_pruning,
+                "status": type(self).peek_status is not GenericTask.peek_status,
+            },
+            "metadata": copy.deepcopy(getattr(self, "_metadata", {})),
+        }
 
     def initialize(self, **kwargs):
         """

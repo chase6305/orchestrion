@@ -8,6 +8,7 @@ import pytest
 pytest.importorskip("viser")
 pytest.importorskip("yourdfpy")
 
+from examples.viser.__main__ import main as viser_demo_main
 from examples.viser.common import PICK_Q, PLACE_Q, ViserDemoRuntime
 from integrations.viser.viser_modular_robot_task import (
     ViserGripperTask,
@@ -34,6 +35,22 @@ DEMO_MODULES = [
 def test_viser_demo_imports(module_name):
     module = importlib.import_module(module_name)
     assert callable(module.workflow)
+
+
+def test_viser_launcher_lists_demos(capsys):
+    viser_demo_main(["--list"])
+    output = capsys.readouterr().out
+    assert "02  Pick and Place" in output
+    assert "08  Gripper Laboratory" in output
+
+
+def test_viser_launcher_forwards_help_to_selected_demo(capsys):
+    with pytest.raises(SystemExit) as error:
+        viser_demo_main(["02", "--help"])
+    assert error.value.code == 0
+    output = capsys.readouterr().out
+    assert "02 · Pick and Place" in output
+    assert "--no-wait-for-client" in output
 
 
 def test_viser_robot_accepts_configurable_scheduler_interval():
@@ -138,7 +155,17 @@ class RobotStub:
     scheduler_interval = 0.01
 
     def query_submodule_state(self, name):
-        return type("State", (), {"positions": [0.2]})()
+        return type(
+            "State",
+            (),
+            {
+                "positions": [0.2],
+                "latest_sent_id": 4,
+                "latest_finished_id": 4,
+                "active_move_id": None,
+                "cancelled_move_ids": (),
+            },
+        )()
 
     def move_submodule_trajectory_async(self, name, trajectory, interval):
         self.requests.append((name, trajectory, interval))
@@ -158,7 +185,10 @@ def test_viser_gripper_task_reports_result():
         task.initialize(executor=executor)
         assert task.invoke_async(0, {"action": "close"})
         deadline = time.monotonic() + 0.5
-        while task.peek_response(0).result_type is not PeekResponseResultType.ResponseFound:
+        while (
+            task.peek_response(0).result_type
+            is not PeekResponseResultType.ResponseFound
+        ):
             assert time.monotonic() < deadline
             time.sleep(0.005)
         response = task.peek_response(0)
@@ -172,6 +202,37 @@ def test_viser_gripper_task_reports_result():
     assert robot.requests[0][0] == "gripper"
     assert robot.requests[0][1][0] == [pytest.approx(0.2)]
     assert robot.requests[0][1][-1] == [pytest.approx(0.72)]
+    status = task.peek_status()
+    assert status["activity"] == "idle"
+    assert status["position"] == pytest.approx(0.2)
+    assert status["succeeded"] == 1
+
+
+def test_viser_gripper_caps_animation_update_rate():
+    robot = RobotStub()
+    robot.scheduler_interval = 0.001
+    task = ViserGripperTask(robot)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        assert task.invoke_async(0, {"action": "close"})
+        deadline = time.monotonic() + 0.5
+        while task.peek_response(0).result_type is not PeekResponseResultType.ResponseFound:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+    _, trajectory, interval = robot.requests[0]
+    assert interval == pytest.approx(1.0 / 60.0)
+    assert len(trajectory) < 50
+
+
+def test_viser_gripper_discovery_describes_commands_and_range():
+    description = ViserGripperTask(RobotStub()).describe()
+    assert description["kind"] == "actuator"
+    assert description["metadata"] == {
+        "device_type": "parallel_gripper",
+        "commands": ["open", "close", "set_position"],
+        "position_unit": "radian",
+        "position_range": [0.0, 0.725],
+    }
 
 
 def test_duplicate_request_id_does_not_corrupt_queued_sequence():

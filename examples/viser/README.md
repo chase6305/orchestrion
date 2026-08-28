@@ -17,26 +17,36 @@ When running on a remote machine, forward the port first:
 ssh -L 8080:localhost:8080 user@remote-host
 ```
 
-Then open `http://localhost:8080` on your local computer. Run commands from the
-repository root with `python -m ...`; direct execution of numbered files is not the
-supported entry point.
+Then open `http://localhost:8080` on your local computer. The preferred launcher is:
+
+```bash
+python -m examples.viser --list
+python -m examples.viser 02
+```
+
+The original module commands and direct commands such as
+`python examples/viser/02_pick_and_place.py` are also supported.
 
 | Demo | What it shows | Command |
 | --- | --- | --- |
-| 01 Joint Sweep | Smooth joint interpolation and return home | `python -m examples.viser.01_joint_sweep` |
-| 02 Pick and Place | Move-synchronized close/open actions | `python -m examples.viser.02_pick_and_place` |
-| 03 Segmented Sync | Actions attached to two segment move IDs | `python -m examples.viser.03_segmented_sync` |
-| 04 Parallel Motion | Arm and gripper executing concurrently | `python -m examples.viser.04_parallel_motion` |
-| 05 Request Timeline | Live request states rendered in the GUI | `python -m examples.viser.05_request_timeline` |
-| 06 Interactive Controls | GUI buttons for poses and gripper actions | `python -m examples.viser.06_interactive_controls` |
-| 07 Motion Trail | Animated robot plus its Cartesian end-effector path | `python -m examples.viser.07_motion_trail` |
-| 08 Gripper Lab | Interactive position, speed, reversal, and cancellation | `python -m examples.viser.08_gripper_lab` |
+| 01 Joint Sweep | Smooth joint interpolation and return home | `python -m examples.viser 01` |
+| 02 Pick and Place | Move-synchronized close/open actions | `python -m examples.viser 02` |
+| 03 Segmented Sync | Actions attached to two segment move IDs | `python -m examples.viser 03` |
+| 04 Parallel Motion | Arm and gripper executing concurrently | `python -m examples.viser 04` |
+| 05 Request Timeline | Live request states rendered in the GUI | `python -m examples.viser 05` |
+| 06 Interactive Controls | GUI buttons for poses and gripper actions | `python -m examples.viser 06` |
+| 07 Motion Trail | Animated robot plus its Cartesian end-effector path | `python -m examples.viser 07` |
+| 08 Gripper Lab | Interactive position, speed, reversal, and cancellation | `python -m examples.viser 08` |
+
+The repository README includes a real runtime recording of demo 02 at
+`assets/02-pick-and-place.webp`.
 
 For a quick headless smoke run:
 
 ```bash
 python -m examples.viser.02_pick_and_place \
-  --startup-delay 0 --duration 0 --steps 2 --interval 0.001
+  --startup-delay 0 --duration 0 --no-wait-for-client \
+  --steps 2 --interval 0.001
 ```
 
 The legacy command `python -m examples.viser.viser_modular_robot_task` remains

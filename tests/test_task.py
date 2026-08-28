@@ -1,12 +1,16 @@
 import concurrent.futures
+import threading
 import time
 
 import pytest
 
+from orchestrion import RetryPolicy
 from orchestrion.tasks.function_call_task import (
+    CallableTask,
     InPlaceFunctionCallTask,
     ThreadedPoolFunctionCallTask,
 )
+from orchestrion.tasks.polling_task import PollingTask
 from orchestrion.utils.types import PeekResponseResultType
 
 
@@ -66,6 +70,244 @@ def test_task_threaded():
         resp = task.peek_response(1)
         print("Threaded resp:", resp.content)
         assert resp.content["result"] == 6
+        status = task.peek_status()
+        assert status["pending"] == 0
+        assert status["succeeded"] == 1
+        assert status["failed"] == 0
+
+
+def test_callable_task_adapts_call_and_status_functions():
+    task = CallableTask(
+        lambda request_id, content: {
+            "request_id": request_id,
+            "value": content["value"] * 2,
+        },
+        status=lambda: {"device_type": "camera", "frames": 4},
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        assert task.invoke_async(3, {"value": 5})
+        deadline = time.monotonic() + 0.5
+        while task.peek_response(3).result_type is not PeekResponseResultType.ResponseFound:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        assert task.peek_response(3).content == {"request_id": 3, "value": 10}
+        assert task.peek_status()["device_type"] == "camera"
+
+
+def test_callable_task_description_is_static_and_defensive():
+    metadata = {"device_type": "camera", "commands": ["capture"]}
+    task = CallableTask(
+        lambda request_id, content: content,
+        retry_policy=RetryPolicy(
+            max_attempts=2, retry_exceptions=(ConnectionError,)
+        ),
+        metadata=metadata,
+    )
+    metadata["commands"].append("mutated")
+    description = task.describe()
+    assert description["kind"] == "command"
+    assert description["execution"] == "thread_pool"
+    assert description["capabilities"] == {
+        "cancellation": True,
+        "response_pruning": True,
+        "status": True,
+    }
+    assert description["metadata"]["commands"] == ["capture"]
+    assert description["retry"]["max_attempts"] == 2
+    assert description["retry"]["exception_types"] == ["ConnectionError"]
+    description["metadata"].clear()
+    assert task.describe()["metadata"]["device_type"] == "camera"
+
+
+def test_task_metadata_must_be_json_compatible():
+    with pytest.raises(ValueError, match="JSON-compatible"):
+        CallableTask(lambda request_id, content: content, metadata={"bad": {1, 2}})
+
+
+def test_callable_task_validates_callbacks_and_status_result():
+    with pytest.raises(TypeError, match="call must"):
+        CallableTask(None)
+    with pytest.raises(TypeError, match="status must"):
+        CallableTask(lambda request_id, content: content, status=object())
+
+    task = CallableTask(lambda request_id, content: content, status=lambda: "bad")
+    with pytest.raises(TypeError, match="status callable"):
+        task.peek_status()
+
+
+def test_callable_task_retries_selected_transient_failures():
+    attempts = []
+
+    def flaky_call(request_id, content):
+        attempts.append(request_id)
+        if len(attempts) < 3:
+            raise ConnectionError("camera reconnecting")
+        return {"ok": True}
+
+    task = CallableTask(
+        flaky_call,
+        retry_policy=RetryPolicy(
+            max_attempts=3,
+            delay=0,
+            retry_exceptions=(ConnectionError,),
+        ),
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        assert task.invoke_async(1)
+        deadline = time.monotonic() + 0.5
+        while task.peek_response(1).result_type is not PeekResponseResultType.ResponseFound:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+    assert attempts == [1, 1, 1]
+    assert task.peek_status()["total_retries"] == 2
+    assert task.peek_status()["latest_attempts"] == 3
+
+
+def test_callable_task_does_not_retry_unselected_failure():
+    task = CallableTask(
+        lambda request_id, content: (_ for _ in ()).throw(ValueError("bad command")),
+        retry_policy=RetryPolicy(
+            max_attempts=3, retry_exceptions=(ConnectionError,)
+        ),
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        assert task.invoke_async(1)
+        deadline = time.monotonic() + 0.5
+        response = task.peek_response(1)
+        while response.result_type is not PeekResponseResultType.ErrorUnknown:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+            response = task.peek_response(1)
+        assert response.error == "bad command"
+    assert task.peek_status()["total_retries"] == 0
+
+
+def test_callable_task_stop_interrupts_retry_backoff():
+    attempted = threading.Event()
+
+    def unavailable(request_id, content):
+        attempted.set()
+        raise ConnectionError("offline")
+
+    task = CallableTask(
+        unavailable,
+        retry_policy=RetryPolicy(
+            max_attempts=3,
+            delay=30.0,
+            retry_exceptions=(ConnectionError,),
+        ),
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        assert task.invoke_async(1)
+        assert attempted.wait(0.5)
+        started = time.monotonic()
+        task.stop()
+        deadline = started + 0.5
+        while task.peek_response(1).result_type is not PeekResponseResultType.ErrorUnknown:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({"max_attempts": 0}, ValueError),
+        ({"max_attempts": True}, TypeError),
+        ({"delay": -1}, ValueError),
+        ({"backoff": 0}, ValueError),
+        ({"max_delay": float("inf")}, ValueError),
+        ({"retry_exceptions": []}, TypeError),
+        ({"retry_exceptions": ()}, ValueError),
+    ],
+)
+def test_retry_policy_validates_configuration(kwargs, expected):
+    with pytest.raises(expected):
+        RetryPolicy(**kwargs)
+
+
+def test_retry_policy_caps_overflowing_exponential_delay():
+    policy = RetryPolicy(delay=1.0, backoff=1e308, max_delay=5.0)
+    assert policy.delay_before(4) == 5.0
+
+
+def test_polling_task_caches_latest_telemetry_and_reports_health():
+    sample_ready = threading.Event()
+    counter = {"value": 0}
+
+    def poll():
+        counter["value"] += 1
+        sample_ready.set()
+        return {"temperature": 20 + counter["value"]}
+
+    task = PollingTask(poll, interval=0.005)
+    task.initialize()
+    try:
+        assert sample_ready.wait(0.5)
+        assert task.invoke_async(1)
+        response = task.peek_response(1)
+        assert response.result_type is PeekResponseResultType.ResponseFound
+        assert response.content["sample"]["temperature"] >= 21
+        status = task.peek_status()
+        assert status["health"] == "online"
+        assert status["available"]
+        assert status["observed_at"] > 0
+    finally:
+        task.stop()
+    assert task.peek_status()["health"] == "offline"
+    assert not task.peek_status()["initialized"]
+
+
+def test_polling_task_description_identifies_cached_telemetry():
+    task = PollingTask(
+        lambda: {"celsius": 24.0},
+        interval=0.25,
+        metadata={"unit": "celsius"},
+    )
+    description = task.describe()
+    assert description["kind"] == "telemetry"
+    assert description["execution"] == "background_polling"
+    assert description["poll_interval"] == 0.25
+    assert description["metadata"] == {"unit": "celsius"}
+
+
+def test_polling_task_degrades_after_failure_but_keeps_last_sample():
+    second_poll = threading.Event()
+    attempts = {"count": 0}
+
+    def poll():
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            return {"input": True}
+        second_poll.set()
+        raise ConnectionError("PLC timeout")
+
+    task = PollingTask(poll, interval=0.005)
+    task.initialize()
+    try:
+        assert second_poll.wait(0.5)
+        deadline = time.monotonic() + 0.5
+        while task.peek_status()["consecutive_failures"] == 0:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        status = task.peek_status()
+        assert status["health"] == "degraded"
+        assert status["available"]
+        assert status["last_error"] == "PLC timeout"
+        assert task.invoke_async(1)
+        assert task.peek_response(1).content["sample"] == {"input": True}
+    finally:
+        task.stop()
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), True])
+def test_polling_task_validates_interval(value):
+    with pytest.raises(ValueError, match="interval"):
+        PollingTask(lambda: {}, interval=value)
 
 
 def test_task_inplace_duplicate_request():
@@ -73,6 +315,18 @@ def test_task_inplace_duplicate_request():
     assert task.invoke_async(1, {"value": 3})
     # Duplicate request_id should return False
     assert not task.invoke_async(1, {"value": 4})
+
+
+def test_out_of_order_request_does_not_mark_gap_as_flushed():
+    task = InPlaceTaskStub()
+    assert task.invoke_async(2, {"value": 2})
+    assert (
+        task.peek_response(1).result_type
+        is PeekResponseResultType.ErrorRequestNotSent
+    )
+    assert task.invoke_async(0, {"value": 0})
+    assert task.invoke_async(1, {"value": 1})
+    assert not task.invoke_async(2, {"value": 2})
 
 
 def test_task_inplace_max_result_count():

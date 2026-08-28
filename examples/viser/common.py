@@ -67,13 +67,20 @@ class ViserDemoRuntime:
         scheduler_interval: float = 0.01,
     ):
         self.server = viser.ViserServer(host=host, port=port, label=title)
-        self.server.initial_camera.position = (1.8, -1.8, 1.3)
+        self.server.gui.configure_theme(
+            control_layout="fixed",
+            control_width="medium",
+            dark_mode=True,
+            show_share_button=False,
+            brand_color=(70, 110, 230),
+        )
+        self.server.initial_camera.position = (1.25, -1.25, 0.95)
         self.server.initial_camera.look_at = (0.0, 0.0, 0.35)
         self.server.initial_camera.up_direction = (0.0, 0.0, 1.0)
         self.server.scene.add_grid(
             "/world/grid",
-            width=4.0,
-            height=4.0,
+            width=2.4,
+            height=2.4,
             cell_size=0.1,
             section_size=0.5,
         )
@@ -93,7 +100,9 @@ class ViserDemoRuntime:
             disabled=True,
         )
         self._gripper_status = self.server.gui.add_markdown(
-            "**Gripper:** idle · position `0.000`"
+            "## Peripheral health\n"
+            "**gripper** · starting · idle\n\n"
+            "Position `0.000` · Move `—` · Pending `0` · Failed `0`"
         )
         self._payload_status = self.server.gui.add_markdown("**Payload:** not configured")
         self._monitor_stop = threading.Event()
@@ -193,23 +202,32 @@ class ViserDemoRuntime:
 
     def _monitor_gripper(self) -> None:
         while not self._monitor_stop.wait(0.05):
-            state = self.robot.query_submodule_state("gripper")
-            self._gripper_slider.value = state.positions[0]
-            if state.active_move_id is not None:
-                activity = "moving"
-            elif (
-                state.latest_sent_id > state.latest_finished_id
-                and state.latest_sent_id not in state.cancelled_move_ids
-            ):
-                activity = "queued"
-            else:
-                activity = "idle"
+            try:
+                status = self.pilot.query_task_status("gripper")
+            except Exception as exc:
+                self._gripper_status.content = (
+                    "## Peripheral health\n"
+                    "**gripper** · **offline**\n\nDetail: `{}`".format(exc)
+                )
+                continue
+            if status is None:
+                self._gripper_status.content = (
+                    "## Peripheral health\n"
+                    "**gripper** · unknown\n\nDetail: status unsupported"
+                )
+                continue
+            self._gripper_slider.value = status["position"]
             self._gripper_status.content = (
-                "**Gripper:** {} · position `{:.3f}` · move `{}/{}`".format(
-                    activity,
-                    state.positions[0],
-                    state.latest_finished_id,
-                    state.latest_sent_id,
+                "## Peripheral health\n"
+                "**gripper** · {} · {}\n\n"
+                "Position `{:.3f}` · Move `{}/{}` · Pending `{}` · Failed `{}`".format(
+                    "online" if status["initialized"] else "offline",
+                    status["activity"],
+                    status["position"],
+                    status["latest_finished_move_id"],
+                    status["latest_move_id"],
+                    status["pending"],
+                    status["failed"],
                 )
             )
 
