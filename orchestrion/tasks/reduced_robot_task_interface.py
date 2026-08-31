@@ -105,11 +105,17 @@ class ReducedRobotTaskInterface(ABC):
         return True
 
     @staticmethod
-    def _is_finite_trajectory(motion_target: List[List[float]]) -> bool:
-        return all(
+    def _is_finite_real(value: object) -> bool:
+        return (
             not isinstance(value, bool)
             and isinstance(value, Real)
-            and math.isfinite(float(value))
+            and math.isfinite(value)
+        )
+
+    @staticmethod
+    def _is_finite_trajectory(motion_target: List[List[float]]) -> bool:
+        return all(
+            ReducedRobotTaskInterface._is_finite_real(value)
             for point in motion_target
             for value in point
         )

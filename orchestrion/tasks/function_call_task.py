@@ -248,20 +248,50 @@ class ThreadedPoolFunctionCallTask(GenericTask):
             executor = self._executor_not_own
             if executor is None:
                 raise RuntimeError("Task must be initialized before use")
+            reservation_state = (
+                self._accepted_request_floor,
+                self._out_of_order_request_ids.copy(),
+                self._latest_sent_request,
+            )
             if not self._reserve_request_id_locked(request_id):
                 return False
-            invoke_future = executor.submit(self._call_fn, request_id, content)
-            invoke_future.add_done_callback(lambda _: self._notify_completion())
+            try:
+                invoke_future = executor.submit(self._call_fn, request_id, content)
+            except Exception:
+                (
+                    self._accepted_request_floor,
+                    self._out_of_order_request_ids,
+                    self._latest_sent_request,
+                ) = reservation_state
+                raise
             self._future_map[request_id] = invoke_future
             if self._max_result_count > 0:
                 heapq.heappush(self._request_id_pq, (request_id, request_id))
-                while len(self._request_id_pq) > self._max_result_count:
-                    pop_request_id, _ = heapq.heappop(self._request_id_pq)
-                    pop_future = self._future_map.pop(pop_request_id, None)
-                    if pop_future is not None:
-                        pop_future.cancel()
+        # Register outside the lock: add_done_callback() invokes synchronously
+        # when a very fast future has already completed.
+        invoke_future.add_done_callback(self._on_future_done)
 
         return True
+
+    def _on_future_done(self, _: concurrent.futures.Future) -> None:
+        with self._lock:
+            if self._max_result_count > 0:
+                completed_ids = sorted(
+                    request_id
+                    for request_id, future in self._future_map.items()
+                    if future.done()
+                )
+                for request_id in completed_ids[: -self._max_result_count]:
+                    self._future_map.pop(request_id, None)
+                if self._request_id_pq is not None:
+                    retained_ids = set(self._future_map)
+                    self._request_id_pq = [
+                        entry
+                        for entry in self._request_id_pq
+                        if entry[0] in retained_ids
+                    ]
+                    heapq.heapify(self._request_id_pq)
+        self._notify_completion()
 
     def _reserve_request_id_locked(self, request_id: int) -> bool:
         if self._request_id_is_reserved_locked(request_id):

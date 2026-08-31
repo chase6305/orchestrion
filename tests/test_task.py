@@ -383,6 +383,58 @@ def test_task_threaded_max_result_count():
         assert resp4.result_type == PeekResponseResultType.ResponseFound
 
 
+def test_threaded_result_limit_does_not_cancel_pending_requests():
+    release = threading.Event()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        blocker = executor.submit(release.wait)
+        task = ThreadedPoolTaskStub(max_result_count=1)
+        task.initialize(executor=executor)
+        assert task.invoke_async(1, {"value": 1})
+        assert task.invoke_async(2, {"value": 2})
+        assert (
+            task.peek_response(1).result_type
+            is PeekResponseResultType.RequestSentNoResponse
+        )
+        assert (
+            task.peek_response(2).result_type
+            is PeekResponseResultType.RequestSentNoResponse
+        )
+        release.set()
+        blocker.result(timeout=0.5)
+        deadline = time.monotonic() + 0.5
+        while task.peek_response(2).result_type is not PeekResponseResultType.ResponseFound:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        assert (
+            task.peek_response(1).result_type
+            is PeekResponseResultType.ResponseReceivedButFlushed
+        )
+
+
+def test_threaded_submit_failure_releases_request_id_for_retry():
+    class FailOnceExecutor:
+        def __init__(self, executor):
+            self.executor = executor
+            self.failed = False
+
+        def submit(self, fn, *args):
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("submit failed")
+            return self.executor.submit(fn, *args)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task = ThreadedPoolTaskStub()
+        task.initialize(executor=FailOnceExecutor(executor))
+        with pytest.raises(RuntimeError, match="submit failed"):
+            task.invoke_async(1, {"value": 1})
+        assert (
+            task.peek_response(1).result_type
+            is PeekResponseResultType.ErrorRequestNotSent
+        )
+        assert task.invoke_async(1, {"value": 1})
+
+
 def test_task_threaded_cancel():
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         task = ThreadedPoolTaskStub(max_result_count=1)

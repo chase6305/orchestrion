@@ -1,3 +1,4 @@
+import concurrent.futures
 import threading
 import time
 
@@ -32,7 +33,9 @@ def make_robot(interval=0.005):
     return RobotTaskStub([0.0] * 4, main, [gripper], interval=interval)
 
 
-@pytest.mark.parametrize("interval", [0.0, -0.01, float("nan"), float("inf")])
+@pytest.mark.parametrize(
+    "interval", [0.0, -0.01, float("nan"), float("inf"), "0.01", True]
+)
 def test_scheduler_rejects_invalid_interval(interval):
     with pytest.raises(ValueError, match="interval"):
         make_robot(interval)
@@ -78,7 +81,9 @@ def test_module_layout_rejects_non_integer_dof_ranges(dof_begin, n_dof):
         RobotTaskStub([0.0], SubModuleTask("arm", dof_begin, n_dof), [])
 
 
-@pytest.mark.parametrize("interval", [0.0, -0.01, float("nan"), float("inf")])
+@pytest.mark.parametrize(
+    "interval", [0.0, -0.01, float("nan"), float("inf"), "0.01", True]
+)
 def test_motion_rejects_invalid_interval(interval):
     robot = make_robot()
     assert robot.move_joint_trajectory_async([[0.0, 0.0, 0.0]], interval) == -1
@@ -108,9 +113,13 @@ def test_main_motion_rejects_invalid_endpoint_types(endpoints):
     [
         (float("nan"), 0.01),
         (float("inf"), 0.01),
+        ("0.1", 0.01),
+        (True, 0.01),
         (0.1, 0.0),
         (0.1, -0.01),
         (0.1, float("nan")),
+        (0.1, "0.01"),
+        (0.1, True),
     ],
 )
 def test_wait_move_rejects_invalid_timing(time_out, interval):
@@ -118,7 +127,9 @@ def test_wait_move_rejects_invalid_timing(time_out, interval):
         make_robot().wait_move(time_out=time_out, interval=interval)
 
 
-@pytest.mark.parametrize("timeout", [-0.1, float("nan"), float("inf")])
+@pytest.mark.parametrize(
+    "timeout", [-0.1, float("nan"), float("inf"), "0.1", True]
+)
 def test_robot_stop_rejects_invalid_timeout(timeout):
     with pytest.raises(ValueError, match="timeout"):
         make_robot().stop(timeout=timeout)
@@ -206,6 +217,22 @@ def test_robot_can_restart():
     robot = make_robot()
     robot.initialize()
     robot.stop()
+
+
+def test_concurrent_initialize_and_stop_are_serialized():
+    robot = make_robot()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(robot.initialize) for _ in range(16)]
+        for future in futures:
+            future.result(timeout=0.5)
+        thread = robot._bg_thread
+        assert thread is not None and thread.is_alive()
+
+        futures = [executor.submit(robot.stop) for _ in range(16)]
+        for future in futures:
+            future.result(timeout=0.5)
+    assert robot._bg_thread is thread
+    assert not thread.is_alive()
     robot.initialize()
     robot.stop()
 
@@ -243,6 +270,34 @@ def test_submodule_move_has_state_and_completion_id():
         assert state.latest_finished_id == 0
     finally:
         robot.stop()
+
+
+@pytest.mark.parametrize(
+    "timeout", [-0.1, float("nan"), float("inf"), "0.1", True]
+)
+def test_wait_submodule_move_rejects_invalid_timeout(timeout):
+    with pytest.raises(ValueError, match="timeout"):
+        make_robot().wait_submodule_move("gripper", 0, timeout=timeout)
+
+
+@pytest.mark.parametrize("move_id", [True, 1.5, "0"])
+def test_submodule_move_apis_reject_non_integer_move_ids(move_id):
+    robot = make_robot()
+    with pytest.raises(TypeError, match="move_id"):
+        robot.wait_submodule_move("gripper", move_id)
+    with pytest.raises(TypeError, match="move_id"):
+        robot.cancel_submodule_move("gripper", move_id)
+
+
+def test_submodule_move_apis_reject_negative_and_unknown_move_ids():
+    robot = make_robot()
+    with pytest.raises(ValueError, match="non-negative"):
+        robot.wait_submodule_move("gripper", -1)
+    with pytest.raises(ValueError, match="non-negative"):
+        robot.cancel_submodule_move("gripper", -1)
+    with pytest.raises(KeyError, match="Unknown move"):
+        robot.wait_submodule_move("gripper", 0)
+    assert not robot.cancel_submodule_move("gripper", 0)
 
 
 def test_submodule_move_can_be_cancelled():

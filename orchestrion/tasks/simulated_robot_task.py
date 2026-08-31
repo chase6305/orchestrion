@@ -1,7 +1,6 @@
 """Deterministic in-process robot backend for demos and integration tests."""
 
 import copy
-import math
 import queue
 import threading
 import time
@@ -22,6 +21,7 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
             raise ValueError("initial_joints must contain finite real numbers")
         self._state = self.ReducedRobotState(initial_joints.copy(), -1, -1)
         self._lock = threading.RLock()
+        self._lifecycle_lock = threading.Lock()
         self._state_condition = threading.Condition(self._lock)
         self._queue: queue.SimpleQueue[ReducedRobotTaskInterface.MovementRequest] = (
             queue.SimpleQueue()
@@ -36,6 +36,10 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
             self._state_change_callback = callback
 
     def initialize(self) -> None:
+        with self._lifecycle_lock:
+            self._initialize_locked()
+
+    def _initialize_locked(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
@@ -46,7 +50,11 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
         self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
-        if not math.isfinite(timeout) or timeout < 0:
+        with self._lifecycle_lock:
+            self._stop_locked(timeout)
+
+    def _stop_locked(self, timeout: float) -> None:
+        if not self._is_finite_real(timeout) or timeout < 0:
             raise ValueError("timeout must be non-negative and finite")
         self._stop_event.set()
         self._wake_event.set()
@@ -68,7 +76,7 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
         interval: float = 0.01,
         endpoint_index: Optional[List[int]] = None,
     ) -> int:
-        if not math.isfinite(interval) or interval <= 0:
+        if not self._is_finite_real(interval) or interval <= 0:
             return -1
         if not motion_target:
             return -1
@@ -102,9 +110,9 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
             return copy.deepcopy(self._state)
 
     def wait_move(self, time_out: float = -1, interval: float = 0.05) -> bool:
-        if not math.isfinite(time_out):
+        if not self._is_finite_real(time_out):
             raise ValueError("time_out must be finite")
-        if not math.isfinite(interval) or interval <= 0:
+        if not self._is_finite_real(interval) or interval <= 0:
             raise ValueError("interval must be positive and finite")
         with self._lock:
             target_id = self._state.latest_sent_id

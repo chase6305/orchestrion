@@ -217,6 +217,12 @@ class TaskPilot:
         if not self._initialized:
             logger.warning("TaskPilot is not running or already stopped.")
             return
+        # Close request admission before cancelling queued/running work. A caller
+        # that began preparing a request just before stop() must not enqueue it
+        # after the cancellation pass has completed.
+        with self._state_condition:
+            self._initialized = False
+            self._mark_health_changed_locked()
         self._stop_event.set()
         self._wake_event.set()
         thread_timed_out = False
@@ -264,7 +270,6 @@ class TaskPilot:
                     self._robot_task.stop()
                 finally:
                     with self._state_condition:
-                        self._initialized = False
                         self._mark_health_changed_locked()
         if thread_timed_out:
             raise TimeoutError("TaskPilot background thread did not stop in time")
@@ -311,6 +316,10 @@ class TaskPilot:
 
         request_content = copy.deepcopy(content)
         with self._state_condition:
+            if not self._initialized:
+                raise RuntimeError(
+                    "TaskPilot stopped while the request was being prepared"
+                )
             if deduplication_key is not None:
                 existing_id = self._idempotency_requests.get(deduplication_key)
                 if existing_id is not None:
@@ -342,10 +351,18 @@ class TaskPilot:
         self._wake_event.set()
         return request_id
 
+    @staticmethod
+    def _validate_request_id(request_id: int) -> None:
+        if isinstance(request_id, bool) or not isinstance(request_id, int):
+            raise TypeError("request_id must be an integer")
+        if request_id < 0:
+            raise ValueError("request_id must be non-negative")
+
     def query_request(self, request_id: int) -> RequestResult:
+        self._validate_request_id(request_id)
         with self._state_condition:
             try:
-                return self._requests[request_id]
+                return copy.deepcopy(self._requests[request_id])
             except KeyError:
                 raise KeyError("Unknown request: {}".format(request_id)) from None
 
@@ -523,6 +540,7 @@ class TaskPilot:
         return self.query_health()
 
     def wait_request(self, request_id: int, timeout: Optional[float] = None) -> RequestResult:
+        self._validate_request_id(request_id)
         if timeout is not None and (
             isinstance(timeout, bool)
             or not isinstance(timeout, Real)
@@ -545,7 +563,7 @@ class TaskPilot:
                             "Request {} did not finish in time".format(request_id)
                         )
                     self._state_condition.wait(remaining)
-                return self._requests[request_id]
+                return copy.deepcopy(self._requests[request_id])
             finally:
                 waiter_count = self._request_waiters[request_id] - 1
                 if waiter_count:
@@ -580,6 +598,7 @@ class TaskPilot:
         return results
 
     def cancel_request(self, request_id: int) -> bool:
+        self._validate_request_id(request_id)
         with self._state_condition:
             result = self._requests.get(request_id)
             if result is None:
@@ -622,6 +641,8 @@ class TaskPilot:
         return cancelled
 
     def timeline(self, request_id: Optional[int] = None) -> List[TimelineEvent]:
+        if request_id is not None:
+            self._validate_request_id(request_id)
         with self._state_condition:
             events = list(self._timeline)
         if request_id is None:

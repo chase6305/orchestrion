@@ -573,6 +573,51 @@ def test_invalid_request_timeout_is_rejected(value):
         pilot.stop()
 
 
+@pytest.mark.parametrize("request_id", [True, 1.5, "1"])
+def test_request_apis_reject_non_integer_ids(request_id):
+    pilot = TaskPilot(SimulatedRobotTask([0.0]))
+    with pytest.raises(TypeError, match="request_id"):
+        pilot.query_request(request_id)
+    with pytest.raises(TypeError, match="request_id"):
+        pilot.wait_request(request_id)
+    with pytest.raises(TypeError, match="request_id"):
+        pilot.cancel_request(request_id)
+    with pytest.raises(TypeError, match="request_id"):
+        pilot.timeline(request_id)
+
+
+def test_request_apis_reject_negative_ids():
+    pilot = TaskPilot(SimulatedRobotTask([0.0]))
+    with pytest.raises(ValueError, match="non-negative"):
+        pilot.query_request(-1)
+    with pytest.raises(ValueError, match="non-negative"):
+        pilot.wait_request(-1)
+    with pytest.raises(ValueError, match="non-negative"):
+        pilot.cancel_request(-1)
+    with pytest.raises(ValueError, match="non-negative"):
+        pilot.timeline(-1)
+
+
+def test_request_results_are_defensive_copies():
+    pilot = TaskPilot(SimulatedRobotTask([0.0]), {"echo": EchoTask()})
+    pilot.initialize()
+    try:
+        request_id = pilot.call_srv_async(
+            "echo",
+            {"nested": {"value": 1}},
+            sync_option=MoveSyncOption.no_sync(),
+        )
+        result = pilot.wait_request(request_id, timeout=0.5)
+        result.content["nested"]["value"] = 99
+        assert pilot.query_request(request_id).content["nested"]["value"] == 1
+
+        queried = pilot.query_request(request_id)
+        queried.content["nested"]["value"] = 42
+        assert pilot.query_request(request_id).content["nested"]["value"] == 1
+    finally:
+        pilot.stop()
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), 0.0, -0.1])
 def test_simulated_robot_rejects_invalid_motion_interval(value):
     robot = SimulatedRobotTask([0.0])
@@ -605,7 +650,9 @@ def test_simulated_wait_rejects_invalid_timing(time_out, interval):
         SimulatedRobotTask([0.0]).wait_move(time_out=time_out, interval=interval)
 
 
-@pytest.mark.parametrize("timeout", [-0.1, float("nan"), float("inf")])
+@pytest.mark.parametrize(
+    "timeout", [-0.1, float("nan"), float("inf"), "0.1", True]
+)
 def test_simulated_stop_rejects_invalid_timeout(timeout):
     with pytest.raises(ValueError, match="timeout"):
         SimulatedRobotTask([0.0]).stop(timeout=timeout)
@@ -629,6 +676,22 @@ def test_simulated_wait_is_woken_by_completion_before_poll_interval():
         assert time.monotonic() - started < 0.1
     finally:
         robot.stop()
+
+
+def test_simulated_robot_concurrent_lifecycle_calls_are_serialized():
+    robot = SimulatedRobotTask([0.0])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(robot.initialize) for _ in range(16)]
+        for future in futures:
+            future.result(timeout=0.5)
+        thread = robot._thread
+        assert thread is not None and thread.is_alive()
+
+        futures = [executor.submit(robot.stop) for _ in range(16)]
+        for future in futures:
+            future.result(timeout=0.5)
+    assert robot._thread is thread
+    assert not thread.is_alive()
 
 
 @pytest.mark.parametrize("timeout", [-0.1, float("nan"), float("inf"), True])
@@ -697,6 +760,33 @@ def test_stop_cancels_requests_and_unblocks_waiters():
     waiter.join(timeout=0.5)
     assert not waiter.is_alive()
     assert outcome[0].status is RequestStatus.CANCELLED
+
+
+def test_stop_does_not_allow_request_to_enqueue_after_cancellation_pass():
+    preparing = threading.Event()
+    release = threading.Event()
+
+    class BlockingCopyDict(dict):
+        def __deepcopy__(self, memo):
+            preparing.set()
+            assert release.wait(0.5)
+            return dict(self)
+
+    pilot = TaskPilot(SimulatedRobotTask([0.0]), {"echo": EchoTask()})
+    pilot.initialize()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        caller = executor.submit(
+            pilot.call_srv_async,
+            "echo",
+            BlockingCopyDict(value=1),
+            MoveSyncOption.no_sync(),
+        )
+        assert preparing.wait(0.5)
+        pilot.stop()
+        release.set()
+        with pytest.raises(RuntimeError, match="stopped"):
+            caller.result(timeout=0.5)
+    assert pilot.timeline() == []
 
 
 def test_stop_does_not_wait_forever_for_running_callback():

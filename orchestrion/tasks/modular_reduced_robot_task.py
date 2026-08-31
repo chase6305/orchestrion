@@ -1,5 +1,4 @@
 import copy
-import math
 import queue
 import threading
 import time
@@ -63,11 +62,12 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         interval: float = 0.01,
     ):
         super().__init__()
-        if not math.isfinite(interval) or interval <= 0:
+        if not self._is_finite_real(interval) or interval <= 0:
             raise ValueError("Scheduler interval must be positive and finite")
         if not init_full_q or not self._is_finite_trajectory([init_full_q]):
             raise ValueError("Initial joints must be finite real numbers")
         self._lock = threading.RLock()
+        self._lifecycle_lock = threading.Lock()
         self._state_condition = threading.Condition(self._lock)
         self._current_full_q = init_full_q.copy()
         self._finished_move_id = -1
@@ -149,6 +149,10 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         """
         Initialize and start the background thread for processing movement requests.
         """
+        with self._lifecycle_lock:
+            self._initialize_locked()
+
+    def _initialize_locked(self) -> None:
         if self._bg_thread is not None and self._bg_thread.is_alive():
             logger.warning("Background thread is already running.")
             return
@@ -163,7 +167,11 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         """
         Stop the background thread and wait for it to finish.
         """
-        if not math.isfinite(timeout) or timeout < 0:
+        with self._lifecycle_lock:
+            self._stop_locked(timeout)
+
+    def _stop_locked(self, timeout: float) -> None:
+        if not self._is_finite_real(timeout) or timeout < 0:
             raise ValueError("timeout must be non-negative and finite")
         self._stop_event.set()
         with self._state_condition:
@@ -207,7 +215,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         Returns:
             int: Move ID if the request was accepted, -1 otherwise.
         """
-        if not math.isfinite(interval) or interval <= 0:
+        if not self._is_finite_real(interval) or interval <= 0:
             return -1
         if not motion_target:
             return -1
@@ -262,7 +270,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         motion_target: List[List[float]],
         interval: float = 0.01,
     ) -> int:
-        if not math.isfinite(interval) or interval <= 0:
+        if not self._is_finite_real(interval) or interval <= 0:
             return -1
         module = self._sub_task_map.get(submodule_name)
         if module is None or not motion_target:
@@ -309,12 +317,24 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
     def wait_submodule_move(
         self, submodule_name: str, move_id: int, timeout: Optional[float] = None
     ) -> bool:
-        if timeout is not None and timeout < 0:
-            raise ValueError("timeout must be non-negative or None")
-        if submodule_name not in self._sub_task_map:
-            raise KeyError("Unknown submodule: {}".format(submodule_name))
+        if isinstance(move_id, bool) or not isinstance(move_id, int):
+            raise TypeError("move_id must be an integer")
+        if move_id < 0:
+            raise ValueError("move_id must be non-negative")
+        if timeout is not None and (
+            not self._is_finite_real(timeout) or timeout < 0
+        ):
+            raise ValueError("timeout must be non-negative and finite, or None")
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._state_condition:
+            if submodule_name not in self._sub_task_map:
+                raise KeyError("Unknown submodule: {}".format(submodule_name))
+            if move_id > self._submodule_sent_ids[submodule_name]:
+                raise KeyError(
+                    "Unknown move {} for submodule {}".format(
+                        move_id, submodule_name
+                    )
+                )
             if (submodule_name, move_id) in self._cancelled_submodule_moves:
                 return False
             while self._submodule_finished_ids[submodule_name] < move_id:
@@ -329,6 +349,10 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
             return True
 
     def cancel_submodule_move(self, submodule_name: str, move_id: int) -> bool:
+        if isinstance(move_id, bool) or not isinstance(move_id, int):
+            raise TypeError("move_id must be an integer")
+        if move_id < 0:
+            raise ValueError("move_id must be non-negative")
         with self._state_condition:
             if submodule_name not in self._sub_task_map:
                 raise KeyError("Unknown submodule: {}".format(submodule_name))
@@ -369,9 +393,9 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         Returns:
             bool: True if movements finished before timeout, False otherwise.
         """
-        if not math.isfinite(time_out):
+        if not self._is_finite_real(time_out):
             raise ValueError("time_out must be finite")
-        if not math.isfinite(interval) or interval <= 0:
+        if not self._is_finite_real(interval) or interval <= 0:
             raise ValueError("interval must be positive and finite")
         sent_id = self.query_state().latest_sent_id
         deadline = None if time_out < 0 else time.monotonic() + time_out

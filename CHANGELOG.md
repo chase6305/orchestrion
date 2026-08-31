@@ -51,3 +51,5 @@
 - Cap Viser gripper rendering at 60 Hz so fast headless demos remain reliable.
 - Expose Viser gripper commands, units, and position range through service discovery.
 - Replace the static Viser preview with a compact recording of the real demo 02 workflow.
+- Add a ticket-based HTTP device demo with long-poll response waiting, health
+  discovery, transport retries, and end-to-end idempotency.

@@ -203,6 +203,32 @@ background and serves the latest cached value. Pass `stale_after` to
 Use `DeviceHealth` values (`unknown`, `connecting`, `online`, `degraded`, and
 `offline`) in adapters; malformed health values and timestamps are rejected early.
 
+### Network service demo
+
+Run `python -m examples.network_service_demo` for an end-to-end HTTP example with
+no external dependencies. The demo starts a simulated device on a loopback port,
+moves the robot, submits a synchronized remote tool command, receives an operation
+ticket, and long-polls until the remote action finishes.
+
+The example separates protocol concerns into two modules:
+
+- `examples.network_device_service` implements the device-facing HTTP service:
+  `POST /commands`, `GET /operations/{id}?wait=...`, and `GET /health`.
+- `examples.network_service_demo` implements `NetworkDeviceClient`, wraps it in a
+  `CallableTask`, and waits for the final response through `TaskPilot`.
+
+Each command carries both an Orchestrion `idempotency_key` and a protocol-level
+`Idempotency-Key`. This distinction matters in production: the first deduplicates
+local submissions, while the second prevents a remote actuator command from being
+executed twice when the HTTP response is lost and the client retries. Only
+connection failures are retried automatically; a remote operation timeout is
+reported as a failed request for the application to reconcile explicitly.
+
+To inspect the device protocol independently, run
+`python -m examples.network_device_service` and connect to port 8080. In a real
+adapter, keep the same ticket/wait shape but replace the simulated service with the
+device gateway, message broker, or RPC client used by the deployment.
+
 Idempotent reads may opt into bounded retry with `RetryPolicy`. Retry is disabled
 by default; do not enable it for non-idempotent actuator or PLC writes unless the
 device protocol supplies an idempotency key:
@@ -353,6 +379,8 @@ integrations/
     viser_modular_robot_task.py
 
 examples/
+  network_device_service.py
+  network_service_demo.py
   simulated_multi_peripheral.py
   simulated_pick_and_place.py
   viser/
