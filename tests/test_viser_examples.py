@@ -2,12 +2,22 @@ import concurrent.futures
 import importlib
 import threading
 import time
+from pathlib import Path
 
+import numpy as np
 import pytest
+import yourdfpy
 
 pytest.importorskip("viser")
 pytest.importorskip("yourdfpy")
 
+from examples.dual_arm.viser import (
+    DualArmViserRuntime,
+    ReplayFrame,
+    replay_frame_index,
+    visual_arm_configuration,
+    world_ee_position,
+)
 from examples.viser.__main__ import main as viser_demo_main
 from examples.viser.common import PICK_Q, PLACE_Q, ViserDemoRuntime
 from integrations.viser.viser_modular_robot_task import (
@@ -51,6 +61,98 @@ def test_viser_launcher_forwards_help_to_selected_demo(capsys):
     output = capsys.readouterr().out
     assert "02 · Pick and Place" in output
     assert "--no-wait-for-client" in output
+
+
+def test_dual_arm_visual_configuration_adds_stable_wrist_pose():
+    configuration = visual_arm_configuration([0.2, -0.3, 0.4])
+    assert configuration.shape == (6,)
+    assert np.all(np.isfinite(configuration))
+
+
+def test_dual_arm_visual_handoff_poses_are_mirrored():
+    left = visual_arm_configuration([0.35, -0.05, -0.25], "left")
+    right = visual_arm_configuration([0.35, 0.05, 0.25], "right")
+    assert left.shape == right.shape == (6,)
+
+
+def test_dual_arm_visual_handoff_end_effectors_meet():
+    urdf_path = Path(__file__).resolve().parents[1] / "assets" / "UR5" / "UR5.urdf"
+    left_urdf = yourdfpy.URDF.load(str(urdf_path))
+    right_urdf = yourdfpy.URDF.load(str(urdf_path))
+    left = visual_arm_configuration([0.35, -0.05, -0.25], "left")
+    right = visual_arm_configuration([0.35, 0.05, 0.25], "right")
+    payload_offset = np.array([0.0, 0.0, 0.08])
+    left_ee = world_ee_position(left_urdf, left, "left", payload_offset)
+    right_ee = world_ee_position(right_urdf, right, "right", payload_offset)
+    assert np.linalg.norm(left_ee - right_ee) < 0.002
+    left_rotation = left_urdf.get_transform("ee_link", "base_link")[:3, :3]
+    right_rotation = right_urdf.get_transform("ee_link", "base_link")[:3, :3]
+    assert np.dot(left_rotation[:, 2], right_rotation[:, 2]) > 0.999
+    assert np.dot(left_rotation[:, 0], right_rotation[:, 0]) < -0.999
+
+
+@pytest.mark.parametrize(
+    "positions", ([0.0, 0.0], [0.0, 0.0, float("nan")])
+)
+def test_dual_arm_visual_configuration_rejects_invalid_state(positions):
+    with pytest.raises(ValueError, match="three finite"):
+        visual_arm_configuration(positions)
+
+
+def test_dual_arm_visual_configuration_rejects_unknown_side():
+    with pytest.raises(ValueError, match="side"):
+        visual_arm_configuration([0.0, 0.0, 0.0], "center")
+
+
+def test_dual_arm_replay_selects_frame_at_or_before_cursor():
+    frames = [
+        ReplayFrame(value, (), (), 0.0, 0.0, None, "table", "move")
+        for value in (0.0, 0.2, 0.7)
+    ]
+    assert replay_frame_index(frames, -1.0) == 0
+    assert replay_frame_index(frames, 0.19) == 0
+    assert replay_frame_index(frames, 0.2) == 1
+    assert replay_frame_index(frames, 99.0) == 2
+
+
+def test_dual_arm_replay_rejects_empty_recording():
+    with pytest.raises(ValueError, match="at least one"):
+        replay_frame_index([], 0.0)
+
+
+def test_dual_arm_replay_recording_round_trip(tmp_path):
+    frames = [
+        ReplayFrame(0.0, (0.0, 0.1, 0.2), (0.0, -0.1, -0.2), 0, 0, None, "table", "start"),
+        ReplayFrame(0.5, (0.3, 0.2, 0.1), (0.3, -0.2, -0.1), 1, 1, "cycle", "both_arms", "handoff"),
+    ]
+    writer = object.__new__(DualArmViserRuntime)
+    writer._replay_lock = threading.Lock()
+    writer._replay_frames = frames
+    recording = tmp_path / "handoff.json"
+    writer.save_replay(recording, "Payload Handoff")
+
+    reader = object.__new__(DualArmViserRuntime)
+    reader._replay_lock = threading.Lock()
+    reader._render_frame = lambda frame, replaying=False: None
+    metadata = reader.load_replay(recording)
+    assert metadata == {"title": "Payload Handoff", "frames": 2, "duration": 0.5}
+    assert reader.replay_frames == frames
+
+
+def test_dual_arm_replay_frame_rejects_invalid_payload_owner():
+    with pytest.raises(ValueError, match="invalid state"):
+        ReplayFrame.from_dict(
+            {
+                "elapsed": 0,
+                "left_arm": [0, 0, 0],
+                "right_arm": [0, 0, 0],
+                "left_gripper": 0,
+                "right_gripper": 0,
+                "zone_owner": None,
+                "payload_owner": "ceiling",
+                "event": "start",
+            }
+        )
 
 
 def test_viser_robot_accepts_configurable_scheduler_interval():

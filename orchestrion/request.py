@@ -27,6 +27,7 @@ class RequestResult:
     content: Any = None
     error: Optional[str] = None
     associated_move_id: int = -1
+    associated_submodule: Optional[str] = None
     created_at: float = 0.0
     started_at: Optional[float] = None
     finished_at: Optional[float] = None

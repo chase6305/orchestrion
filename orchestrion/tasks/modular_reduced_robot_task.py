@@ -241,6 +241,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
             )
             self._main_task_queue.put(request)
             self._latest_sent_id += len(assigned_endpoint_idx)
+        self._notify_state_change()
         return move_id_begin
 
     def move_submodule_async(
@@ -291,7 +292,56 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
                 )
             )
             self._state_condition.notify_all()
+        self._notify_state_change()
         return move_id
+
+    def move_submodules_trajectories_async(
+        self,
+        motion_targets: Dict[str, List[List[float]]],
+        interval: float = 0.01,
+    ) -> Dict[str, int]:
+        """Atomically validate and enqueue trajectories for several submodules."""
+        if not isinstance(motion_targets, dict) or not motion_targets:
+            return {}
+        if not self._is_finite_real(interval) or interval <= 0:
+            return {}
+        # Snapshot the whole batch before assigning any move IDs. This preserves
+        # all-or-nothing submission even if a caller mutates its input concurrently
+        # or a custom container fails during copying.
+        targets = copy.deepcopy(motion_targets)
+        for submodule_name, motion_target in targets.items():
+            module = self._sub_task_map.get(submodule_name)
+            if (
+                module is None
+                or not isinstance(motion_target, list)
+                or not motion_target
+                or any(not isinstance(point, list) for point in motion_target)
+            ):
+                return {}
+            if any(len(point) != module.n_dof for point in motion_target):
+                return {}
+            if not self._is_finite_trajectory(motion_target):
+                return {}
+
+        with self._state_condition:
+            move_ids = {
+                submodule_name: self._submodule_sent_ids[submodule_name] + 1
+                for submodule_name in targets
+            }
+            for submodule_name, motion_target in targets.items():
+                move_id = move_ids[submodule_name]
+                self._submodule_sent_ids[submodule_name] = move_id
+                self._sub_task_queue.put(
+                    SubModuleMovementRequest(
+                        submodule_name=submodule_name,
+                        motion_target=motion_target,
+                        interval=interval,
+                        move_id=move_id,
+                    )
+                )
+            self._state_condition.notify_all()
+        self._notify_state_change()
+        return move_ids
 
     def query_submodule_state(self, submodule_name: str) -> SubModuleState:
         module = self._sub_task_map.get(submodule_name)
@@ -314,13 +364,28 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
                 ),
             )
 
+    def query_submodule_states(
+        self, submodule_names: Optional[List[str]] = None
+    ) -> Dict[str, SubModuleState]:
+        """Return an atomic snapshot of several or all submodule states."""
+        if submodule_names is None:
+            names = tuple(self._sub_task_map)
+        else:
+            if not isinstance(submodule_names, (list, tuple)) or any(
+                not isinstance(name, str) or not name for name in submodule_names
+            ):
+                raise TypeError("submodule_names must be a list of names or None")
+            names = tuple(submodule_names)
+        with self._lock:
+            for name in names:
+                if name not in self._sub_task_map:
+                    raise KeyError("Unknown submodule: {}".format(name))
+            return {name: self.query_submodule_state(name) for name in names}
+
     def wait_submodule_move(
         self, submodule_name: str, move_id: int, timeout: Optional[float] = None
     ) -> bool:
-        if isinstance(move_id, bool) or not isinstance(move_id, int):
-            raise TypeError("move_id must be an integer")
-        if move_id < 0:
-            raise ValueError("move_id must be non-negative")
+        self._validate_submodule_move_id(move_id)
         if timeout is not None and (
             not self._is_finite_real(timeout) or timeout < 0
         ):
@@ -348,14 +413,65 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
                 self._state_condition.wait(remaining)
             return True
 
-    def cancel_submodule_move(self, submodule_name: str, move_id: int) -> bool:
+    def wait_submodule_moves(
+        self, moves: Dict[str, int], timeout: Optional[float] = None
+    ) -> bool:
+        """Wait for several submodule moves using one shared timeout budget."""
+        if not isinstance(moves, dict):
+            raise TypeError("moves must be a dictionary")
+        if timeout is not None and (
+            not self._is_finite_real(timeout) or timeout < 0
+        ):
+            raise ValueError("timeout must be non-negative and finite, or None")
+        requested = tuple(moves.items())
+        for submodule_name, move_id in requested:
+            if not isinstance(submodule_name, str) or not submodule_name:
+                raise TypeError("moves must map submodule names to move IDs")
+            self._validate_submodule_move_id(move_id)
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._state_condition:
+            for submodule_name, move_id in requested:
+                if submodule_name not in self._sub_task_map:
+                    raise KeyError("Unknown submodule: {}".format(submodule_name))
+                if move_id > self._submodule_sent_ids[submodule_name]:
+                    raise KeyError(
+                        "Unknown move {} for submodule {}".format(
+                            move_id, submodule_name
+                        )
+                    )
+            while True:
+                if any(
+                    (submodule_name, move_id) in self._cancelled_submodule_moves
+                    for submodule_name, move_id in requested
+                ):
+                    return False
+                if all(
+                    self._submodule_finished_ids[submodule_name] >= move_id
+                    for submodule_name, move_id in requested
+                ):
+                    return True
+                if self._stop_event.is_set():
+                    return False
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._state_condition.wait(remaining)
+
+    @staticmethod
+    def _validate_submodule_move_id(move_id: int) -> None:
         if isinstance(move_id, bool) or not isinstance(move_id, int):
             raise TypeError("move_id must be an integer")
         if move_id < 0:
             raise ValueError("move_id must be non-negative")
+
+    def cancel_submodule_move(self, submodule_name: str, move_id: int) -> bool:
+        self._validate_submodule_move_id(move_id)
         with self._state_condition:
             if submodule_name not in self._sub_task_map:
                 raise KeyError("Unknown submodule: {}".format(submodule_name))
+            if (submodule_name, move_id) in self._cancelled_submodule_moves:
+                return False
             if move_id > self._submodule_sent_ids[submodule_name]:
                 return False
             if move_id <= self._submodule_finished_ids[submodule_name]:
@@ -364,7 +480,41 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
             if self._submodule_active_ids[submodule_name] == move_id:
                 self._submodule_active_ids[submodule_name] = None
             self._state_condition.notify_all()
-            return True
+        self._notify_state_change()
+        return True
+
+    def cancel_submodule_moves(self, moves: Dict[str, int]) -> Dict[str, bool]:
+        """Cancel several submodule moves under one state lock."""
+        if not isinstance(moves, dict):
+            raise TypeError("moves must be a dictionary")
+        requested = tuple(moves.items())
+        for submodule_name, move_id in requested:
+            if not isinstance(submodule_name, str) or not submodule_name:
+                raise TypeError("moves must map submodule names to move IDs")
+            self._validate_submodule_move_id(move_id)
+        with self._state_condition:
+            for submodule_name, _ in requested:
+                if submodule_name not in self._sub_task_map:
+                    raise KeyError("Unknown submodule: {}".format(submodule_name))
+            results = {}
+            for submodule_name, move_id in requested:
+                move_key = (submodule_name, move_id)
+                can_cancel = (
+                    move_key not in self._cancelled_submodule_moves
+                    and move_id <= self._submodule_sent_ids[submodule_name]
+                    and move_id > self._submodule_finished_ids[submodule_name]
+                )
+                results[submodule_name] = can_cancel
+                if can_cancel:
+                    self._cancelled_submodule_moves.add(move_key)
+                    if self._submodule_active_ids[submodule_name] == move_id:
+                        self._submodule_active_ids[submodule_name] = None
+            changed = any(results.values())
+            if changed:
+                self._state_condition.notify_all()
+        if changed:
+            self._notify_state_change()
+        return results
 
     def query_state(self) -> Optional[ReducedRobotTaskInterface.ReducedRobotState]:
         """
@@ -480,17 +630,20 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
 
             # 2. get tasks from _task_queue_submodules
             pop_submodule_tasks: List[SubModuleMovementRequest] = list()
-            while True:
-                subtask_elem: Optional[SubModuleMovementRequest] = None
-                try:
-                    subtask_elem = self._sub_task_queue.get_nowait()
-                except queue.Empty:
-                    subtask_elem = None
+            # Submissions use the same lock, so a validated batch becomes visible
+            # to the scheduler all at once rather than one arm at a time.
+            with self._lock:
+                while True:
+                    subtask_elem: Optional[SubModuleMovementRequest] = None
+                    try:
+                        subtask_elem = self._sub_task_queue.get_nowait()
+                    except queue.Empty:
+                        subtask_elem = None
 
-                if subtask_elem is not None:
-                    pop_submodule_tasks.append(subtask_elem)
-                else:
-                    break
+                    if subtask_elem is not None:
+                        pop_submodule_tasks.append(subtask_elem)
+                    else:
+                        break
 
             # 3. push into local map
             for i in range(len(pop_submodule_tasks)):
@@ -517,6 +670,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
             # 4. reset the submodule task state
             next_full_jps = copy.deepcopy(current_full_jps)
             submodule_updated = False
+            submodule_completed = False
 
             for submodule_name in local_submodule_task_queue.keys():
                 # Extract the movement of submodule
@@ -601,6 +755,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
                         )
                         self._submodule_active_ids[submodule_name] = None
                         self._state_condition.notify_all()
+                    submodule_completed = True
                     if len(local_submodule_task_queue[submodule_name]) > 0:
                         local_submodule_task_state[submodule_name] = SubTaskState(
                             idx_in_current_move=0, next_step_at=time.monotonic()
@@ -661,7 +816,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
                 self._finished_move_id = finished_move_id
                 if main_updated or submodule_updated:
                     self._state_condition.notify_all()
-            if main_updated or submodule_updated:
+            if main_updated or submodule_updated or submodule_completed:
                 self._notify_state_change()
 
             # Sleep

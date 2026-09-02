@@ -121,6 +121,36 @@ def test_unknown_service_is_rejected():
         pilot.call_srv_async("missing", {}, MoveSyncOption.no_sync())
 
 
+def test_call_rejects_invalid_sync_option():
+    pilot = TaskPilot(RobotTaskStub(), {"task": GenericTaskStub()})
+    pilot.initialize()
+    try:
+        with pytest.raises(TypeError, match="sync_option"):
+            pilot.call_srv_async("task", sync_option=object())
+    finally:
+        pilot.stop()
+
+
+def test_malformed_submodule_state_fails_request_without_stopping_scheduler():
+    class MalformedSubmoduleRobot(RobotTaskStub):
+        def query_submodule_state(self, name):
+            return object()
+
+    pilot = TaskPilot(MalformedSubmoduleRobot(), {"task": GenericTaskStub()})
+    pilot.initialize()
+    try:
+        request_id = pilot.call_srv_async(
+            "task",
+            sync_option=MoveSyncOption.sync_w_submodule("arm", move_id=0),
+        )
+        result = pilot.wait_request(request_id, timeout=0.5)
+        assert result.status.value == "failed"
+        assert "cancelled_move_ids" in result.error
+        assert pilot.is_running
+    finally:
+        pilot.stop()
+
+
 def test_request_before_initialization_is_rejected():
     pilot = TaskPilot(RobotTaskStub(), {"task": GenericTaskStub()})
     with pytest.raises(RuntimeError):
@@ -140,6 +170,10 @@ def test_move_sync_option_rejects_invalid_direct_combinations():
         MoveSyncOption(need_sync=False, associated_move_id=0)
     with pytest.raises(ValueError, match="-1"):
         MoveSyncOption(need_sync=True, associated_move_id=-2)
+    with pytest.raises(ValueError, match="submodule_name"):
+        MoveSyncOption.sync_w_submodule("")
+    with pytest.raises(ValueError, match="submodule"):
+        MoveSyncOption(need_sync=False, submodule_name="arm")
 
 
 def test_move_and_wait_are_forwarded():

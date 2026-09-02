@@ -53,3 +53,27 @@
 - Replace the static Viser preview with a compact recording of the real demo 02 workflow.
 - Add a ticket-based HTTP device demo with long-poll response waiting, health
   discovery, transport retries, and end-to-end idempotency.
+- Harden the network demo with server-side command validation, HTTP 409
+  idempotency conflicts, bounded client settings, and remote timeout cancellation.
+- Add a reusable dual-arm simulation runtime, three collaboration demos, shared
+  workspace reservation service, and shared-deadline multi-submodule waiting.
+- Add coordinated dual-arm abort behavior so a cancelled arm stops its moving peer.
+- Add a dual-arm remote-inspection demo that overlaps arm retreat with a ticketed
+  HTTP quality-service request.
+- Add TaskPilot service synchronization against individual submodule move IDs,
+  including cancellation propagation from the associated movement.
+- Add an event-driven dual-arm health monitor demo based on monotonic revisions.
+- Let all six dual-arm workflows run with `--viser`, using two live UR5 models
+  and a shared-zone, gripper, and orchestration-event status panel.
+- Refine dual-arm Viser poses with mirrored UR5 motion anchors, presentation
+  pacing, live workflow phases, and an animated handoff payload.
+- Record every dual-arm Viser workflow for offline replay with play, pause,
+  restart, timeline scrubbing, speed selection, auto-play, and looping.
+- Save and load versioned dual-arm replay JSON files without initializing robot,
+  peripheral, or network services during playback.
+- Add a complete dual-arm handoff-and-place production cycle and enrich the Viser
+  cell with robot pedestals, labeled input/output stations, and output payload state.
+- Replace hand-positioned dual-arm props with FK-derived input, handoff, and output
+  locations, using UR5 pose anchors whose handoff endpoints agree within 2 mm.
+- Constrain UR5 handoff orientation as well as position and replace symbolic
+  end-effector blocks with animated two-finger grippers around the payload axis.

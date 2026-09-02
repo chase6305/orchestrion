@@ -31,6 +31,7 @@ class TaskPilot:
         request_id: int
         content: Optional[Dict] = None
         associated_move_id: int = -1
+        associated_submodule: Optional[str] = None
         priority: int = 0
 
     def __init__(
@@ -302,11 +303,29 @@ class TaskPilot:
                 existing_id = self._idempotency_requests.get(deduplication_key)
                 if existing_id is not None:
                     return existing_id
-        sync_option = sync_option or MoveSyncOption.sync_w_latest_move()
+        if sync_option is None:
+            sync_option = MoveSyncOption.sync_w_latest_move()
+        elif not isinstance(sync_option, MoveSyncOption):
+            raise TypeError("sync_option must be a MoveSyncOption or None")
 
         associated_move_id = -1
+        associated_submodule = sync_option.submodule_name
         if sync_option.need_sync:
-            if sync_option.associated_move_id >= 0:
+            if associated_submodule is not None:
+                query_submodule_state = getattr(
+                    self._robot_task, "query_submodule_state", None
+                )
+                if not callable(query_submodule_state):
+                    raise TypeError(
+                        "Robot task does not support submodule synchronization"
+                    )
+                submodule_state = query_submodule_state(associated_submodule)
+                associated_move_id = (
+                    sync_option.associated_move_id
+                    if sync_option.associated_move_id >= 0
+                    else submodule_state.latest_sent_id
+                )
+            elif sync_option.associated_move_id >= 0:
                 associated_move_id = sync_option.associated_move_id
             else:
                 robot_state = self._robot_task.query_state()
@@ -332,6 +351,7 @@ class TaskPilot:
                 service_name=srv_name,
                 status=RequestStatus.QUEUED,
                 associated_move_id=associated_move_id,
+                associated_submodule=associated_submodule,
                 priority=priority,
                 idempotency_key=idempotency_key,
                 created_at=now,
@@ -344,6 +364,7 @@ class TaskPilot:
                 request_id=request_id,
                 content=request_content,
                 associated_move_id=associated_move_id,
+                associated_submodule=associated_submodule,
                 priority=priority,
             )
             self._task_queue.put((-priority, request_id, request))
@@ -851,25 +872,68 @@ class TaskPilot:
                     )
 
             if waiting:
-                try:
-                    robot_state = self._robot_task.query_state()
-                except Exception:
-                    logger.exception("Failed to query robot state")
-                    robot_state = None
-                if robot_state is not None:
-                    remaining = []
-                    while waiting:
-                        priority_entry = heapq.heappop(waiting)
-                        request = priority_entry[2]
-                        with self._state_condition:
-                            result = self._requests.get(request.request_id)
-                        if result is None or result.status.terminal:
+                needs_main_state = any(
+                    entry[2].associated_submodule is None for entry in waiting
+                )
+                robot_state = None
+                if needs_main_state:
+                    try:
+                        robot_state = self._robot_task.query_state()
+                    except Exception:
+                        logger.exception("Failed to query robot state")
+                submodule_states = {}
+                remaining = []
+                while waiting:
+                    priority_entry = heapq.heappop(waiting)
+                    request = priority_entry[2]
+                    with self._state_condition:
+                        result = self._requests.get(request.request_id)
+                    if result is None or result.status.terminal:
+                        continue
+                    move_finished = False
+                    if request.associated_submodule is not None:
+                        try:
+                            if request.associated_submodule not in submodule_states:
+                                submodule_states[request.associated_submodule] = (
+                                    self._robot_task.query_submodule_state(
+                                        request.associated_submodule
+                                    )
+                                )
+                            submodule_state = submodule_states[
+                                request.associated_submodule
+                            ]
+                            cancelled_move_ids = submodule_state.cancelled_move_ids
+                            latest_finished_id = submodule_state.latest_finished_id
+                        except Exception as exc:
+                            self._transition(
+                                request.request_id,
+                                RequestStatus.FAILED,
+                                error=str(exc),
+                            )
                             continue
-                        if request.associated_move_id <= robot_state.latest_finished_id:
-                            self._invoke_request(request)
-                        else:
-                            heapq.heappush(remaining, priority_entry)
-                    waiting = remaining
+                        if request.associated_move_id in (
+                            cancelled_move_ids
+                        ):
+                            self._transition(
+                                request.request_id,
+                                RequestStatus.CANCELLED,
+                                error="Associated submodule move was cancelled",
+                            )
+                            continue
+                        move_finished = (
+                            request.associated_move_id
+                            <= latest_finished_id
+                        )
+                    elif robot_state is not None:
+                        move_finished = (
+                            request.associated_move_id
+                            <= robot_state.latest_finished_id
+                        )
+                    if move_finished:
+                        self._invoke_request(request)
+                    else:
+                        heapq.heappush(remaining, priority_entry)
+                waiting = remaining
 
             self._refresh_running()
             self._wake_event.wait(self._poll_interval)

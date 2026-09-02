@@ -2,7 +2,9 @@
 
 import concurrent.futures
 import json
+import math
 import time
+from numbers import Real
 from typing import Dict
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -24,8 +26,17 @@ class NetworkDeviceClient:
     """Synchronous adapter for a ticket-based asynchronous HTTP protocol."""
 
     def __init__(self, base_url: str, request_timeout: float = 0.5) -> None:
+        if not isinstance(base_url, str) or not base_url.strip():
+            raise ValueError("base_url must be a non-empty string")
+        if (
+            isinstance(request_timeout, bool)
+            or not isinstance(request_timeout, Real)
+            or not math.isfinite(request_timeout)
+            or request_timeout <= 0
+        ):
+            raise ValueError("request_timeout must be positive and finite")
         self.base_url = base_url.rstrip("/")
-        self.request_timeout = request_timeout
+        self.request_timeout = float(request_timeout)
 
     def execute(self, request_id: int, content: Dict) -> Dict:
         operation = self._request_json(
@@ -39,6 +50,12 @@ class NetworkDeviceClient:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                try:
+                    self.cancel(operation_id)
+                except (ConnectionError, RuntimeError):
+                    # Preserve the primary timeout; reconciliation can use the
+                    # stable operation key after connectivity is restored.
+                    pass
                 raise TimeoutError(
                     "remote operation {} did not finish in time".format(operation_id)
                 )
@@ -48,12 +65,26 @@ class NetworkDeviceClient:
                 )
             )
             if result["status"] != "running":
+                if result["status"] != "succeeded":
+                    raise RuntimeError(
+                        "remote operation {} ended as {}: {}".format(
+                            operation_id,
+                            result["status"],
+                            result.get("error", "no error detail"),
+                        )
+                    )
                 return {
                     "request_id": request_id,
                     "operation_id": operation_id,
                     "deduplicated": operation["deduplicated"],
+                    "remote_completed_at": result["completed_at"],
                     **result["result"],
                 }
+
+    def cancel(self, operation_id: str) -> Dict:
+        return self._request_json(
+            "/operations/{}".format(operation_id), method="DELETE"
+        )
 
     def status(self) -> Dict:
         return self._request_json("/health")
@@ -111,7 +142,11 @@ def run_workflow(base_url: str) -> Dict:
         metadata={
             "transport": "http",
             "protocol": "ticket-and-long-poll",
-            "endpoints": ["POST /commands", "GET /operations/{id}"],
+            "endpoints": [
+                "POST /commands",
+                "GET /operations/{id}",
+                "DELETE /operations/{id}",
+            ],
         },
     )
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)

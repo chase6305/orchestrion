@@ -213,7 +213,8 @@ ticket, and long-polls until the remote action finishes.
 The example separates protocol concerns into two modules:
 
 - `examples.network_device_service` implements the device-facing HTTP service:
-  `POST /commands`, `GET /operations/{id}?wait=...`, and `GET /health`.
+  `POST /commands`, `GET /operations/{id}?wait=...`,
+  `DELETE /operations/{id}`, and `GET /health`.
 - `examples.network_service_demo` implements `NetworkDeviceClient`, wraps it in a
   `CallableTask`, and waits for the final response through `TaskPilot`.
 
@@ -223,6 +224,8 @@ local submissions, while the second prevents a remote actuator command from bein
 executed twice when the HTTP response is lost and the client retries. Only
 connection failures are retried automatically; a remote operation timeout is
 reported as a failed request for the application to reconcile explicitly.
+Before reporting a response timeout, the demo client sends a best-effort remote
+cancellation so an abandoned actuator operation does not continue unnoticed.
 
 To inspect the device protocol independently, run
 `python -m examples.network_device_service` and connect to port 8080. In a real
@@ -255,6 +258,9 @@ camera = CallableTask(
   - Task is associated with the latest known move ID at dispatch time.
 - `MoveSyncOption.sync_w_explicit_id(move_id)`
   - Task runs only after robot state reports finishing that move ID.
+- `MoveSyncOption.sync_w_submodule(name, move_id)`
+  - Task runs after one arm, gripper, or other modular component finishes its move.
+  - Cancelling the associated submodule move cancels the waiting service request.
 
 ## Submodule Motion
 
@@ -271,6 +277,36 @@ cancelled = robot.cancel_submodule_move("gripper", move_id)
 
 `move_submodule_async()` remains as a boolean compatibility wrapper. New backends
 should prefer the completion-aware API.
+
+For coordinated components such as two arms, wait once against a shared deadline:
+
+```python
+moves = robot.move_submodules_trajectories_async(
+    {"left_arm": left_path, "right_arm": right_path}
+)
+if not moves:
+    raise ValueError("coordinated trajectories were rejected")
+if not robot.wait_submodule_moves(moves, timeout=2.0):
+    robot.cancel_submodule_moves(moves)
+    raise RuntimeError("coordinated move failed")
+```
+
+The batch submission validates every trajectory before enqueuing any of them, so
+an invalid right-arm command cannot leave the left arm moving alone. Use
+`query_submodule_states()` when monitoring both arms to obtain one atomic snapshot.
+
+Run `python -m examples.dual_arm --list` for seven hardware-free dual-arm demos:
+parallel picking, payload handoff, shared-workspace safety interlocking, and
+coordinated abort when either arm fails, plus remote inspection overlapping an
+HTTP response wait with arm retreat.
+The health-monitor demo additionally shows revision-based observation without
+busy polling. See
+Add `--viser` to any selection, such as
+`python -m examples.dual_arm 02 --viser`, to render two live UR5 models plus
+gripper, shared-zone, and event status. Add `--replay` or `--loop-replay` for
+recorded timeline playback with GUI scrubbing and speed controls. See
+`examples/dual_arm/README.md` for
+their service, visualization, and synchronization design.
 
 ## Architecture
 
@@ -379,6 +415,9 @@ integrations/
     viser_modular_robot_task.py
 
 examples/
+  dual_arm/
+    01_parallel_pick.py ... 06_health_monitor.py
+    common.py
   network_device_service.py
   network_service_demo.py
   simulated_multi_peripheral.py
@@ -388,6 +427,8 @@ examples/
     common.py
 
 tests/
+  test_dual_arm_examples.py
+  test_network_demo.py
   test_schema.py
   test_task.py
   test_task_pilot.py
