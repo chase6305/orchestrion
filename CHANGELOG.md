@@ -1,5 +1,77 @@
 # Changelog
 
+## Unreleased
+
+- Validate known input fields and composite choices even when a workflow node
+  contains output references; reject invalid plans before any device action and
+  recheck resolved values before dispatch. Add binding-independent template validation.
+- Distinguish nested JSON booleans from numbers in object/array schema choices.
+- Consolidate regression files by behavior, share backend/schema cases through
+  parametrization, and replace sleep-based task checks with bounded completion
+  signals. Verify queued cancellation actually prevents device dispatch.
+- Add nested object/array schemas with element types and length bounds, reuse
+  scalar validators, and preserve precise field paths in validation errors.
+- Validate declared workflow output schemas before success, reject statically
+  impossible output references during compilation, and expose result contracts
+  to planners. Invalid vision results cannot dispatch dependent arm commands.
+- Add contracts to the simulated multi-device cell and reject future-dated as
+  well as stale visual observations before manipulation.
+- Bound SDK-thread feedback queues, batch loop notifications, retain recent
+  progress on overflow, and expose dropped counts in node results and diagnostics.
+- Supervise unexpected scheduler exits, block queued adapters before device I/O,
+  release unstarted reservations, and drain active operations independently of the
+  scheduler task while preserving uncertain resource ownership.
+- Deduplicate explicitly keyed workflow submissions against their compiled input
+  snapshots; retain original outcomes with bounded key admission and explicit
+  pruning that protects active and unreconciled operations.
+- Explain dependency, concurrency, resource queue and stop-confirmation waits;
+  expose scheduler counts, resource owners and submission retention diagnostics.
+- Add whole-workflow execution budgets covering dependency and resource waits;
+  preserve device claims during timeout cleanup and stop fail-fast admission as
+  soon as a node deadline expires.
+- Prevent late cancellation from rewriting completed workflow success, suppress
+  cancelled SDK calls still waiting in an executor queue, and reject action waits
+  or shutdowns that would wait on their own engine.
+- Recover workflow resource accounting after task startup failures or worker
+  interruption, isolate malformed SDK exception messages, support thread-safe
+  feedback, and consume late executor failures after an interrupted await.
+- Add experimental `orchestrion.workflow` for heterogeneous DAG execution, planner
+  proposals, output bindings, mandatory action resource claims, capacity scheduling,
+  cooperative cancellation, and quarantine/reconciliation of uncertain operations.
+- Add a simulated arm, gripper, fixture, speech, vision, and mobile-base workflow,
+  plus an architecture and migration design separating planning from execution.
+- Apply priorities consistently across immediate and ready motion-synchronized
+  requests, collect inline results before eviction, and avoid repeated full polling
+  while admitting a backlog. Idle schedulers now wait for notifications.
+- Isolate malformed, missing, mismatched, and unreadable device responses so an
+  adapter failure does not terminate the scheduler or leave a request running forever.
+- Fix cancellation/pruning races and delegate cancellation outside the shared
+  state lock while preserving completions that arrive during cancellation.
+- Retain every result needed by a grouped wait, validate all IDs before waiting,
+  and maintain request status counts without scanning the full history.
+- Reject overlapping scheduler/polling restarts and requests prepared across a
+  stop/restart boundary; allow callbacks to stop their own pilot or robot without
+  joining themselves or deadlocking with an external shutdown.
+- Allocate robot move IDs atomically with queue admission, reject malformed
+  trajectories, and preserve completed IDs across modular-robot restarts.
+- Add main-move cancellation history to `ReducedRobotState` and propagate stopped
+  main movements to synchronized service requests. Preserve submodule cancellation
+  outcomes when later movements finish.
+- Remove quadratic sparse-ID history copying and pending-future scans from thread
+  pool submission and bounded response retention; add reproducible microbenchmarks.
+- Retain inline failures and report concurrent inline calls as pending until done.
+- Stop zero-delay retries and prevent old invocations from resuming retries after
+  restart; preserve exponential-delay behavior at extreme numeric ranges.
+- Keep integer schema bounds exact and snapshot field constraints at construction.
+- Validate malformed network commands and body lengths, close command admission
+  before server shutdown, release sockets on startup failure, and return defensive
+  operation snapshots.
+- Preserve main motion queued before simulated-robot initialization, roll back
+  failed worker starts, and use constant-time deque removal for submodule queues.
+- Keep health snapshots JSON-compatible when one adapter returns invalid metadata.
+- Test installations with and without Viser, fail on unhandled background-thread
+  exceptions, and smoke-test built wheels in isolated CI environments.
+
 ## 0.2.0
 
 - Add unified request status, results, waiting, cancellation, and timelines.

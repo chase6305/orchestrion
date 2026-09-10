@@ -1,3 +1,5 @@
+"""Compatibility of public request, health, lifecycle, and simulated-motion APIs."""
+
 import concurrent.futures
 import json
 import threading
@@ -1007,7 +1009,7 @@ def test_timeline_capacity_is_bounded():
         pilot.stop()
 
 
-def test_evicted_task_results_do_not_leave_running_requests():
+def test_inline_results_are_collected_before_the_next_call_can_evict_them():
     pilot = TaskPilot(
         SimulatedRobotTask([0.0]),
         {"echo": EchoTask(max_result_count=1)},
@@ -1022,12 +1024,7 @@ def test_evicted_task_results_do_not_leave_running_requests():
             pilot.wait_request(request_id, timeout=0.5)
             for request_id in request_ids
         ]
-        assert [result.status for result in results] == [
-            RequestStatus.FAILED,
-            RequestStatus.FAILED,
-            RequestStatus.SUCCEEDED,
-        ]
-        assert "flushed" in results[0].error
+        assert all(result.status is RequestStatus.SUCCEEDED for result in results)
     finally:
         pilot.stop()
 

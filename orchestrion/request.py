@@ -16,7 +16,12 @@ class RequestStatus(str, Enum):
 
     @property
     def terminal(self) -> bool:
-        return self in {self.SUCCEEDED, self.FAILED, self.CANCELLED}
+        return self in _TERMINAL_STATUSES
+
+
+_TERMINAL_STATUSES = frozenset({
+    RequestStatus.SUCCEEDED, RequestStatus.FAILED, RequestStatus.CANCELLED
+})
 
 
 @dataclass(frozen=True)

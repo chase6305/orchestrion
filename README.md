@@ -4,6 +4,11 @@ Lightweight Python framework for coordinating robot motion and asynchronous peri
 
 Orchestrion centers around TaskPilot, which schedules robot trajectories and side tasks (for example, gripper actions) with optional motion synchronization.
 
+For heterogeneous workflows spanning arms, fixtures, speech, vision, and mobile
+bases, the experimental `orchestrion.workflow` API adds a device-independent DAG
+engine with resource scheduling. See the [architecture and migration design
+(中文)](docs/architecture-v3.md) for its contracts, current scope, and roadmap.
+
 ![Orchestrion coordinating robot and peripheral devices](assets/orchestrion-system-overview.png)
 
 ## Features
@@ -20,7 +25,117 @@ Orchestrion centers around TaskPilot, which schedules robot trajectories and sid
 - Event-driven health revisions, normalized device health, and stale-data detection.
 - Callable command adapters, bounded retries, and cached polling tasks for telemetry.
 - Declarative request schemas that reject malformed commands before device I/O.
+- Nested object/array contracts and workflow output validation before downstream dispatch.
 - Hardware-free `SimulatedRobotTask` for demos and integration tests.
+- Experimental workflow DAGs with output bindings, shared resource capacities,
+  cooperative cancellation, explicit submission deduplication, wait diagnostics,
+  and quarantine of operations with uncertain outcomes.
+
+## Heterogeneous workflows (experimental)
+
+```python
+import asyncio
+from orchestrion.workflow import (
+    Action, Node, OutputRef, Resource, ResourceClaim, Workflow, WorkflowEngine,
+)
+
+async def detect(context, inputs):
+    return {"pose": [0.4, 0.1, 0.2]}  # Replace with a vision adapter.
+
+async def move(context, inputs):
+    await context.sleep(0.01)  # Simulation; real adapters must confirm completion.
+    return {"reached": inputs["pose"]}
+
+async def main():
+    async with WorkflowEngine([
+        Action("vision.detect", detect),
+        Action("arm.move", move, (ResourceClaim("arm"),)),
+    ], [Resource("arm")]) as engine:
+        run = engine.submit(Workflow((
+            Node("detect", "vision.detect"),
+            Node("move", "arm.move", {"pose": OutputRef("detect", ("pose",))}),
+        ), timeout=2), idempotency_key="pick-cycle-42")
+        print(await run.wait(timeout=3))
+
+asyncio.run(main())
+```
+
+Run `python -m examples.heterogeneous_workflow` for a complete simulated cell, or
+add `--preview` to compile its plan without executing actions. A `Planner` proposes
+a workflow using the capability catalog; the engine validates it before dispatch.
+Action claims are mandatory floors and apply across every run in the same engine.
+Actions can declare `input_schema` and `output_schema` with `RequestSchema`.
+Declared outputs must be JSON objects; validation happens before success and
+downstream admission. Invalid results fail their producer with `ActionOutputError`
+in the node error, preserve JSON output for diagnosis, and skip dependent nodes.
+An output contract does not confirm physical termination; adapter completion must
+still mean the device has finished. The planner catalog exposes both contracts.
+
+When a source declares an output contract, compilation rejects impossible
+`OutputRef` paths such as an unknown closed-object field, indexing a string, or
+reading index 3 of an array with `max_items=3`. Optional fields and open/dynamic
+structures still require runtime checks.
+
+Compilation also validates the known parts of inputs containing `OutputRef`:
+required fields, literal types/ranges, nested fields, array lengths and known
+parts of composite choices. A reference does not postpone unrelated input errors
+until after upstream device actions. Bound values receive full validation again
+before their adapter starts; rejected plans do not reserve an idempotency key.
+
+Use `BlockingAction` for blocking SDK calls; async handlers must keep the loop free.
+It uses a supplied `ThreadPoolExecutor` or the event loop's default thread pool.
+Cancellation is checked again when a queued SDK wrapper gets a worker, before
+device I/O. Already started calls drain before releasing their claims. SDK callback
+threads can report JSON progress with `context.report()`; late feedback is dropped.
+
+SDK progress uses one bounded queue per action. Set
+`max_pending_feedback_per_action` on the engine (default 128). Overflow discards
+oldest pending progress, emits `feedback_overflow` events, and records the total in
+`NodeResult.feedback_dropped`, even if event history has been evicted. Delivery
+yields after batches of 32; completion flushes the remaining bounded queue before
+recording the final state. Loop-local reports are delivered directly. This channel
+is for progress; required results belong in the final output or device protocol.
+
+Cancellation requests a stop and retains resource claims until the adapter confirms
+completion. `ExecutionUncertain` quarantines claims until external reconciliation;
+an accepted remote command or cancellation request is not a final result. Wait
+timeouts only limit the caller's wait. `Workflow(timeout=...)` applies one execution
+budget across dependency waits, resource queues, and running actions; expiry stops
+admission and requests cancellation while device cleanup retains resource claims.
+`Node(timeout=...)` starts its budget at execution. With `FAIL_FAST`, node expiry
+stops sibling admission immediately, before cleanup finishes.
+
+Actions must express ordering through graph dependencies; attempting to await a run
+or close their own engine from inside an action raises `RuntimeError` to prevent
+waiting cycles. The new engine is local to one event loop,
+has no durable crash recovery yet, and does not replace motion planning or real-time
+control. Give each physical device one command owner when migrating from TaskPilot.
+
+Use `submit(workflow, idempotency_key="cycle-42")` to deduplicate caller retries in
+the same engine. Identical retained submissions return the original `WorkflowRun`,
+including failed or cancelled outcomes; a changed execution snapshot raises
+`ValueError`. Keys are reserved before action dispatch and do not restart deadlines.
+Retrieve a retained handle with `engine.get_run_by_key("cycle-42")`.
+
+`max_idempotency_keys` defaults to 1024; reaching it rejects new keyed submissions
+without silently evicting old keys. Explicitly call
+`engine.prune_idempotency_keys(keep_last=1000)` to forget older settled submissions.
+Active runs and unreconciled unknown operations are preserved. Pruning permits those
+keys to execute again; existing handles remain valid. Unkeyed completed runs are
+not retained by the engine unless they have unknown operations. Key retention is
+in memory and does not provide deduplication across engines or process restarts.
+
+For operational diagnostics, `run.explain("move")` returns dependency, concurrency,
+resource-capacity, queue-order, stop-confirmation, or quarantine blockers.
+`engine.scheduler_snapshot()` reports counts, resource owners and queue heads,
+and retained/prunable key counts. These JSON-compatible reads use the engine's
+event loop, scan current state on demand, and perform no device calls.
+Node explanations also report pending/dropped feedback counts. An unexpected
+scheduler exit closes admission and records `scheduler_error` in the engine
+snapshot. Unstarted actions fail without device I/O; running actions receive a
+stop request and keep their claims until confirmed quiescent. `aclose()` continues
+waiting for that cleanup independently of the failed scheduler. Unknown operations
+remain quarantined; the engine does not restart itself after a scheduler fault.
 
 ## Package Overview
 
@@ -140,11 +255,14 @@ peripherals, and `pilot.task_map` returns a defensive copy of the registry.
 `wait_request` raises `TimeoutError` without cancelling the request. Cancellation
 is guaranteed before execution and best-effort once a task is running.
 `wait_requests` applies one shared timeout budget to the entire group rather than
-resetting the timeout for each request. `cancel_all_requests` can target all active
+resetting the timeout for each request. It validates every ID before waiting and
+protects the whole group's results from concurrent pruning until it returns or
+times out. `cancel_all_requests` can target all active
 work or only one peripheral service.
 Higher integer `priority` values run before lower-priority queued work. Priority
 never preempts a running device action, and equal priorities preserve request-ID
-order.
+order. Immediate requests and requests whose motion conditions have been met
+compete in the same priority queue.
 An optional `idempotency_key` deduplicates concurrent or repeated submissions for
 the same service and returns the original request ID. Keys remain active while the
 request is retained; `prune_completed_requests()` releases keys belonging to
@@ -152,6 +270,20 @@ removed records. Use stable operation IDs for actuator and PLC commands that may
 be retransmitted after a network timeout.
 Long-running processes can call `prune_completed_requests()` periodically to bound
 stored terminal request results without removing active work.
+Task result caches and the pilot's request history are independent. A positive
+`max_result_count` on a function task limits retained completed responses; pending
+thread-pool work is always preserved. Allow enough space for a burst of concurrent
+completions, since a response evicted before collection becomes an explicit failed
+request. Inline responses are collected before the next inline call runs.
+Request-ID deduplication metadata remains for the lifetime of a task, including
+after response pruning; sparse IDs may therefore retain additional identifier
+history.
+
+`InPlaceFunctionCallTask` runs on the scheduler thread. Use it for short local
+operations; use `CallableTask` or `ThreadedPoolFunctionCallTask` with an executor
+for blocking device I/O. Completion notifications refresh only affected services,
+and `poll_interval` provides fallback polling for adapters without notifications.
+An idle pilot sleeps until new work or a component notification arrives.
 
 Peripheral tasks can expose live health through `peek_status()`. TaskPilot provides
 `query_task_status()` and `query_all_task_statuses()` as a uniform monitoring API;
@@ -172,6 +304,8 @@ contacting hardware. Use it for service discovery and automatically generated UI
 Simple SDK or I/O functions can be exposed without defining a task subclass:
 
 ```python
+from orchestrion import CallableTask, FieldSpec, RequestSchema
+
 camera = CallableTask(
     lambda request_id, content: camera_sdk.capture(**(content or {})),
     status=lambda: {
@@ -190,9 +324,35 @@ camera = CallableTask(
 )
 ```
 
-`RequestSchema` validates flat command dictionaries before retry or adapter
+`RequestSchema` validates command dictionaries before retry or adapter
 execution. Its JSON-compatible description is included in `describe_services()`,
 so control panels can discover required fields, numeric limits, and choices.
+Schemas snapshot their field constraints at construction, and integer bounds keep
+their exact precision even above the floating-point integer range.
+
+Use `items`, `min_items` and `max_items` for arrays, and `object_schema` for nested
+objects. Errors identify paths such as `objects[0].pose[1]`:
+
+```python
+pose_result = RequestSchema({
+    "pose": FieldSpec(
+        "array", required=True, items=FieldSpec("number"), min_items=3, max_items=3,
+    ),
+    "frame_id": FieldSpec("string", required=True, choices=["workcell"]),
+})
+move_input = RequestSchema({
+    "detection": FieldSpec("object", required=True, object_schema=pose_result),
+})
+```
+
+These constraints work in both `CallableTask` requests and workflow action
+contracts. `RequestSchema.validate_path()` checks structural paths against a
+contract; optional fields or short arrays can still be absent in actual data.
+`validate_template(content, is_deferred=...)` checks known template values without
+producing executable input. The workflow compiler uses it automatically; custom
+planners must still resolve bindings and call `validate()` before dispatch.
+Composite choices distinguish JSON booleans from numbers, including nested
+confirmations such as `{"stopped": true}` versus `{"stopped": 1}`.
 
 Run `python -m examples.simulated_multi_peripheral` for a hardware-free camera,
 vacuum, PLC, and continuously polled temperature-sensor example. `CallableTask`
@@ -248,6 +408,10 @@ camera = CallableTask(
 )
 ```
 
+Stopping a callable task interrupts retry backoff, including zero-delay retries.
+Reinitialization starts a new lifecycle: an older invocation cannot resume its
+retry sequence after the task is restarted.
+
 ## Synchronization Model
 
 `TaskPilot.call_srv_async(...)` accepts a `MoveSyncOption`:
@@ -255,12 +419,25 @@ camera = CallableTask(
 - `MoveSyncOption.no_sync()`
   - Task is executed as soon as the background loop dequeues it.
 - `MoveSyncOption.sync_w_latest_move()`
-  - Task is associated with the latest known move ID at dispatch time.
+  - Task is associated with the latest known move ID when the request is submitted.
 - `MoveSyncOption.sync_w_explicit_id(move_id)`
   - Task runs only after robot state reports finishing that move ID.
 - `MoveSyncOption.sync_w_submodule(name, move_id)`
   - Task runs after one arm, gripper, or other modular component finishes its move.
   - Cancelling the associated submodule move cancels the waiting service request.
+
+The built-in robot backends discard unfinished main and submodule motion on
+`stop()`. Main cancellations are available in
+`query_state().cancelled_move_ids`, and dependent service requests become
+`CANCELLED`. Cancellation history and completed IDs survive restart, so completing
+a later move cannot turn a cancelled move into a successful synchronization.
+Custom backends can populate the optional `ReducedRobotState.cancelled_move_ids`
+field to provide the same behavior.
+
+After stopping, built-in robots reject new motion until `initialize()` is called.
+A trajectory or service request being prepared across a stop/restart boundary is
+also rejected. If a scheduler or polling callback outlives shutdown, restart raises
+`RuntimeError` until the previous worker has exited.
 
 ## Submodule Motion
 
@@ -300,7 +477,7 @@ parallel picking, payload handoff, shared-workspace safety interlocking, and
 coordinated abort when either arm fails, plus remote inspection overlapping an
 HTTP response wait with arm retreat.
 The health-monitor demo additionally shows revision-based observation without
-busy polling. See
+busy polling.
 Add `--viser` to any selection, such as
 `python -m examples.dual_arm 02 --viser`, to render two live UR5 models plus
 gripper, shared-zone, and event status. Add `--replay` or `--loop-replay` for
@@ -369,8 +546,30 @@ python -m pytest -q
 python -m pytest -q tests/test_task.py
 python -m pytest -q tests/test_task_pilot.py
 python -m pytest -q tests/test_modular_robot_task.py
+python -m pytest -q tests/test_workflow*.py tests/test_heterogeneous_workflow.py
 ruff check .
 ```
+
+Install `.[dev]` to run the core suite. Viser-specific tests skip when optional
+visualization dependencies are absent; install `.[dev,viser]` to include them.
+Unhandled worker-thread exceptions fail the suite. CI covers both installation
+profiles and smoke-tests a built wheel in an isolated environment.
+
+Tests are organized by behavior, with regressions kept beside the corresponding
+contracts. See the [test map and concurrency guidelines](tests/README.md) for
+focused commands and where to add coverage.
+
+For repeatable performance comparisons, run:
+
+```bash
+python -m examples.benchmark_task_storage
+python -m examples.benchmark_task_storage --reference HEAD --counts 1000 5000
+```
+
+The benchmark reports median timings for sparse request-ID submission and bounded
+result retention with many pending futures. `--reference` loads the task code from
+the selected local Git revision, using the current supporting modules. These are
+framework microbenchmarks; they exclude device, network, and worker-thread latency.
 
 ## Development Workflow
 
@@ -416,8 +615,9 @@ integrations/
 
 examples/
   dual_arm/
-    01_parallel_pick.py ... 06_health_monitor.py
+    01_parallel_pick.py ... 07_handoff_and_place.py
     common.py
+  benchmark_task_storage.py
   network_device_service.py
   network_service_demo.py
   simulated_multi_peripheral.py
@@ -427,21 +627,34 @@ examples/
     common.py
 
 tests/
+  README.md
   test_dual_arm_examples.py
+  test_heterogeneous_workflow.py
+  test_legacy_api.py
+  test_modular_robot_task.py
   test_network_demo.py
+  test_robot_task.py
   test_schema.py
   test_task.py
   test_task_pilot.py
-  test_v02.py
   test_viser_examples.py
+  test_workflow.py
+  test_workflow_cancellation.py
+  test_workflow_contracts.py
+  test_workflow_idempotency.py
+  test_workflow_lifecycle.py
+  test_workflow_observability.py
 ```
 
 ## Notes
 
 - This repository is framework-oriented: concrete robot backends should subclass or implement the provided task interfaces.
 - `executor_owned` is shut down by `TaskPilot.stop()`; do not reuse it afterward.
-- `stop(timeout=...)` does not wait indefinitely for a running Python callback that
-  ignores cancellation; such a callback must still arrange its own cooperative exit.
+- `stop(timeout=...)` bounds the scheduler-thread join and shuts down the owned
+  executor without waiting for running callbacks. Device shutdown hooks and I/O
+  must supply their own timeouts; Python callbacks require cooperative exit.
+- After a scheduler join times out, calling `stop()` again can wait for that worker
+  to exit. Restart is rejected while it is still stopping.
 
 ## Troubleshooting
 

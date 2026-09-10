@@ -28,13 +28,17 @@ class RetryPolicy:
             ("backoff", self.backoff, False),
             ("max_delay", self.max_delay, True),
         ):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, Real)
-                or not math.isfinite(value)
-                or value < 0
-                or (not allow_zero and value == 0)
-            ):
+            try:
+                valid = (
+                    not isinstance(value, bool)
+                    and isinstance(value, Real)
+                    and math.isfinite(value)
+                    and value >= 0
+                    and (allow_zero or value != 0)
+                )
+            except OverflowError:
+                valid = False
+            if not valid:
                 qualifier = "non-negative" if allow_zero else "positive"
                 raise ValueError("{} must be {} and finite".format(name, qualifier))
         if not isinstance(self.retry_exceptions, tuple) or not all(
@@ -47,8 +51,30 @@ class RetryPolicy:
 
     def delay_before(self, next_attempt: int) -> float:
         """Return delay before a one-based attempt number greater than one."""
+        if isinstance(next_attempt, bool) or not isinstance(next_attempt, int):
+            raise TypeError("next_attempt must be an integer")
+        if next_attempt < 2:
+            raise ValueError("next_attempt must be at least 2")
+        if self.delay == 0 or self.max_delay == 0:
+            return 0.0
+        if self.backoff == 1:
+            return min(self.delay, self.max_delay)
         try:
-            delay = self.delay * self.backoff ** (next_attempt - 2)
-        except OverflowError:
-            return self.max_delay
+            # Integer bases otherwise construct an arbitrarily large integer
+            # before the cap can apply. Float overflow uses the bounded fallback.
+            delay = self.delay * float(self.backoff) ** (next_attempt - 2)
+        except (OverflowError, ValueError):
+            delay = None
+        if delay is None or delay == 0:
+            # The exponent alone can overflow or underflow even when scaling by
+            # the initial delay would produce a representable result.
+            try:
+                log_delay = math.log(self.delay) + (next_attempt - 2) * math.log(
+                    self.backoff
+                )
+            except OverflowError:
+                return self.max_delay if self.backoff > 1 else 0.0
+            if log_delay >= math.log(self.max_delay):
+                return self.max_delay
+            return math.exp(log_delay)
         return min(delay, self.max_delay)

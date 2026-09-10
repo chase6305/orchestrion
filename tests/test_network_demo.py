@@ -1,6 +1,8 @@
+import http.client
 import json
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -73,9 +75,12 @@ def test_network_client_rejects_invalid_request_timeout(request_timeout):
     "payload",
     [
         {"action": "unknown", "duration": 0.01},
+        {"action": [], "duration": 0.01},
+        {"action": {"name": "grip"}, "duration": 0.01},
         {"action": "grip", "duration": -1},
         {"action": "grip", "duration": float("nan")},
         {"action": "grip", "duration": True},
+        {"action": "grip", "duration": 10 ** 400},
         {"action": "grip", "duration": 0.01, "extra": True},
     ],
 )
@@ -192,6 +197,50 @@ def test_network_server_stop_cancels_running_device_operations():
     assert operation["status"] == "cancelled"
     assert operation["error"] == "device server stopped"
     assert server.device.health()["running_operations"] == 0
+    assert server.device.health()["health"] == "offline"
+    with pytest.raises(RuntimeError, match="closed"):
+        server.device.submit({"action": "grip", "duration": 0.1}, "after-stop")
+
+
+@pytest.mark.parametrize("length, status", [("-1", 400), ("bad", 400), ("65537", 413)])
+def test_network_server_rejects_invalid_body_length_before_reading(length, status):
+    with NetworkDeviceServer() as server:
+        host, port = server._server.server_address[:2]
+        connection = http.client.HTTPConnection(host, port, timeout=1.0)
+        try:
+            connection.request(
+                "POST", "/commands", body=b"",
+                headers={"Content-Length": length, "Idempotency-Key": "invalid-length"},
+            )
+            response = connection.getresponse()
+            assert response.status == status
+            assert "error" in json.loads(response.read())
+        finally:
+            connection.close()
+
+
+def test_network_device_snapshot_cannot_mutate_retained_command():
+    device = SimulatedNetworkDevice()
+    try:
+        submitted = device.submit({"action": "grip", "duration": 1.0}, "snapshot")
+        snapshot = device.wait(submitted["operation_id"], timeout=0.0)
+        snapshot["command"]["action"] = "release"
+        assert device.wait(submitted["operation_id"], timeout=0.0)["command"]["action"] == "grip"
+    finally:
+        device.close()
+
+
+def test_network_server_releases_socket_when_worker_cannot_start(monkeypatch):
+    server = NetworkDeviceServer()
+
+    def fail_start(thread):
+        raise RuntimeError("HTTP worker could not start")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    with pytest.raises(RuntimeError, match="could not start"):
+        server.start()
+    server.stop()
+    assert server._server.socket.fileno() == -1
 
 
 def test_network_demo_module_runs_to_completion():

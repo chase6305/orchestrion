@@ -4,12 +4,14 @@ import threading
 import time
 from pathlib import Path
 
-import numpy as np
 import pytest
-import yourdfpy
 
-pytest.importorskip("viser")
+pytest.importorskip("numpy")
 pytest.importorskip("yourdfpy")
+pytest.importorskip("viser")
+
+import numpy as np
+import yourdfpy
 
 from examples.dual_arm.viser import (
     DualArmViserRuntime,

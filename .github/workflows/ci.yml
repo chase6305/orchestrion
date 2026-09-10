@@ -7,16 +7,64 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       matrix:
-        python-version: ["3.9", "3.12"]
+        include:
+          - python-version: "3.9"
+            extras: dev
+          - python-version: "3.12"
+            extras: dev,viser
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m pip install -e ".[dev,viser]"
+      - run: python -m pip install -e ".[${{ matrix.extras }}]"
       - run: ruff check orchestrion integrations tests examples
       - run: python -m pytest -q
       - run: python -m examples.simulated_pick_and_place
-      - run: python -m examples.viser.02_pick_and_place --startup-delay 0 --duration 0 --steps 2 --interval 0.001
+      - run: python -m examples.heterogeneous_workflow
+      - if: contains(matrix.extras, 'viser')
+        run: python -m examples.viser.02_pick_and_place --startup-delay 0 --duration 0 --steps 2 --interval 0.001
+      - name: Build and smoke-test the wheel without optional dependencies
+        run: |
+          python -m pip wheel . --no-deps --wheel-dir dist
+          python -m venv /tmp/orchestrion-wheel-env
+          /tmp/orchestrion-wheel-env/bin/python -m pip install --no-deps dist/*.whl
+          /tmp/orchestrion-wheel-env/bin/python -I - <<'PY'
+          import asyncio
+          from orchestrion import CommandValidationError, FieldSpec, RequestSchema, SimulatedRobotTask, TaskPilot
+          from orchestrion.workflow import Action, Node, OutputRef, RunStatus, Workflow, WorkflowEngine
+          with TaskPilot(SimulatedRobotTask([0.0])) as pilot:
+              begin, end = pilot.move_joint_trajectory_async([[0.1]], interval=0.001)
+              assert (begin, end) == (0, 1)
+              assert pilot.wait_move(time_out=1.0)
+          async def echo(context, inputs):
+              return inputs
+          async def workflow_smoke():
+              schema = RequestSchema({"ok": FieldSpec("boolean", required=True)})
+              async with WorkflowEngine([Action("echo", echo, input_schema=schema, output_schema=schema)]) as engine:
+                  invalid = Workflow((
+                      Node("source", "echo", {"ok": True}),
+                      Node("sink", "echo", {"ok": OutputRef("source", ("ok",)), "typo": 1}),
+                  ))
+                  try:
+                      engine.submit(invalid, idempotency_key="smoke")
+                  except CommandValidationError:
+                      pass
+                  else:
+                      raise AssertionError("mixed input bypassed validation")
+                  assert engine.get_run_by_key("smoke") is None
+                  workflow = Workflow((Node("echo", "echo", {"ok": True}),), timeout=1)
+                  run = engine.submit(workflow, idempotency_key="smoke")
+                  assert (await run.wait(1)).status == RunStatus.SUCCEEDED
+                  assert engine.submit(workflow, idempotency_key="smoke") is run
+                  assert engine.get_run_by_key("smoke") is run
+                  assert run.explain("echo")["blockers"] == []
+                  assert run.snapshot().nodes["echo"].feedback_dropped == 0
+                  assert engine.scheduler_snapshot()["running_actions"] == 0
+                  assert engine.scheduler_snapshot()["scheduler_error"] is None
+                  assert engine.prune_idempotency_keys(0) == 1
+          asyncio.run(workflow_smoke())
+          PY

@@ -10,16 +10,18 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, replace
+from functools import partial
 from numbers import Real
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from orchestrion.health import DeviceHealth
 from orchestrion.move_sync_option import MoveSyncOption
 from orchestrion.request import RequestResult, RequestStatus, TimelineEvent
 from orchestrion.tasks.generic_task import GenericTask
 from orchestrion.tasks.reduced_robot_task_interface import ReducedRobotTaskInterface
+from orchestrion.utils.errors import exception_message
 from orchestrion.utils.logger import logger
-from orchestrion.utils.types import PeekResponseResultType
+from orchestrion.utils.types import PeekResponseResult, PeekResponseResultType
 
 
 class TaskPilot:
@@ -59,6 +61,12 @@ class TaskPilot:
         self._task_map = dict(task_map) if task_map is not None else {}
         if any(not isinstance(name, str) or not name for name in self._task_map):
             raise ValueError("Task service names must be non-empty strings")
+        self._services_by_task: Dict[int, Set[str]] = {}
+        self._lifecycle_tasks = []
+        for name, task in self._task_map.items():
+            if id(task) not in self._services_by_task:
+                self._lifecycle_tasks.append((name, task))
+            self._services_by_task.setdefault(id(task), set()).add(name)
         self._executor = executor_owned
         self._executor_shutdown = False
         self._poll_interval = poll_interval
@@ -71,15 +79,22 @@ class TaskPilot:
         self._next_request_id = 0
         self._state_condition = threading.Condition()
         self._requests: Dict[int, RequestResult] = {}
+        self._request_counts = {status.value: 0 for status in RequestStatus}
         self._idempotency_requests: Dict[Tuple[str, str], int] = {}
         self._request_waiters: Dict[int, int] = {}
         self._timeline: deque[TimelineEvent] = deque(maxlen=timeline_capacity)
         self._running_requests: Dict[int, TaskPilot.BackgroundRequest] = {}
+        self._cancelling_requests: Dict[
+            int, Optional[Tuple[RequestStatus, Any, Optional[str]]]
+        ] = {}
         self._health_revision = 0
+        self._move_state_revision = 0
+        self._dirty_services: Set[str] = set()
         self._wake_event = threading.Event()
         self._stop_event = threading.Event()
         self._bg_thread: Optional[threading.Thread] = None
         self._initialized = False
+        self._lifecycle_epoch = 0
 
     @property
     def task_map(self) -> Dict[str, GenericTask]:
@@ -116,6 +131,15 @@ class TaskPilot:
 
     def _on_component_change(self) -> None:
         with self._state_condition:
+            self._move_state_revision += 1
+            self._mark_health_changed_locked()
+        self._wake_event.set()
+
+    def _on_task_completion(self, service_name: str) -> None:
+        with self._state_condition:
+            self._dirty_services.update(
+                self._services_by_task[id(self._task_map[service_name])]
+            )
             self._mark_health_changed_locked()
         self._wake_event.set()
 
@@ -129,7 +153,7 @@ class TaskPilot:
                 task.stop()
             except Exception:
                 logger.exception("Failed to roll back peripheral task")
-        for task in self._task_map.values():
+        for _, task in self._lifecycle_tasks:
             set_completion_callback = getattr(task, "set_completion_callback", None)
             if callable(set_completion_callback):
                 try:
@@ -158,6 +182,8 @@ class TaskPilot:
         if self._initialized:
             logger.warning("TaskPilot is already initialized.")
             return
+        if self._bg_thread is not None and self._bg_thread.is_alive():
+            raise RuntimeError("TaskPilot background thread is still stopping")
         if self._executor_shutdown:
             raise RuntimeError(
                 "TaskPilot cannot restart after its owned executor was shut down"
@@ -174,10 +200,10 @@ class TaskPilot:
             raise
         initialized_tasks = []
         try:
-            for task in self._task_map.values():
+            for service_name, task in self._lifecycle_tasks:
                 set_completion_callback = getattr(task, "set_completion_callback", None)
                 if callable(set_completion_callback):
-                    set_completion_callback(self._on_component_change)
+                    set_completion_callback(partial(self._on_task_completion, service_name))
                 initialized_tasks.append(task)
                 task.initialize(executor=self._executor)
         except Exception:
@@ -204,6 +230,9 @@ class TaskPilot:
 
     def stop(self, timeout: float = 5.0) -> None:
         """Stop the pilot, serializing against initialization and other stops."""
+        if threading.current_thread() is self._bg_thread:
+            self._stop_locked(timeout)
+            return
         with self._lifecycle_lock:
             self._stop_locked(timeout)
 
@@ -215,26 +244,42 @@ class TaskPilot:
             or timeout < 0
         ):
             raise ValueError("timeout must be non-negative and finite")
-        if not self._initialized:
+        # Elect one cleanup owner before calling device code. A scheduler callback
+        # can request stop while an external caller is already joining that thread.
+        with self._state_condition:
+            was_initialized = self._initialized
+            if was_initialized:
+                self._initialized = False
+                self._lifecycle_epoch += 1
+                self._stop_event.set()
+                self._mark_health_changed_locked()
+        if not was_initialized:
+            thread = self._bg_thread
+            if (
+                thread is not None
+                and thread is not threading.current_thread()
+                and thread.is_alive()
+            ):
+                thread.join(timeout=timeout)
+                if thread.is_alive():
+                    raise TimeoutError("TaskPilot background thread did not stop in time")
             logger.warning("TaskPilot is not running or already stopped.")
             return
-        # Close request admission before cancelling queued/running work. A caller
-        # that began preparing a request just before stop() must not enqueue it
-        # after the cancellation pass has completed.
-        with self._state_condition:
-            self._initialized = False
-            self._mark_health_changed_locked()
-        self._stop_event.set()
         self._wake_event.set()
         thread_timed_out = False
-        if self._bg_thread is not None:
+        if self._bg_thread is not None and self._bg_thread is not threading.current_thread():
             self._bg_thread.join(timeout=timeout)
             thread_timed_out = self._bg_thread.is_alive()
 
         self._cancel_nonterminal("TaskPilot stopped")
+        while True:
+            try:
+                self._task_queue.get_nowait()
+            except queue.Empty:
+                break
         task_stop_error: Optional[Exception] = None
         try:
-            for task in self._task_map.values():
+            for _, task in self._lifecycle_tasks:
                 try:
                     task.stop()
                 except Exception as exc:
@@ -289,6 +334,8 @@ class TaskPilot:
             raise KeyError("Unknown service: {}".format(srv_name))
         if not self._initialized:
             raise RuntimeError("TaskPilot must be initialized before accepting requests")
+        with self._state_condition:
+            epoch = self._lifecycle_epoch
         if isinstance(priority, bool) or not isinstance(priority, int):
             raise TypeError("priority must be an integer")
         if idempotency_key is not None and not isinstance(idempotency_key, str):
@@ -335,7 +382,7 @@ class TaskPilot:
 
         request_content = copy.deepcopy(content)
         with self._state_condition:
-            if not self._initialized:
+            if not self._initialized or epoch != self._lifecycle_epoch:
                 raise RuntimeError(
                     "TaskPilot stopped while the request was being prepared"
                 )
@@ -346,15 +393,17 @@ class TaskPilot:
             request_id = self._next_request_id
             self._next_request_id += 1
             now = time.time()
-            self._requests[request_id] = RequestResult(
-                request_id=request_id,
-                service_name=srv_name,
-                status=RequestStatus.QUEUED,
-                associated_move_id=associated_move_id,
-                associated_submodule=associated_submodule,
-                priority=priority,
-                idempotency_key=idempotency_key,
-                created_at=now,
+            self._store_request_locked(
+                RequestResult(
+                    request_id=request_id,
+                    service_name=srv_name,
+                    status=RequestStatus.QUEUED,
+                    associated_move_id=associated_move_id,
+                    associated_submodule=associated_submodule,
+                    priority=priority,
+                    idempotency_key=idempotency_key,
+                    created_at=now,
+                )
             )
             if deduplication_key is not None:
                 self._idempotency_requests[deduplication_key] = request_id
@@ -383,9 +432,10 @@ class TaskPilot:
         self._validate_request_id(request_id)
         with self._state_condition:
             try:
-                return copy.deepcopy(self._requests[request_id])
+                result = self._requests[request_id]
             except KeyError:
                 raise KeyError("Unknown request: {}".format(request_id)) from None
+        return copy.deepcopy(result)
 
     def query_task_status(self, service_name: str) -> Optional[Dict]:
         try:
@@ -408,6 +458,8 @@ class TaskPilot:
         status.setdefault(
             "available", status["health"] != DeviceHealth.OFFLINE.value
         )
+        if not isinstance(status["available"], bool):
+            raise ValueError("Task status available must be a boolean")
         status.setdefault("observed_at", time.time())
         observed_at = status["observed_at"]
         if (
@@ -448,7 +500,7 @@ class TaskPilot:
                     "available": False,
                     "health": DeviceHealth.OFFLINE.value,
                     "observed_at": time.time(),
-                    "error": str(exc),
+                    "error": exception_message(exc),
                 }
         return statuses
 
@@ -462,9 +514,7 @@ class TaskPilot:
         ):
             raise ValueError("stale_after must be positive and finite, or None")
         with self._state_condition:
-            request_counts = {status.value: 0 for status in RequestStatus}
-            for result in self._requests.values():
-                request_counts[result.status.value] += 1
+            request_counts = self._request_counts.copy()
             initialized = self._initialized
             scheduler_alive = (
                 self._bg_thread is not None and self._bg_thread.is_alive()
@@ -482,10 +532,21 @@ class TaskPilot:
                     "latest_move_id": robot_state.latest_sent_id,
                     "latest_finished_move_id": robot_state.latest_finished_id,
                 }
+                json.dumps(robot, allow_nan=False)
         except Exception as exc:
-            robot = {"available": False, "error": str(exc)}
+            robot = {"available": False, "error": exception_message(exc)}
 
         peripherals = self.query_all_task_statuses()
+        for service_name, status in peripherals.items():
+            try:
+                json.dumps(status, allow_nan=False)
+            except (TypeError, ValueError) as exc:
+                peripherals[service_name] = {
+                    "available": False,
+                    "health": DeviceHealth.OFFLINE.value,
+                    "observed_at": time.time(),
+                    "error": "Task status is not JSON-compatible: {}".format(exception_message(exc)),
+                }
         now = time.time()
         if stale_after is not None:
             for status in peripherals.values():
@@ -537,6 +598,7 @@ class TaskPilot:
         """Wait for observable state newer than ``after_revision``.
 
         Returns a fresh health snapshot, or ``None`` when the timeout expires.
+        Blocking waits are not allowed from this pilot's scheduler callbacks.
         """
         if isinstance(after_revision, bool) or not isinstance(after_revision, int):
             raise TypeError("after_revision must be an integer")
@@ -557,10 +619,19 @@ class TaskPilot:
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     return None
+                self._check_scheduler_wait()
                 self._state_condition.wait(remaining)
         return self.query_health()
 
+    def _check_scheduler_wait(self) -> None:
+        if threading.current_thread() is self._bg_thread:
+            raise RuntimeError(
+                "TaskPilot scheduler callbacks cannot block waiting on their own "
+                "pilot; submit follow-up work asynchronously"
+            )
+
     def wait_request(self, request_id: int, timeout: Optional[float] = None) -> RequestResult:
+        """Wait for a result; scheduler callbacks may only read completed results."""
         self._validate_request_id(request_id)
         if timeout is not None and (
             isinstance(timeout, bool)
@@ -576,26 +647,27 @@ class TaskPilot:
             self._request_waiters[request_id] = (
                 self._request_waiters.get(request_id, 0) + 1
             )
-            try:
+        try:
+            with self._state_condition:
                 while not self._requests[request_id].status.terminal:
                     remaining = None if deadline is None else deadline - time.monotonic()
                     if remaining is not None and remaining <= 0:
                         raise TimeoutError(
                             "Request {} did not finish in time".format(request_id)
                         )
+                    self._check_scheduler_wait()
                     self._state_condition.wait(remaining)
-                return copy.deepcopy(self._requests[request_id])
-            finally:
-                waiter_count = self._request_waiters[request_id] - 1
-                if waiter_count:
-                    self._request_waiters[request_id] = waiter_count
-                else:
-                    self._request_waiters.pop(request_id)
+                result = self._requests[request_id]
+            # Keep the waiter registered while copying outside the scheduler lock.
+            return copy.deepcopy(result)
+        finally:
+            with self._state_condition:
+                self._release_request_waiter_locked(request_id)
 
     def wait_requests(
         self, request_ids: List[int], timeout: Optional[float] = None
     ) -> List[RequestResult]:
-        """Wait for requests in order using one shared timeout budget."""
+        """Wait in order with a shared deadline, retaining every group's result."""
         if timeout is not None and (
             isinstance(timeout, bool)
             or not isinstance(timeout, Real)
@@ -610,13 +682,35 @@ class TaskPilot:
         ):
             raise TypeError("request_ids must contain integers")
         deadline = None if timeout is None else time.monotonic() + timeout
-        results = []
-        for request_id in ids:
-            remaining = (
-                None if deadline is None else max(0.0, deadline - time.monotonic())
-            )
-            results.append(self.wait_request(request_id, timeout=remaining))
-        return results
+        unique_ids = set(ids)
+        with self._state_condition:
+            for request_id in ids:
+                self._validate_request_id(request_id)
+                if request_id not in self._requests:
+                    raise KeyError("Unknown request: {}".format(request_id))
+            for request_id in unique_ids:
+                self._request_waiters[request_id] = (
+                    self._request_waiters.get(request_id, 0) + 1
+                )
+        try:
+            results = []
+            for request_id in ids:
+                remaining = (
+                    None if deadline is None else max(0.0, deadline - time.monotonic())
+                )
+                results.append(self.wait_request(request_id, timeout=remaining))
+            return results
+        finally:
+            with self._state_condition:
+                for request_id in unique_ids:
+                    self._release_request_waiter_locked(request_id)
+
+    def _release_request_waiter_locked(self, request_id: int) -> None:
+        waiter_count = self._request_waiters[request_id] - 1
+        if waiter_count:
+            self._request_waiters[request_id] = waiter_count
+        else:
+            self._request_waiters.pop(request_id)
 
     def cancel_request(self, request_id: int) -> bool:
         self._validate_request_id(request_id)
@@ -624,25 +718,47 @@ class TaskPilot:
             result = self._requests.get(request_id)
             if result is None:
                 raise KeyError("Unknown request: {}".format(request_id))
-            if result.status.terminal:
+            if result.status.terminal or request_id in self._cancelling_requests:
                 return False
             running = request_id in self._running_requests
-            if running:
-                cancel = getattr(
-                    self._task_map[result.service_name], "cancel_request", None
+            if not running:
+                self._transition(
+                    request_id, RequestStatus.CANCELLED, error="Cancelled by user"
                 )
-                if not callable(cancel) or not cancel(request_id):
-                    return False
-            # Keep the state lock across delegated cancellation and transition so
-            # a completion callback cannot race this request into FAILED first.
-            self._transition(
-                request_id, RequestStatus.CANCELLED, error="Cancelled by user"
+                self._wake_event.set()
+                return True
+            cancel = getattr(
+                self._task_map[result.service_name], "cancel_request", None
             )
-        self._wake_event.set()
-        return True
+            if not callable(cancel):
+                return False
+            self._cancelling_requests[request_id] = None
+
+        accepted = False
+        cancelled = False
+        try:
+            # Backend cancellation may wait for a worker that notifies the pilot.
+            # Do not hold the shared state lock across arbitrary device code.
+            accepted = bool(cancel(request_id))
+        finally:
+            with self._state_condition:
+                deferred = self._cancelling_requests.pop(request_id)
+                if accepted:
+                    cancelled = self._transition(
+                        request_id, RequestStatus.CANCELLED, error="Cancelled by user"
+                    )
+                elif deferred is not None:
+                    status, content, error = deferred
+                    self._transition(request_id, status, content=content, error=error)
+            self._wake_event.set()
+        return cancelled
 
     def cancel_all_requests(self, service_name: Optional[str] = None) -> List[int]:
-        """Best-effort cancel all nonterminal requests, optionally for one service."""
+        """Attempt every selected cancellation, logging individual backend errors.
+
+        Return only IDs whose cancellation was accepted. Failed attempts retain
+        their observed state and do not prevent cancellation of other requests.
+        """
         if service_name is not None and service_name not in self._task_map:
             raise KeyError("Unknown service: {}".format(service_name))
         with self._state_condition:
@@ -659,6 +775,11 @@ class TaskPilot:
                     cancelled.append(request_id)
             except KeyError:
                 continue
+            except Exception as exc:
+                logger.error(
+                    "Failed to cancel request %s: %s",
+                    request_id, exception_message(exc),
+                )
         return cancelled
 
     def timeline(self, request_id: Optional[int] = None) -> List[TimelineEvent]:
@@ -694,6 +815,7 @@ class TaskPilot:
             ]
             for request_id, _ in pruned:
                 result = self._requests.pop(request_id)
+                self._request_counts[result.status.value] -= 1
                 if result.idempotency_key is not None:
                     self._idempotency_requests.pop(
                         (result.service_name, result.idempotency_key), None
@@ -716,7 +838,6 @@ class TaskPilot:
         interval: float = 0.01,
         endpoint_index: Optional[List[int]] = None,
     ) -> Tuple[int, int]:
-        n_segments = 1 if endpoint_index is None else len(endpoint_index)
         move_id_begin = self._robot_task.move_joint_trajectory_async(
             motion_target=motion_target,
             interval=interval,
@@ -724,6 +845,7 @@ class TaskPilot:
         )
         if move_id_begin < 0:
             return move_id_begin, move_id_begin
+        n_segments = 1 if endpoint_index is None else len(endpoint_index)
         return move_id_begin, move_id_begin + n_segments
 
     def query_robot_state(self):
@@ -740,6 +862,13 @@ class TaskPilot:
             TimelineEvent.now(request_id, result.service_name, status, message)
         )
 
+    def _store_request_locked(self, result: RequestResult) -> None:
+        previous = self._requests.get(result.request_id)
+        if previous is not None:
+            self._request_counts[previous.status.value] -= 1
+        self._requests[result.request_id] = result
+        self._request_counts[result.status.value] += 1
+
     def _transition(
         self,
         request_id: int,
@@ -751,14 +880,26 @@ class TaskPilot:
             current = self._requests.get(request_id)
             if current is None or current.status.terminal:
                 return False
+            if (
+                status.terminal
+                and status is not RequestStatus.CANCELLED
+                and request_id in self._cancelling_requests
+            ):
+                if self._cancelling_requests[request_id] is None:
+                    self._cancelling_requests[request_id] = (status, content, error)
+                return False
             now = time.time()
-            self._requests[request_id] = replace(
-                current,
-                status=status,
-                content=content,
-                error=error,
-                started_at=now if status is RequestStatus.RUNNING else current.started_at,
-                finished_at=now if status.terminal else None,
+            self._store_request_locked(
+                replace(
+                    current,
+                    status=status,
+                    content=content,
+                    error=error,
+                    started_at=(
+                        now if status is RequestStatus.RUNNING else current.started_at
+                    ),
+                    finished_at=now if status.terminal else None,
+                )
             )
             if status.terminal:
                 self._running_requests.pop(request_id, None)
@@ -768,13 +909,18 @@ class TaskPilot:
 
     def _invoke_request(self, request: BackgroundRequest) -> None:
         with self._state_condition:
-            current = self._requests[request.request_id]
-            if current.status.terminal:
+            current = self._requests.get(request.request_id)
+            if (
+                self._stop_event.is_set()
+                or not self._initialized
+                or current is None
+                or current.status.terminal
+            ):
                 return
             self._running_requests[request.request_id] = request
             now = time.time()
-            self._requests[request.request_id] = replace(
-                current, status=RequestStatus.RUNNING, started_at=now
+            self._store_request_locked(
+                replace(current, status=RequestStatus.RUNNING, started_at=now)
             )
             self._record_event_locked(request.request_id, RequestStatus.RUNNING)
             self._mark_health_changed_locked()
@@ -792,26 +938,48 @@ class TaskPilot:
                 request.service_name,
                 request.request_id,
             )
-            self._transition(request.request_id, RequestStatus.FAILED, error=str(exc))
+            self._transition(request.request_id, RequestStatus.FAILED, error=exception_message(exc))
 
-    def _refresh_running(self) -> None:
+    def _refresh_running(self, service_names: Optional[Set[str]] = None) -> None:
         with self._state_condition:
-            running = list(self._running_requests.values())
+            running = [
+                request for request in self._running_requests.values()
+                if service_names is None or request.service_name in service_names
+            ]
         for request in running:
-            try:
-                response = self._task_map[request.service_name].peek_response(
-                    request.request_id
-                )
-            except (AttributeError, NotImplementedError):
-                continue
-            except Exception as exc:
-                self._transition(request.request_id, RequestStatus.FAILED, error=str(exc))
-                continue
+            self._refresh_request(request)
+
+    def _refresh_request(self, request: BackgroundRequest) -> None:
+        with self._state_condition:
+            if (
+                request.request_id not in self._running_requests
+                or self._cancelling_requests.get(request.request_id) is not None
+            ):
+                return
+        try:
+            peek_response = getattr(
+                self._task_map[request.service_name], "peek_response", None
+            )
+            if not callable(peek_response):
+                return
+            response = peek_response(request.request_id)
+            if not isinstance(response, PeekResponseResult) or not isinstance(
+                response.result_type, PeekResponseResultType
+            ):
+                raise TypeError("Task returned an invalid response envelope")
+            if response.request_id not in (-1, request.request_id):
+                raise ValueError("Task returned a response for a different request")
             if response.result_type is PeekResponseResultType.ResponseFound:
+                try:
+                    content = copy.deepcopy(response.content)
+                except Exception as exc:
+                    raise ValueError(
+                        "Task response could not be copied: {}".format(exception_message(exc))
+                    ) from exc
                 self._transition(
                     request.request_id,
                     RequestStatus.SUCCEEDED,
-                    content=response.content,
+                    content=content,
                 )
             elif response.result_type is PeekResponseResultType.ErrorUnknown:
                 self._transition(
@@ -828,6 +996,16 @@ class TaskPilot:
                     RequestStatus.FAILED,
                     error="Task result was flushed before collection",
                 )
+            elif response.result_type is PeekResponseResultType.ErrorRequestNotSent:
+                self._transition(
+                    request.request_id, RequestStatus.FAILED,
+                    error="Task has no record of the accepted request",
+                )
+        except NotImplementedError:
+            # Legacy adapters may only implement fire-and-forget invocation.
+            return
+        except Exception as exc:
+            self._transition(request.request_id, RequestStatus.FAILED, error=exception_message(exc))
 
     def _cancel_nonterminal(self, reason: str) -> None:
         with self._state_condition:
@@ -839,7 +1017,8 @@ class TaskPilot:
         for request_id in request_ids:
             with self._state_condition:
                 request = self._running_requests.get(request_id)
-            if request is not None:
+                cancellation_in_progress = request_id in self._cancelling_requests
+            if request is not None and not cancellation_in_progress:
                 cancel = getattr(
                     self._task_map[request.service_name], "cancel_request", None
                 )
@@ -852,26 +1031,44 @@ class TaskPilot:
 
     def _bg_thread_loop(self) -> None:
         waiting: List[Tuple[int, int, TaskPilot.BackgroundRequest]] = []
+        ready: List[Tuple[int, int, TaskPilot.BackgroundRequest]] = []
+        next_poll_at = time.monotonic()
+        observed_move_revision = -1
         while not self._stop_event.is_set():
             self._wake_event.clear()
-            while True:
+            now = time.monotonic()
+            poll_due = now >= next_poll_at
+            new_waiting = False
+            # Limit admission to the current batch so continuous producers cannot
+            # starve response collection, motion checks, or shutdown.
+            for _ in range(self._task_queue.qsize()):
+                if self._stop_event.is_set():
+                    break
                 try:
-                    _, _, request = self._task_queue.get_nowait()
+                    entry = self._task_queue.get_nowait()
                 except queue.Empty:
                     break
+                request = entry[2]
                 with self._state_condition:
                     result = self._requests.get(request.request_id)
                 if result is None or result.status.terminal:
                     continue
                 if request.associated_move_id < 0:
-                    self._invoke_request(request)
+                    heapq.heappush(ready, entry)
                 else:
                     self._transition(request.request_id, RequestStatus.WAITING_FOR_MOVE)
-                    heapq.heappush(
-                        waiting, (-request.priority, request.request_id, request)
-                    )
+                    heapq.heappush(waiting, entry)
+                    new_waiting = True
 
-            if waiting:
+            with self._state_condition:
+                move_revision = self._move_state_revision
+                dirty_services = self._dirty_services
+                self._dirty_services = set()
+
+            if waiting and (
+                new_waiting or poll_due or move_revision != observed_move_revision
+            ):
+                observed_move_revision = move_revision
                 needs_main_state = any(
                     entry[2].associated_submodule is None for entry in waiting
                 )
@@ -904,36 +1101,66 @@ class TaskPilot:
                             ]
                             cancelled_move_ids = submodule_state.cancelled_move_ids
                             latest_finished_id = submodule_state.latest_finished_id
+                            move_cancelled = request.associated_move_id in cancelled_move_ids
+                            move_finished = request.associated_move_id <= latest_finished_id
                         except Exception as exc:
                             self._transition(
                                 request.request_id,
                                 RequestStatus.FAILED,
-                                error=str(exc),
+                                error=exception_message(exc),
                             )
                             continue
-                        if request.associated_move_id in (
-                            cancelled_move_ids
-                        ):
+                        if move_cancelled:
                             self._transition(
                                 request.request_id,
                                 RequestStatus.CANCELLED,
                                 error="Associated submodule move was cancelled",
                             )
                             continue
-                        move_finished = (
-                            request.associated_move_id
-                            <= latest_finished_id
-                        )
                     elif robot_state is not None:
-                        move_finished = (
-                            request.associated_move_id
-                            <= robot_state.latest_finished_id
-                        )
+                        try:
+                            cancelled_move_ids = getattr(
+                                robot_state, "cancelled_move_ids", ()
+                            )
+                            if request.associated_move_id in cancelled_move_ids:
+                                self._transition(
+                                    request.request_id,
+                                    RequestStatus.CANCELLED,
+                                    error="Associated move was cancelled",
+                                )
+                                continue
+                            move_finished = (
+                                request.associated_move_id
+                                <= robot_state.latest_finished_id
+                            )
+                        except Exception as exc:
+                            self._transition(
+                                request.request_id, RequestStatus.FAILED, error=exception_message(exc)
+                            )
+                            continue
                     if move_finished:
-                        self._invoke_request(request)
+                        heapq.heappush(ready, priority_entry)
                     else:
                         heapq.heappush(remaining, priority_entry)
                 waiting = remaining
 
-            self._refresh_running()
-            self._wake_event.wait(self._poll_interval)
+            if poll_due:
+                self._refresh_running()
+                next_poll_at = time.monotonic() + self._poll_interval
+            elif dirty_services:
+                self._refresh_running(dirty_services)
+
+            # Dispatch one request before checking new priorities and collecting
+            # results again. Inline tasks with bounded storage must be collected
+            # before another call can evict their response.
+            if ready:
+                request = heapq.heappop(ready)[2]
+                self._invoke_request(request)
+                self._refresh_request(request)
+            if not ready and self._task_queue.empty():
+                with self._state_condition:
+                    needs_polling = bool(waiting or self._running_requests)
+                timeout = (
+                    max(0.0, next_poll_at - time.monotonic()) if needs_polling else None
+                )
+                self._wake_event.wait(timeout)

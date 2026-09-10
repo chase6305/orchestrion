@@ -1,5 +1,6 @@
 """Small HTTP device service used by the network orchestration demo."""
 
+import copy
 import json
 import math
 import threading
@@ -23,9 +24,31 @@ class SimulatedNetworkDevice:
         self._operations: Dict[str, Dict] = {}
         self._idempotency_keys: Dict[str, str] = {}
         self._cancel_events: Dict[str, threading.Event] = {}
+        self._closed = False
+
+    @staticmethod
+    def valid_command(command: object) -> bool:
+        """Whether a payload is an executable demo command."""
+        if not isinstance(command, dict) or set(command) != {"action", "duration"}:
+            return False
+        duration = command["duration"]
+        return (
+            isinstance(command["action"], str)
+            and command["action"] in {"grip", "release", "inspect"}
+            and not isinstance(duration, bool)
+            and isinstance(duration, (int, float))
+            and 0 <= duration <= 2.0
+            and math.isfinite(duration)
+        )
 
     def submit(self, command: Dict, idempotency_key: str) -> Dict:
+        if not self.valid_command(command):
+            raise ValueError("invalid command")
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise ValueError("idempotency_key must be a non-empty string")
         with self._condition:
+            if self._closed:
+                raise RuntimeError("device server is closed")
             existing = self._idempotency_keys.get(idempotency_key)
             if existing is not None:
                 if self._operations[existing]["command"] != command:
@@ -48,7 +71,15 @@ class SimulatedNetworkDevice:
             name="simulated-network-device-command",
             daemon=True,
         )
-        worker.start()
+        try:
+            worker.start()
+        except Exception as exc:
+            with self._condition:
+                self._operations[operation_id].update({
+                    "status": "failed", "error": str(exc), "completed_at": time.time()
+                })
+                self._condition.notify_all()
+            raise
         return {"operation_id": operation_id, "deduplicated": False}
 
     def _execute(self, operation_id: str) -> None:
@@ -105,7 +136,20 @@ class SimulatedNetworkDevice:
                 self._condition.notify_all()
             return operation_ids
 
+    def close(self) -> None:
+        """Close admission and cancel accepted work under the same lock."""
+        with self._condition:
+            self._closed = True
+            self.cancel_all()
+
     def wait(self, operation_id: str, timeout: float) -> Optional[Dict]:
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or timeout < 0
+            or not math.isfinite(timeout)
+        ):
+            raise ValueError("timeout must be non-negative and finite")
         deadline = time.monotonic() + timeout
         with self._condition:
             operation = self._operations.get(operation_id)
@@ -116,7 +160,7 @@ class SimulatedNetworkDevice:
                 if remaining <= 0:
                     break
                 self._condition.wait(remaining)
-            return operation.copy()
+            return copy.deepcopy(operation)
 
     def health(self) -> Dict:
         with self._condition:
@@ -128,9 +172,10 @@ class SimulatedNetworkDevice:
                 operation["status"] == "cancelled"
                 for operation in self._operations.values()
             )
+            closed = self._closed
         return {
-            "health": "online",
-            "available": True,
+            "health": "offline" if closed else "online",
+            "available": not closed,
             "observed_at": time.time(),
             "running_operations": running,
             "cancelled_operations": cancelled,
@@ -162,19 +207,27 @@ class NetworkDeviceServer:
                 return
             self._thread = threading.Thread(
                 target=self._server.serve_forever,
+                kwargs={"poll_interval": 0.05},
                 name="simulated-network-device-http",
                 daemon=True,
             )
-            self._thread.start()
+            try:
+                self._thread.start()
+            except Exception:
+                self._thread = None
+                self.device.close()
+                self._server.server_close()
+                self._closed = True
+                raise
 
     def stop(self) -> None:
         with self._lifecycle_lock:
             if self._closed:
                 return
             thread = self._thread
+            self.device.close()
             if thread is not None and thread.is_alive():
                 self._server.shutdown()
-            self.device.cancel_all()
             self._server.server_close()
             self._closed = True
         if thread is not None:
@@ -230,8 +283,16 @@ class NetworkDeviceServer:
                     return
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0:
+                        raise ValueError
+                    if length > 65536:
+                        self._send_json(
+                            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                            {"error": "command body exceeds 65536 bytes"},
+                        )
+                        return
                     command = json.loads(self.rfile.read(length))
-                    if not self._valid_command(command):
+                    if not device.valid_command(command):
                         raise ValueError
                 except (ValueError, json.JSONDecodeError):
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid command"})
@@ -240,6 +301,9 @@ class NetworkDeviceServer:
                     accepted = device.submit(command, idempotency_key)
                 except IdempotencyConflictError as exc:
                     self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                    return
+                except RuntimeError as exc:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
                     return
                 self._send_json(HTTPStatus.ACCEPTED, accepted)
 
@@ -256,21 +320,6 @@ class NetworkDeviceServer:
                     )
                     return
                 self._send_json(HTTPStatus.OK, result)
-
-            @staticmethod
-            def _valid_command(command: object) -> bool:
-                if not isinstance(command, dict):
-                    return False
-                if set(command) != {"action", "duration"}:
-                    return False
-                duration = command["duration"]
-                return (
-                    command["action"] in {"grip", "release", "inspect"}
-                    and not isinstance(duration, bool)
-                    and isinstance(duration, (int, float))
-                    and math.isfinite(duration)
-                    and 0 <= duration <= 2.0
-                )
 
             def _send_json(self, status: HTTPStatus, payload: Dict) -> None:
                 body = json.dumps(payload).encode("utf-8")

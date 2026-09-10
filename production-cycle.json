@@ -1,0 +1,2636 @@
+{
+  "format": "orchestrion-dual-arm-replay",
+  "version": 1,
+  "title": "07 \u00b7 Handoff and Place",
+  "duration": 4.580696334945969,
+  "frames": [
+    {
+      "elapsed": 0.0,
+      "left_arm": [
+        0.027500000000000004,
+        0.245,
+        -0.41250000000000003
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.0321164729539305,
+      "left_arm": [
+        0.05500000000000001,
+        0.24,
+        -0.42500000000000004
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.06345043692272156,
+      "left_arm": [
+        0.0825,
+        0.235,
+        -0.4375
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.09474217297974974,
+      "left_arm": [
+        0.11000000000000001,
+        0.23,
+        -0.45
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.1261476289946586,
+      "left_arm": [
+        0.1375,
+        0.225,
+        -0.4625
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.15795450191944838,
+      "left_arm": [
+        0.165,
+        0.22,
+        -0.47500000000000003
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.18919639696832746,
+      "left_arm": [
+        0.165,
+        0.22,
+        -0.47500000000000003
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.22033129597548395,
+      "left_arm": [
+        0.19250000000000003,
+        0.215,
+        -0.48750000000000004
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.25218083697836846,
+      "left_arm": [
+        0.22000000000000003,
+        0.21,
+        -0.5
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.2840512680122629,
+      "left_arm": [
+        0.2475,
+        0.20500000000000002,
+        -0.5125000000000001
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.31582109292503446,
+      "left_arm": [
+        0.275,
+        0.2,
+        -0.525
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.34751243400387466,
+      "left_arm": [
+        0.30250000000000005,
+        0.195,
+        -0.5375000000000001
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.3794626910239458,
+      "left_arm": [
+        0.30250000000000005,
+        0.195,
+        -0.5375000000000001
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.41131683194544166,
+      "left_arm": [
+        0.33,
+        0.19,
+        -0.55
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.44300991599448025,
+      "left_arm": [
+        0.35750000000000004,
+        0.185,
+        -0.5625
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.47444393392652273,
+      "left_arm": [
+        0.38500000000000006,
+        0.18,
+        -0.575
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.5058451519580558,
+      "left_arm": [
+        0.4125,
+        0.175,
+        -0.5875
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.5376833529444411,
+      "left_arm": [
+        0.44000000000000006,
+        0.16999999999999998,
+        -0.6000000000000001
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.5697323719505221,
+      "left_arm": [
+        0.4675000000000001,
+        0.16499999999999998,
+        -0.6125
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.6013199519366026,
+      "left_arm": [
+        0.4675000000000001,
+        0.16499999999999998,
+        -0.6125
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.632700301008299,
+      "left_arm": [
+        0.495,
+        0.16,
+        -0.625
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.6643326639896259,
+      "left_arm": [
+        0.5225000000000001,
+        0.155,
+        -0.6375
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.6957918079569936,
+      "left_arm": [
+        0.55,
+        0.15,
+        -0.65
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 0.727531858952716,
+      "left_arm": [
+        0.55,
+        0.15,
+        -0.65
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0625,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 0.7590571349719539,
+      "left_arm": [
+        0.55,
+        0.15,
+        -0.65
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.125,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 0.7907891300274059,
+      "left_arm": [
+        0.55,
+        0.15,
+        -0.65
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.1875,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 0.8223693269537762,
+      "left_arm": [
+        0.55,
+        0.15,
+        -0.65
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.3125,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 0.8538200160255656,
+      "left_arm": [
+        0.55,
+        0.15,
+        -0.65
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.375,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 0.8855137419886887,
+      "left_arm": [
+        0.55,
+        0.15,
+        -0.65
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.4375,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 0.9168621959397569,
+      "left_arm": [
+        0.55,
+        0.15,
+        -0.65
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.5,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 0.9481439070077613,
+      "left_arm": [
+        0.55,
+        0.15,
+        -0.65
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.625,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 0.9794383710250258,
+      "left_arm": [
+        0.55,
+        0.15,
+        -0.65
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.6875,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 1.0106412880122662,
+      "left_arm": [
+        0.55,
+        0.15,
+        -0.65
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.75,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 1.0422310750000179,
+      "left_arm": [
+        0.55,
+        0.15,
+        -0.65
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.8125,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 1.0737869999138638,
+      "left_arm": [
+        0.55,
+        0.15,
+        -0.65
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.9375,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 1.1053647759836167,
+      "left_arm": [
+        0.55,
+        0.15,
+        -0.65
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "table",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 1.137090103002265,
+      "left_arm": [
+        0.54,
+        0.13999999999999999,
+        -0.63
+      ],
+      "right_arm": [
+        0.017499999999999998,
+        -0.235,
+        0.3925
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.1686193889472634,
+      "left_arm": [
+        0.53,
+        0.13,
+        -0.61
+      ],
+      "right_arm": [
+        0.034999999999999996,
+        -0.22,
+        0.385
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.2001124889357015,
+      "left_arm": [
+        0.52,
+        0.12,
+        -0.59
+      ],
+      "right_arm": [
+        0.05249999999999999,
+        -0.20500000000000002,
+        0.3775
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.2318265750072896,
+      "left_arm": [
+        0.52,
+        0.12,
+        -0.59
+      ],
+      "right_arm": [
+        0.05249999999999999,
+        -0.20500000000000002,
+        0.3775
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.2634262199280784,
+      "left_arm": [
+        0.51,
+        0.10999999999999999,
+        -0.5700000000000001
+      ],
+      "right_arm": [
+        0.06999999999999999,
+        -0.19,
+        0.37
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.2950596580049023,
+      "left_arm": [
+        0.5,
+        0.09999999999999999,
+        -0.55
+      ],
+      "right_arm": [
+        0.0875,
+        -0.175,
+        0.36250000000000004
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.3265290040289983,
+      "left_arm": [
+        0.49000000000000005,
+        0.08999999999999998,
+        -0.53
+      ],
+      "right_arm": [
+        0.10499999999999998,
+        -0.16,
+        0.35500000000000004
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.3580945669673383,
+      "left_arm": [
+        0.48000000000000004,
+        0.07999999999999999,
+        -0.51
+      ],
+      "right_arm": [
+        0.12249999999999998,
+        -0.145,
+        0.34750000000000003
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.3897763639688492,
+      "left_arm": [
+        0.47000000000000003,
+        0.06999999999999999,
+        -0.49
+      ],
+      "right_arm": [
+        0.13999999999999999,
+        -0.13,
+        0.34
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.421358587918803,
+      "left_arm": [
+        0.47000000000000003,
+        0.06999999999999999,
+        -0.49
+      ],
+      "right_arm": [
+        0.13999999999999999,
+        -0.13,
+        0.34
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.4527741249185055,
+      "left_arm": [
+        0.46,
+        0.06,
+        -0.47000000000000003
+      ],
+      "right_arm": [
+        0.1575,
+        -0.11500000000000002,
+        0.3325
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.4843066569883376,
+      "left_arm": [
+        0.45,
+        0.04999999999999999,
+        -0.45
+      ],
+      "right_arm": [
+        0.175,
+        -0.1,
+        0.325
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.5158088639145717,
+      "left_arm": [
+        0.44,
+        0.03999999999999998,
+        -0.43
+      ],
+      "right_arm": [
+        0.19249999999999998,
+        -0.08500000000000002,
+        0.3175
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.5475073310080916,
+      "left_arm": [
+        0.43,
+        0.02999999999999997,
+        -0.41
+      ],
+      "right_arm": [
+        0.20999999999999996,
+        -0.07,
+        0.31
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.5792300129542127,
+      "left_arm": [
+        0.42,
+        0.01999999999999999,
+        -0.39
+      ],
+      "right_arm": [
+        0.22749999999999998,
+        -0.05499999999999999,
+        0.3025
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.6110765419434756,
+      "left_arm": [
+        0.41000000000000003,
+        0.009999999999999981,
+        -0.37
+      ],
+      "right_arm": [
+        0.24499999999999997,
+        -0.03999999999999998,
+        0.295
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.6425295079825446,
+      "left_arm": [
+        0.41000000000000003,
+        0.009999999999999981,
+        -0.37
+      ],
+      "right_arm": [
+        0.24499999999999997,
+        -0.03999999999999998,
+        0.295
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.673836916917935,
+      "left_arm": [
+        0.4,
+        0.0,
+        -0.35000000000000003
+      ],
+      "right_arm": [
+        0.2625,
+        -0.024999999999999994,
+        0.2875
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.7054820759221911,
+      "left_arm": [
+        0.39,
+        -0.010000000000000009,
+        -0.33
+      ],
+      "right_arm": [
+        0.27999999999999997,
+        -0.010000000000000009,
+        0.28
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.737120863981545,
+      "left_arm": [
+        0.38,
+        -0.020000000000000018,
+        -0.31
+      ],
+      "right_arm": [
+        0.2975,
+        0.0050000000000000044,
+        0.2725
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.7686410829192027,
+      "left_arm": [
+        0.37,
+        -0.03,
+        -0.29000000000000004
+      ],
+      "right_arm": [
+        0.315,
+        0.019999999999999962,
+        0.265
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.8001983310095966,
+      "left_arm": [
+        0.36,
+        -0.04000000000000001,
+        -0.27
+      ],
+      "right_arm": [
+        0.33249999999999996,
+        0.03500000000000003,
+        0.2575
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.832618084968999,
+      "left_arm": [
+        0.36,
+        -0.04000000000000001,
+        -0.27
+      ],
+      "right_arm": [
+        0.33249999999999996,
+        0.03500000000000003,
+        0.2575
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.8640394120011479,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 1.8955104829510674,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.0625,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 1.9268959580222145,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.1875,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 1.9582251489628106,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.25,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 1.98990176001098,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.3125,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.021571947960183,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.375,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.0529334989842027,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.5,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.0846788759808987,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.5625,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.1161539759486914,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.625,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.147620009025559,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.6875,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.1791782919317484,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.8125,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.2105203869286925,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.875,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.241801801021211,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 0.9375,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.2731151529587805,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 1.0,
+      "right_gripper": 1.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "left_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.305003272020258,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 0.875,
+      "right_gripper": 1.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "both_arms",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.3369930179324,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 0.8125,
+      "right_gripper": 1.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "both_arms",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.368444013991393,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 0.75,
+      "right_gripper": 1.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "both_arms",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.3997766519896686,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 0.6875,
+      "right_gripper": 1.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "both_arms",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.431139774969779,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 0.5625,
+      "right_gripper": 1.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "both_arms",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.462479806970805,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 0.5,
+      "right_gripper": 1.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "both_arms",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.4937254349933937,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 0.4375,
+      "right_gripper": 1.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "both_arms",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.5251550209941342,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 0.375,
+      "right_gripper": 1.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "both_arms",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.5566553570097312,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 0.25,
+      "right_gripper": 1.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "both_arms",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.5885118179721758,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 0.1875,
+      "right_gripper": 1.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "both_arms",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.620032280916348,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 0.125,
+      "right_gripper": 1.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "both_arms",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.651432664017193,
+      "left_arm": [
+        0.35,
+        -0.05000000000000002,
+        -0.25
+      ],
+      "right_arm": [
+        0.35,
+        0.04999999999999999,
+        0.25
+      ],
+      "left_gripper": 0.0625,
+      "right_gripper": 1.0,
+      "zone_owner": "production-cycle-1",
+      "payload_owner": "both_arms",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 2.682736648945138,
+      "left_arm": [
+        0.33249999999999996,
+        -0.03500000000000002,
+        -0.2575
+      ],
+      "right_arm": [
+        0.36,
+        0.039999999999999994,
+        0.27
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 2.7144808139419183,
+      "left_arm": [
+        0.33249999999999996,
+        -0.03500000000000002,
+        -0.2575
+      ],
+      "right_arm": [
+        0.36,
+        0.039999999999999994,
+        0.27
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 2.746091822977178,
+      "left_arm": [
+        0.315,
+        -0.02000000000000001,
+        -0.265
+      ],
+      "right_arm": [
+        0.37,
+        0.029999999999999992,
+        0.29
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 2.7776315519586205,
+      "left_arm": [
+        0.2975,
+        -0.005000000000000011,
+        -0.2725
+      ],
+      "right_arm": [
+        0.38,
+        0.01999999999999999,
+        0.31
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 2.809670357964933,
+      "left_arm": [
+        0.27999999999999997,
+        0.009999999999999995,
+        -0.28
+      ],
+      "right_arm": [
+        0.39,
+        0.009999999999999995,
+        0.33
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 2.8415832929313183,
+      "left_arm": [
+        0.26249999999999996,
+        0.024999999999999994,
+        -0.2875
+      ],
+      "right_arm": [
+        0.4,
+        -6.938893903907228e-18,
+        0.35
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 2.8731158890295774,
+      "left_arm": [
+        0.245,
+        0.039999999999999994,
+        -0.295
+      ],
+      "right_arm": [
+        0.41,
+        -0.010000000000000009,
+        0.37
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 2.905241395928897,
+      "left_arm": [
+        0.245,
+        0.039999999999999994,
+        -0.295
+      ],
+      "right_arm": [
+        0.41,
+        -0.010000000000000009,
+        0.37
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 2.9367655399255455,
+      "left_arm": [
+        0.22749999999999998,
+        0.05500000000000001,
+        -0.3025
+      ],
+      "right_arm": [
+        0.42,
+        -0.020000000000000004,
+        0.39
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 2.968819947913289,
+      "left_arm": [
+        0.21,
+        0.07,
+        -0.31
+      ],
+      "right_arm": [
+        0.43,
+        -0.03,
+        0.41000000000000003
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 3.0003345030127093,
+      "left_arm": [
+        0.19249999999999998,
+        0.08499999999999999,
+        -0.3175
+      ],
+      "right_arm": [
+        0.44,
+        -0.04000000000000001,
+        0.43
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 3.0318469549529254,
+      "left_arm": [
+        0.175,
+        0.1,
+        -0.325
+      ],
+      "right_arm": [
+        0.45,
+        -0.05,
+        0.45
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 3.0634682159870863,
+      "left_arm": [
+        0.1575,
+        0.11500000000000002,
+        -0.3325
+      ],
+      "right_arm": [
+        0.46,
+        -0.06,
+        0.47000000000000003
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 3.0959184520179406,
+      "left_arm": [
+        0.14,
+        0.13,
+        -0.34
+      ],
+      "right_arm": [
+        0.47000000000000003,
+        -0.07,
+        0.49000000000000005
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 3.1280860690167174,
+      "left_arm": [
+        0.14,
+        0.13,
+        -0.34
+      ],
+      "right_arm": [
+        0.47000000000000003,
+        -0.07,
+        0.49000000000000005
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 3.159487586002797,
+      "left_arm": [
+        0.1225,
+        0.145,
+        -0.34750000000000003
+      ],
+      "right_arm": [
+        0.48000000000000004,
+        -0.07999999999999999,
+        0.51
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 3.1911238050088286,
+      "left_arm": [
+        0.10500000000000001,
+        0.16000000000000003,
+        -0.35500000000000004
+      ],
+      "right_arm": [
+        0.49,
+        -0.09,
+        0.53
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 3.222771064960398,
+      "left_arm": [
+        0.08749999999999997,
+        0.17500000000000002,
+        -0.36250000000000004
+      ],
+      "right_arm": [
+        0.5,
+        -0.09999999999999998,
+        0.55
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 3.2549859079299495,
+      "left_arm": [
+        0.07,
+        0.19000000000000003,
+        -0.37
+      ],
+      "right_arm": [
+        0.51,
+        -0.10999999999999999,
+        0.5700000000000001
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 3.2866032319143414,
+      "left_arm": [
+        0.05249999999999999,
+        0.205,
+        -0.3775
+      ],
+      "right_arm": [
+        0.52,
+        -0.12,
+        0.5900000000000001
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 3.318393263965845,
+      "left_arm": [
+        0.05249999999999999,
+        0.205,
+        -0.3775
+      ],
+      "right_arm": [
+        0.52,
+        -0.12,
+        0.5900000000000001
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 3.350221225991845,
+      "left_arm": [
+        0.034999999999999976,
+        0.22,
+        -0.385
+      ],
+      "right_arm": [
+        0.53,
+        -0.13,
+        0.61
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 3.3818032959243283,
+      "left_arm": [
+        0.017500000000000016,
+        0.23500000000000001,
+        -0.3925
+      ],
+      "right_arm": [
+        0.54,
+        -0.14,
+        0.63
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 3.41343583795242,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.55,
+        -0.15,
+        0.65
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 1.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 3.4456296119606122,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.55,
+        -0.15,
+        0.65
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.9375,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 3.477305974927731,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.55,
+        -0.15,
+        0.65
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.875,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 3.5085871620103717,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.55,
+        -0.15,
+        0.65
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.8125,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 3.5404136310098693,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.55,
+        -0.15,
+        0.65
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.6875,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 3.57237713097129,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.55,
+        -0.15,
+        0.65
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.625,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 3.6043823990039527,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.55,
+        -0.15,
+        0.65
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.5625,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 3.635811837972142,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.55,
+        -0.15,
+        0.65
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.4375,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 3.6680752199608833,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.55,
+        -0.15,
+        0.65
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.375,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 3.699661316932179,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.55,
+        -0.15,
+        0.65
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.3125,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 3.731091156951152,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.55,
+        -0.15,
+        0.65
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.25,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 3.762393752927892,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.55,
+        -0.15,
+        0.65
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.125,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 3.793746670940891,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.55,
+        -0.15,
+        0.65
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0625,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 3.825141476932913,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.55,
+        -0.15,
+        0.65
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "right_arm",
+      "event": "gripper_requested"
+    },
+    {
+      "elapsed": 3.856412583962083,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.5225000000000001,
+        -0.155,
+        0.6375000000000001
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 3.8879104600055143,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.49500000000000005,
+        -0.16,
+        0.625
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 3.919537945999764,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.4675,
+        -0.165,
+        0.6125
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 3.9511274619726464,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.44000000000000006,
+        -0.16999999999999998,
+        0.6
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 3.9826518489280716,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.44000000000000006,
+        -0.16999999999999998,
+        0.6
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 4.014412709977478,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.41250000000000003,
+        -0.175,
+        0.5875
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 4.04655303992331,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.385,
+        -0.18,
+        0.5750000000000001
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 4.07834044995252,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.35750000000000004,
+        -0.185,
+        0.5625
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 4.110213196952827,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.33,
+        -0.19,
+        0.55
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 4.141989215975627,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.30250000000000005,
+        -0.195,
+        0.5375
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 4.1740545380162075,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.30250000000000005,
+        -0.195,
+        0.5375
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 4.2059973439900205,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.275,
+        -0.2,
+        0.525
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 4.237791636958718,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.2475,
+        -0.20500000000000002,
+        0.5125
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 4.26965955493506,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.22000000000000003,
+        -0.21000000000000002,
+        0.5
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 4.301577345002443,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.1925,
+        -0.215,
+        0.48750000000000004
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 4.333446115022525,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.16499999999999998,
+        -0.22,
+        0.47500000000000003
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 4.365124895004556,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.13750000000000007,
+        -0.22499999999999998,
+        0.4625
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 4.3971026060171425,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.10999999999999999,
+        -0.22999999999999998,
+        0.45
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 4.429057874018326,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.10999999999999999,
+        -0.22999999999999998,
+        0.45
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 4.460454816929996,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.08249999999999996,
+        -0.235,
+        0.4375
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 4.492242306936532,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.05500000000000005,
+        -0.24,
+        0.42500000000000004
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 4.524293883005157,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.02749999999999997,
+        -0.245,
+        0.41250000000000003
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 4.556068119010888,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_started"
+    },
+    {
+      "elapsed": 4.580696334945969,
+      "left_arm": [
+        0.0,
+        0.25,
+        -0.4
+      ],
+      "right_arm": [
+        0.0,
+        -0.25,
+        0.4
+      ],
+      "left_gripper": 0.0,
+      "right_gripper": 0.0,
+      "zone_owner": null,
+      "payload_owner": "output_table",
+      "event": "arms_finished"
+    }
+  ]
+}

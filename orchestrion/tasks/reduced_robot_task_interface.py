@@ -16,6 +16,7 @@ class ReducedRobotTaskInterface(ABC):
         jps: List[float]  # Joint positions
         latest_finished_id: int = -1  # Last finished movement ID
         latest_sent_id: int = -1  # Last sent movement ID
+        cancelled_move_ids: tuple = ()  # Accepted movements discarded on stop
 
     @dataclass
     class MovementRequest(object):
@@ -84,7 +85,7 @@ class ReducedRobotTaskInterface(ABC):
         Returns:
             bool: True if valid, False otherwise.
         """
-        if endpoint_index is None or len(endpoint_index) == 0:
+        if not isinstance(endpoint_index, (list, tuple)) or not endpoint_index:
             return False
 
         # Check each endpoint index is greater than previous
@@ -106,18 +107,25 @@ class ReducedRobotTaskInterface(ABC):
 
     @staticmethod
     def _is_finite_real(value: object) -> bool:
-        return (
-            not isinstance(value, bool)
-            and isinstance(value, Real)
-            and math.isfinite(value)
-        )
+        if isinstance(value, bool) or not isinstance(value, Real):
+            return False
+        try:
+            return math.isfinite(value)
+        except OverflowError:
+            return False
 
     @staticmethod
     def _is_finite_trajectory(motion_target: List[List[float]]) -> bool:
-        return all(
-            ReducedRobotTaskInterface._is_finite_real(value)
-            for point in motion_target
-            for value in point
+        return (
+            isinstance(motion_target, (list, tuple))
+            and all(
+                isinstance(point, (list, tuple))
+                and all(
+                    ReducedRobotTaskInterface._is_finite_real(value)
+                    for value in point
+                )
+                for point in motion_target
+            )
         )
 
     @abstractmethod

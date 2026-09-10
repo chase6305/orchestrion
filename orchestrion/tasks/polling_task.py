@@ -9,6 +9,7 @@ from typing import Callable, Dict, Optional
 
 from orchestrion.health import DeviceHealth
 from orchestrion.tasks.function_call_task import InPlaceFunctionCallTask
+from orchestrion.utils.errors import exception_message
 
 
 class PollingTask(InPlaceFunctionCallTask):
@@ -43,6 +44,7 @@ class PollingTask(InPlaceFunctionCallTask):
         self._consecutive_failures = 0
         self._poll_stop = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
+        self._poll_lifecycle_lock = threading.RLock()
 
     def describe(self) -> Dict:
         description = super().describe()
@@ -50,25 +52,43 @@ class PollingTask(InPlaceFunctionCallTask):
         return description
 
     def initialize(self, **kwargs) -> None:
-        if self._poll_thread is not None and self._poll_thread.is_alive():
-            return
-        self._poll_stop.clear()
-        self._poll_thread = threading.Thread(
-            target=self._poll_loop,
-            name="orchestrion-polling-task",
-            daemon=True,
-        )
-        self._poll_thread.start()
+        with self._poll_lifecycle_lock:
+            if self._poll_thread is not None and self._poll_thread.is_alive():
+                if self._poll_stop.is_set():
+                    raise RuntimeError("Polling task thread is still stopping")
+                return
+            self._poll_stop.clear()
+            self._poll_thread = threading.Thread(
+                target=self._poll_loop,
+                name="orchestrion-polling-task",
+                daemon=True,
+            )
+            try:
+                self._poll_thread.start()
+            except Exception:
+                self._poll_thread = None
+                self._poll_stop.set()
+                raise
 
     def stop(self) -> None:
-        self._poll_stop.set()
-        thread = self._poll_thread
-        if thread is not None:
-            # Device SDK calls must configure their own I/O timeout. Keep framework
-            # shutdown bounded even if a third-party poll function blocks.
-            thread.join(timeout=1.0)
-            if not thread.is_alive():
-                self._poll_thread = None
+        if threading.current_thread() is self._poll_thread:
+            # An external stop may be joining this worker while holding the
+            # lifecycle lock. Worker callbacks must not wait for that lock.
+            was_stopped = self._poll_stop.is_set()
+            self._poll_stop.set()
+        else:
+            with self._poll_lifecycle_lock:
+                was_stopped = self._poll_stop.is_set()
+                self._poll_stop.set()
+                thread = self._poll_thread
+                if thread is not None and thread is not threading.current_thread():
+                    # Device SDK calls must configure their own I/O timeout. Keep framework
+                    # shutdown bounded even if a third-party poll function blocks.
+                    thread.join(timeout=1.0)
+                    if not thread.is_alive():
+                        self._poll_thread = None
+        if not was_stopped:
+            self._notify_completion()
 
     def _poll_loop(self) -> None:
         while not self._poll_stop.is_set():
@@ -76,14 +96,16 @@ class PollingTask(InPlaceFunctionCallTask):
                 sample = self._poll()
                 if sample is not None and not isinstance(sample, dict):
                     raise TypeError("poll callable must return a dictionary or None")
+                sample = copy.deepcopy(sample)
                 with self._sample_lock:
-                    self._latest_sample = copy.deepcopy(sample)
+                    self._latest_sample = sample
                     self._observed_at = time.time()
                     self._last_error = None
                     self._consecutive_failures = 0
             except Exception as exc:
+                message = exception_message(exc)
                 with self._sample_lock:
-                    self._last_error = str(exc)
+                    self._last_error = message
                     self._consecutive_failures += 1
             self._notify_completion()
             self._poll_stop.wait(self._interval)
@@ -92,10 +114,13 @@ class PollingTask(InPlaceFunctionCallTask):
         with self._sample_lock:
             if self._observed_at is None:
                 raise RuntimeError(self._last_error or "No telemetry sample is available")
-            return {
-                "sample": copy.deepcopy(self._latest_sample),
-                "observed_at": self._observed_at,
-            }
+            sample = self._latest_sample
+            observed_at = self._observed_at
+        # Published samples are replaced, never mutated; copying needs no lock.
+        return {
+            "sample": copy.deepcopy(sample),
+            "observed_at": observed_at,
+        }
 
     def peek_status(self) -> Dict:
         status = super().peek_status()
@@ -103,9 +128,10 @@ class PollingTask(InPlaceFunctionCallTask):
             observed_at = self._observed_at
             last_error = self._last_error
             failures = self._consecutive_failures
+        thread = self._poll_thread
         initialized = (
-            self._poll_thread is not None
-            and self._poll_thread.is_alive()
+            thread is not None
+            and thread.is_alive()
             and not self._poll_stop.is_set()
         )
         if not initialized:

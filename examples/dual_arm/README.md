@@ -16,7 +16,7 @@ python -m examples.dual_arm 07
 ```
 
 Install the optional visualization dependencies and add `--viser` to render any
-of the six workflows with two live UR5 models:
+of the seven workflows with two live UR5 models:
 
 ```bash
 pip install -e ".[viser]"

@@ -101,11 +101,14 @@ class GenericTask(ABC):
 
     def set_completion_callback(self, callback: Optional[Callable[[], None]]) -> None:
         """Register a callback invoked whenever a request may have completed."""
+        if callback is not None and not callable(callback):
+            raise TypeError("callback must be callable or None")
         self._completion_callback = callback
 
     def _notify_completion(self) -> None:
-        if self._completion_callback is not None:
+        callback = self._completion_callback
+        if callback is not None:
             try:
-                self._completion_callback()
+                callback()
             except Exception:
                 logger.exception("Task completion callback failed")
