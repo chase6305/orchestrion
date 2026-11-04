@@ -3,6 +3,8 @@ import importlib
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -12,6 +14,7 @@ pytest.importorskip("viser")
 
 import numpy as np
 import yourdfpy
+from viser.transforms import SO3
 
 from examples.dual_arm.viser import (
     DualArmViserRuntime,
@@ -21,7 +24,18 @@ from examples.dual_arm.viser import (
     world_ee_position,
 )
 from examples.viser.__main__ import main as viser_demo_main
-from examples.viser.common import PICK_Q, PLACE_Q, ViserDemoRuntime
+from examples.viser.common import (
+    HOME_Q,
+    PAYLOAD_DIMENSIONS,
+    PAYLOAD_GRASP_POSITION,
+    PAYLOAD_OFFSET,
+    PICK_ABOVE_Q,
+    PICK_Q,
+    PLACE_ABOVE_Q,
+    PLACE_Q,
+    ViserDemoRuntime,
+    interpolate,
+)
 from integrations.viser.viser_modular_robot_task import (
     ViserGripperTask,
     ViserModularReducedRobotTask,
@@ -251,16 +265,116 @@ def make_payload_runtime(joints, gripper_position, attached=False):
     return runtime
 
 
-def test_payload_attaches_only_at_pick_with_closed_gripper():
-    runtime = make_payload_runtime(PICK_Q, 0.72)
+def test_payload_attaches_only_at_pick_with_grasp_width():
+    runtime = make_payload_runtime(PICK_Q, PAYLOAD_GRASP_POSITION)
     runtime.attach_payload()
     assert runtime._payload_attached
     assert not runtime._pick_object.visible
     assert runtime._carried_object.visible
 
-    runtime = make_payload_runtime(PICK_Q, 0.2)
-    with pytest.raises(RuntimeError, match="closed"):
-        runtime.attach_payload()
+    for position in (0.0, 0.2, 0.72):
+        runtime = make_payload_runtime(PICK_Q, position)
+        with pytest.raises(RuntimeError, match="grasp position"):
+            runtime.attach_payload()
+
+
+def test_payload_fits_between_fingers_throughout_grasp():
+    gripper = yourdfpy.URDF.load(
+        str(Path(__file__).parents[1] / "assets/Robotiq2F85/Robotiq2F85.urdf")
+    )
+    payload_min = PAYLOAD_OFFSET - np.asarray(PAYLOAD_DIMENSIONS) / 2
+    payload_max = PAYLOAD_OFFSET + np.asarray(PAYLOAD_DIMENSIONS) / 2
+    for position in np.linspace(0.0, PAYLOAD_GRASP_POSITION, 25):
+        gripper.update_cfg(np.array([position]))
+        for node in gripper.scene.graph.nodes_geometry:
+            transform, geometry = gripper.scene.graph[node]
+            mesh = gripper.scene.geometry[geometry].copy()
+            mesh.apply_transform(transform)
+            overlap = np.minimum(mesh.bounds[1], payload_max) - np.maximum(
+                mesh.bounds[0], payload_min
+            )
+            assert not np.all(overlap > 1e-7), (position, node)
+
+
+def test_pick_place_lifts_before_transfer_and_clears_station_surfaces():
+    runtime = object.__new__(ViserDemoRuntime)
+    runtime._fk_urdf = yourdfpy.URDF.load(
+        str(Path(__file__).parents[1] / "assets/UR5/UR5.urdf")
+    )
+    for contact, above in ((PICK_Q, PICK_ABOVE_Q), (PLACE_Q, PLACE_ABOVE_Q)):
+        delta = runtime.fk_position(above) - runtime.fk_position(contact)
+        assert delta == pytest.approx([0.0, 0.0, 0.14], abs=1e-6)
+    # Trace the actual workflow so removing a lift also invalidates this check.
+    demo = Mock()
+    current = HOME_Q
+    carried = False
+    carried_paths = []
+
+    def move(target, steps, interval):
+        nonlocal current
+        if carried:
+            carried_paths.append(interpolate(current, target, steps))
+        current = target
+
+    def attach():
+        nonlocal carried
+        carried = True
+
+    def release():
+        nonlocal carried
+        carried = False
+
+    demo.move.side_effect = move
+    demo.move_and_wait.side_effect = move
+    demo.attach_payload.side_effect = attach
+    demo.release_payload.side_effect = release
+    importlib.import_module("examples.viser.02_pick_and_place").workflow(
+        demo, SimpleNamespace(steps=100, interval=0.01)
+    )
+    assert len(carried_paths) == 3
+    assert demo.pilot.call_srv_async.call_args_list[0].args[1]["position"] == (
+        PAYLOAD_GRASP_POSITION
+    )
+    stations = [runtime.fk_position(pose) for pose in (PICK_Q, PLACE_Q)]
+    for path in carried_paths:
+        for joints in path:
+            center = runtime.fk_position(joints)
+            half_extent = np.abs(runtime.fk_transform(joints)[:3, :3]) @ (
+                np.asarray(PAYLOAD_DIMENSIONS) / 2
+            )
+            for station in stations:
+                if np.all(np.abs(center[:2] - station[:2]) < 0.08 + half_extent[:2]):
+                    bottom = center[2] - half_extent[2]
+                    assert bottom >= station[2] - PAYLOAD_DIMENSIONS[2] / 2 - 1e-6
+    assert runtime.fk_position(HOME_Q)[2] > max(p[2] for p in stations) + 0.14
+
+
+def test_payload_world_and_tool_markers_agree_at_attachment_and_release():
+    runtime = object.__new__(ViserDemoRuntime)
+    runtime._fk_urdf = yourdfpy.URDF.load(
+        str(Path(__file__).parents[1] / "assets/UR5/UR5.urdf")
+    )
+    runtime._ee_node = "/tool"
+    runtime._payload_status = SimpleNamespace(content="")
+    runtime.server = Mock()
+    runtime.server.scene.add_box.side_effect = (
+        lambda name, **kwargs: SimpleNamespace(name=name, **kwargs)
+    )
+    runtime.add_workspace_markers()
+    for joints, marker in (
+        (PICK_Q, runtime._pick_object), (PLACE_Q, runtime._placed_object)
+    ):
+        tool = runtime.fk_transform(joints)
+        assert marker.position == pytest.approx(
+            tool[:3, 3] + tool[:3, :3] @ runtime._carried_object.position
+        )
+        assert SO3(marker.wxyz).as_matrix() == pytest.approx(tool[:3, :3])
+        station = next(
+            call for call in runtime.server.scene.add_box.call_args_list
+            if call.args[0] == "/world/" + ("pick" if joints is PICK_Q else "place")
+        )
+        top = station.kwargs["position"][2] + station.kwargs["dimensions"][2] / 2
+        assert top == pytest.approx(marker.position[2] - marker.dimensions[2] / 2)
 
 
 def test_payload_releases_only_at_place_with_open_gripper():

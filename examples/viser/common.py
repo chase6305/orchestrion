@@ -18,15 +18,21 @@ from integrations.viser.viser_modular_robot_task import (
 from orchestrion import RequestStatus, TaskPilot
 from orchestrion.tasks import SubModuleTask
 from viser.extras import ViserUrdf
+from viser.transforms import SO3
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-HOME_Q = np.array(
-    [np.pi / 2, -3 * np.pi / 4, 3 * np.pi / 4, -np.pi / 2, -np.pi / 2, np.pi / 2]
-)
+HOME_Q = np.deg2rad([90, -110, 80, -60, -90, 90])
 PICK_Q = np.array(
     [np.pi / 2, -np.pi / 2, np.pi / 2, -np.pi / 2, -np.pi / 2, np.pi / 2]
 )
 PLACE_Q = PICK_Q + np.array([np.deg2rad(35), 0.1, -0.1, 0.0, 0.0, 0.0])
+# Tool-down approach poses keep transfers 14 cm above the station contacts.
+PICK_ABOVE_Q = np.deg2rad([90, -86.47329062, 65.43651450, -68.96322388, -90, 90])
+PLACE_ABOVE_Q = np.deg2rad([125, -80.56492786, 59.08595348, -68.52102562, -90, 90])
+PAYLOAD_DIMENSIONS = (0.04, 0.04, 0.06)
+PAYLOAD_OFFSET = np.array([0.0, 0.0, 0.17])
+# Stop at the 40 mm object's width instead of closing empty fingers through it.
+PAYLOAD_GRASP_POSITION = 0.37
 
 
 def interpolate(start: np.ndarray, end: np.ndarray, steps: int) -> List[List[float]]:
@@ -75,8 +81,8 @@ class ViserDemoRuntime:
             show_share_button=False,
             brand_color=(70, 110, 230),
         )
-        self.server.initial_camera.position = (0.85, -1.15, 0.80)
-        self.server.initial_camera.look_at = (0.12, -0.25, 0.34)
+        self.server.initial_camera.position = (0.85, -1.15, 0.95)
+        self.server.initial_camera.look_at = (0.16, -0.28, 0.40)
         self.server.initial_camera.fov = np.deg2rad(42)
         self.server.initial_camera.up = (0.0, 0.0, 1.0)
         self.server.scene.add_grid(
@@ -226,7 +232,9 @@ class ViserDemoRuntime:
                 "/world/" + name,
                 color=color,
                 dimensions=(0.16, 0.16, 0.025),
-                position=position - np.array([0.0, 0.0, 0.075]),
+                position=position - np.array(
+                    [0.0, 0.0, (PAYLOAD_DIMENSIONS[2] + 0.025) / 2]
+                ),
             )
         self.server.gui.add_markdown("**Stations:** PICK (green) → PLACE (blue)")
         if not include_payload:
@@ -234,21 +242,23 @@ class ViserDemoRuntime:
         self._pick_object = self.server.scene.add_box(
             "/world/payload_at_pick",
             color=(245, 170, 40),
-            dimensions=(0.07, 0.07, 0.12),
+            dimensions=PAYLOAD_DIMENSIONS,
             position=pick_position,
+            wxyz=SO3.from_matrix(self.fk_transform(PICK_Q)[:3, :3]).wxyz,
         )
         self._carried_object = self.server.scene.add_box(
             self._ee_node + "/payload",
             color=(245, 170, 40),
-            dimensions=(0.07, 0.07, 0.12),
-            position=(0.0, 0.0, 0.1),
+            dimensions=PAYLOAD_DIMENSIONS,
+            position=PAYLOAD_OFFSET,
             visible=False,
         )
         self._placed_object = self.server.scene.add_box(
             "/world/payload_at_place",
             color=(245, 170, 40),
-            dimensions=(0.07, 0.07, 0.12),
+            dimensions=PAYLOAD_DIMENSIONS,
             position=place_position,
+            wxyz=SO3.from_matrix(self.fk_transform(PLACE_Q)[:3, :3]).wxyz,
             visible=False,
         )
         self._payload_status.content = "**Payload:** at pick"
@@ -259,10 +269,14 @@ class ViserDemoRuntime:
         local_offset: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         if local_offset is None:
-            local_offset = np.array([0.0, 0.0, 0.1])
-        self._fk_urdf.update_cfg(joints)
-        transform = self._fk_urdf.get_transform("ee_link", "base_link")
+            local_offset = PAYLOAD_OFFSET
+        transform = self.fk_transform(joints)
         return transform[:3, :3] @ local_offset + transform[:3, 3]
+
+    def fk_transform(self, joints: np.ndarray) -> np.ndarray:
+        """Return the tool frame used by both the renderer and payload markers."""
+        self._fk_urdf.update_cfg(joints)
+        return self._fk_urdf.get_transform("ee_link", "base_link")
 
     def attach_payload(self) -> None:
         if self._pick_object is None or self._carried_object is None:
@@ -271,8 +285,8 @@ class ViserDemoRuntime:
         if np.linalg.norm(current - PICK_Q) > 0.05:
             raise RuntimeError("Robot must be at the pick pose before attaching payload")
         gripper_position = self.robot.query_submodule_state("gripper").positions[0]
-        if gripper_position < 0.65:
-            raise RuntimeError("Gripper must be closed before attaching payload")
+        if abs(gripper_position - PAYLOAD_GRASP_POSITION) > 0.02:
+            raise RuntimeError("Gripper must be at the payload grasp position")
         self._pick_object.visible = False
         self._carried_object.visible = True
         self._payload_attached = True

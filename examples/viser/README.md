@@ -37,7 +37,10 @@ python -m examples.viser 02
 
 The repository README features a real runtime recording of demo 02. Green marks
 PICK and blue marks PLACE; the yellow payload follows the gripper only after
-closure completes. The panel shows the four phases and peripheral health.
+the fingers reach the object's grasp width. The tool approaches from above, lifts
+before transferring, and retreats after release. The panel shows six phases and
+peripheral health.
+The recording plays at 2.5× speed.
 
 For a quick headless smoke run:
 

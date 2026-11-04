@@ -44,7 +44,10 @@ status for device failures.
 
 ## Run a demo
 
-![Synchronized pick and place in Viser](assets/02-pick-and-place.webp)
+![UR5 lifts the payload before transferring it to PLACE](assets/02-pick-and-place.webp)
+
+The gripper closes to the object's width. The arm lifts before transferring the
+payload and retreats above the station after release.
 
 Run `python -m examples.simulated_pick_and_place` for a complete cycle. It prints
 the joint position observed by each gripper call. For the interactive UR5/Robotiq view:
