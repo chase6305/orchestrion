@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Correct the Viser pick-and-place payload fit, grasp width and approach/lift
+  paths; replace the README recording with the corrected runtime sequence.
 - Reduce scheduler and snapshot overhead with linear motion-wait scans, cached
   cancellation history, targeted JSON copies and smaller pending-status allocations.
   Reuse normalized claims and batch durable event-history trimming.
