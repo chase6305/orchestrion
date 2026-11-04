@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Batch concurrent durable dispatch intents and graph-stop results atomically;
+  interrupt remote queries on cancellation and reject inconsistent recovery leases.
+- Add optional SQLite workflow journals with committed dispatch intent, durable
+  keyed results/checkpoints, conservative hard-exit recovery, exclusive ownership,
+  reconciliation evidence and explicit retention. Storage faults close admission.
+- Add `TicketAction` and typed asynchronous operation backends; distinguish command
+  acceptance, final completion and cancellation confirmation without actuator retries.
+- Compose fixed DAGs into resource-scoped capabilities with `workflow_action`,
+  hierarchical operation IDs, inner concurrency and versioned execution identity.
+- Add action versions, independent stop-confirmation deadlines, draining-worker
+  accounting, late ticket checkpoints and opt-in JSON byte limits. Escape operation
+  ID components and expose `WorkflowRun.operation_id()` for safe reconciliation.
+- Demonstrate durable resource-scoped execution against the loopback HTTP device,
+  including restart replay without duplicate commands and lost-response recovery.
+- Avoid quadratic choice membership checks during schema construction while
+  preserving candidate validation, nested constraints, and defensive copies.
+  Add a reproducible scalar/composite enumeration benchmark.
 - Validate known input fields and composite choices even when a workflow node
   contains output references; reject invalid plans before any device action and
   recheck resolved values before dispatch. Add binding-independent template validation.

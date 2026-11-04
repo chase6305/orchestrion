@@ -104,7 +104,7 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
         # calls (or a duplicate ID) can overwrite a queued request's sequence.
         with self._submission_lock:
             with self._lock:
-                if self._request_id_is_reserved_locked(request_id):
+                if request_id in self._request_history:
                     return False
             with self._order_condition:
                 self._request_sequences[request_id] = self._next_assigned_sequence

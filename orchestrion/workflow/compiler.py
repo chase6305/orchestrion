@@ -4,7 +4,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from json import dumps
-from typing import Any, Dict, Mapping, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from orchestrion.schema import CommandValidationError
 
@@ -17,6 +17,7 @@ class CompiledNode:
     node: Node
     dependencies: Tuple[str, ...]
     claims: Tuple[ResourceClaim, ...]
+    action_version: Optional[str] = None
 
 
 def _is_output_reference(value: Any) -> bool:
@@ -62,6 +63,7 @@ def compile_workflow(
     actions: Mapping[str, Action],
     resources: Mapping[str, Resource],
     max_nodes: int,
+    max_input_bytes: Optional[int] = None,
 ) -> Tuple[CompiledNode, ...]:
     if not isinstance(workflow, Workflow):
         raise TypeError("expected a Workflow")
@@ -71,14 +73,18 @@ def compile_workflow(
     for original in workflow.nodes:
         # Re-snapshot even frozen definitions: nested dictionaries are mutable.
         node = replace(original)
+        if max_input_bytes is not None:
+            _snapshot(node.inputs, references=True, max_bytes=max_input_bytes)
         if node.node_id in nodes:
             raise ValueError("duplicate node ID: " + node.node_id)
         if node.action not in actions:
             raise ValueError("unknown action: " + node.action)
         references = tuple(_output_references(node.inputs))
-        dependencies = tuple(dict.fromkeys(
-            (*node.after, *(reference.node_id for reference in references))
-        ))
+        dependencies = tuple(
+            dict.fromkeys(
+                (*node.after, *(reference.node_id for reference in references))
+            )
+        )
         claims = merge_claims(actions[node.action].claims, node.claims)
         check_claims(claims, resources)
         schema = actions[node.action].input_schema
@@ -87,7 +93,9 @@ def compile_workflow(
                 schema.validate_template(node.inputs, is_deferred=_is_output_reference)
             else:
                 schema.validate(dict(node.inputs))
-        nodes[node.node_id] = CompiledNode(node, dependencies, claims)
+        nodes[node.node_id] = CompiledNode(
+            node, dependencies, claims, actions[node.action].version
+        )
 
     successors = {node_id: [] for node_id in nodes}
     indegree = {}
@@ -139,7 +147,7 @@ def resolve_inputs(value: Any, outputs: Mapping[str, Any]) -> Any:
                 # upstream node and the first path component that failed.
                 raise type(exc)(
                     "cannot resolve output from node {!r} at path {!r}: {}".format(
-                        value.node_id, value.path[:index + 1], exc
+                        value.node_id, value.path[: index + 1], exc
                     )
                 ) from exc
         return _snapshot(result)
@@ -186,11 +194,13 @@ def submission_fingerprint(
             [
                 item.node.node_id,
                 item.node.action,
+                item.action_version,
                 encode(item.node.inputs),
                 sorted(item.dependencies),
                 [(claim.resource, claim.units) for claim in item.claims],
                 item.node.priority,
                 item.node.timeout,
+                item.node.stop_timeout,
             ]
             for item in compiled
         ],

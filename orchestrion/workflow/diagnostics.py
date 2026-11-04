@@ -10,10 +10,13 @@ if TYPE_CHECKING:
 
 def _queue_head(engine: "WorkflowEngine", resource: str):
     # Reading diagnostics must not compact queues or alter scheduling order.
+    waiters = engine._resource_waiters[resource]
+    if waiters and engine._is_ready(waiters[0]):
+        return waiters[0]
     return min(
         (
             entry
-            for entry in engine._resource_waiters[resource]
+            for entry in waiters
             if engine._is_ready(entry)
         ),
         default=None,
@@ -37,7 +40,7 @@ def _owners(engine: "WorkflowEngine") -> Dict[str, list]:
 def explain_node(run: "WorkflowRun", node_id: str) -> Dict[str, Any]:
     engine = run._engine
     result = run._results[node_id]
-    operation_id = run.run_id + "/" + node_id
+    operation_id = run.operation_id(node_id)
     blockers = []
     if result.status == NodeStatus.PENDING:
         blockers.append(
@@ -83,7 +86,7 @@ def explain_node(run: "WorkflowRun", node_id: str) -> Dict[str, Any]:
                     {
                         "kind": "resource_queue",
                         "resource": claim.resource,
-                        "ahead": head[2].run_id + "/" + head[3].node.node_id,
+                        "ahead": head[2].operation_id(head[3].node.node_id),
                     }
                 )
         if not blockers:
@@ -122,7 +125,7 @@ def scheduler_snapshot(engine: "WorkflowEngine") -> Dict[str, Any]:
         )
         head = _queue_head(engine, name)
         resource["next_operation"] = (
-            None if head is None else head[2].run_id + "/" + head[3].node.node_id
+            None if head is None else head[2].operation_id(head[3].node.node_id)
         )
     counts = dict.fromkeys((status.value for status in NodeStatus), 0)
     for run in engine._runs.values():
@@ -135,9 +138,21 @@ def scheduler_snapshot(engine: "WorkflowEngine") -> Dict[str, Any]:
             "active_runs": len(engine._runs),
             "max_active_runs": engine._max_active_runs,
             "running_actions": engine._running_count,
+            "draining_adapters": len(engine._draining),
+            "stop_timeout": engine._stop_timeout,
             "max_concurrency": engine._max_concurrency,
             "max_pending_feedback_per_action": engine._max_pending_feedback,
             "scheduler_error": engine._driver_error,
+            "journal_error": engine._journal_error,
+            "durable": engine._journal is not None,
+            "journal_mode": None
+            if engine._journal is None
+            else engine._journal.journal_mode,
+            "payload_limits": {
+                "input_per_node": engine._max_input_bytes,
+                "output_per_node": engine._max_output_bytes,
+                "feedback_per_report": engine._max_feedback_bytes,
+            },
             "nodes": counts,
             "idempotency_keys": {
                 "retained": len(engine._submissions),

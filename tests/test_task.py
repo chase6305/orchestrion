@@ -3,6 +3,7 @@
 import concurrent.futures
 import threading
 import time
+import weakref
 
 import pytest
 
@@ -26,6 +27,31 @@ class InPlaceTaskStub(InPlaceFunctionCallTask):
 class ThreadedPoolTaskStub(ThreadedPoolFunctionCallTask):
     def _call_fn(self, request_id, content):
         return {"result": content["value"] + 1}
+
+
+def test_polling_releases_a_rejected_sample_before_the_next_poll():
+    observed = threading.Event()
+    reclaimed = threading.Event()
+    samples = []
+
+    class InvalidSample(list):
+        pass
+
+    def poll():
+        sample = InvalidSample(["x" * 100000])
+        samples.append(weakref.ref(sample, lambda _: reclaimed.set()))
+        return sample
+
+    task = PollingTask(poll, interval=10.0)
+    task.set_completion_callback(observed.set)
+    task.initialize()
+    try:
+        assert observed.wait(1.0)
+        assert "dictionary or None" in task.peek_status()["last_error"]
+        assert reclaimed.wait(1.0)
+        assert len(samples) == 1 and samples[0]() is None
+    finally:
+        task.stop()
 
 
 @pytest.mark.parametrize("task_type", [InPlaceTaskStub, ThreadedPoolTaskStub])

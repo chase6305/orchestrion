@@ -126,20 +126,25 @@ class FieldSpec:
         self.maximum = (
             maximum if maximum is None or isinstance(maximum, int) else float(maximum)
         )
-        self.choices = copy.deepcopy(choice_list)
+        validated_choices = copy.deepcopy(choice_list)
+        self.choices = None
         self.description = description
         self.items = copy.deepcopy(items)
         self.object_schema = copy.deepcopy(object_schema)
         self.min_items = min_items
         self.max_items = max_items
-        if self.choices is not None:
-            for choice in self.choices:
+        if validated_choices is not None:
+            # Every candidate is already a member of this enumeration. Check
+            # its other constraints without a redundant quadratic membership
+            # scan; nested fields still enforce their own choices.
+            for choice in validated_choices:
                 try:
                     self.validate("choice", choice)
                 except CommandValidationError as exc:
                     raise ValueError(
                         "choices must satisfy the field constraints"
                     ) from exc
+        self.choices = validated_choices
 
     def validate(
         self, name: str, value: Any, *,

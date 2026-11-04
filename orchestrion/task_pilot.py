@@ -8,11 +8,11 @@ import math
 import queue
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, replace
 from functools import partial
 from numbers import Real
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Container, Dict, List, Optional, Set, Tuple
 
 from orchestrion.health import DeviceHealth
 from orchestrion.move_sync_option import MoveSyncOption
@@ -22,6 +22,20 @@ from orchestrion.tasks.reduced_robot_task_interface import ReducedRobotTaskInter
 from orchestrion.utils.errors import exception_message
 from orchestrion.utils.logger import logger
 from orchestrion.utils.types import PeekResponseResult, PeekResponseResultType
+
+# (-priority, request_id, request): higher priorities first, FIFO for ties.
+_QueueEntry = Tuple[int, int, "TaskPilot.BackgroundRequest"]
+
+
+def _validate_wait_timeout(timeout: Optional[float]) -> None:
+    """Apply the same timeout contract to request and health waits."""
+    if timeout is not None and (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, Real)
+        or not math.isfinite(timeout)
+        or timeout < 0
+    ):
+        raise ValueError("timeout must be non-negative and finite, or None")
 
 
 class TaskPilot:
@@ -70,12 +84,9 @@ class TaskPilot:
         self._executor = executor_owned
         self._executor_shutdown = False
         self._poll_interval = poll_interval
-        self._timeline_capacity = timeline_capacity
         self._lifecycle_lock = threading.RLock()
 
-        self._task_queue: queue.PriorityQueue[
-            Tuple[int, int, TaskPilot.BackgroundRequest]
-        ] = queue.PriorityQueue()
+        self._task_queue: queue.PriorityQueue[_QueueEntry] = queue.PriorityQueue()
         self._next_request_id = 0
         self._state_condition = threading.Condition()
         self._requests: Dict[int, RequestResult] = {}
@@ -203,7 +214,9 @@ class TaskPilot:
             for service_name, task in self._lifecycle_tasks:
                 set_completion_callback = getattr(task, "set_completion_callback", None)
                 if callable(set_completion_callback):
-                    set_completion_callback(partial(self._on_task_completion, service_name))
+                    set_completion_callback(
+                        partial(self._on_task_completion, service_name)
+                    )
                 initialized_tasks.append(task)
                 task.initialize(executor=self._executor)
         except Exception:
@@ -262,12 +275,17 @@ class TaskPilot:
             ):
                 thread.join(timeout=timeout)
                 if thread.is_alive():
-                    raise TimeoutError("TaskPilot background thread did not stop in time")
+                    raise TimeoutError(
+                        "TaskPilot background thread did not stop in time"
+                    )
             logger.warning("TaskPilot is not running or already stopped.")
             return
         self._wake_event.set()
         thread_timed_out = False
-        if self._bg_thread is not None and self._bg_thread is not threading.current_thread():
+        if (
+            self._bg_thread is not None
+            and self._bg_thread is not threading.current_thread()
+        ):
             self._bg_thread.join(timeout=timeout)
             thread_timed_out = self._bg_thread.is_alive()
 
@@ -333,9 +351,11 @@ class TaskPilot:
         if srv_name not in self._task_map:
             raise KeyError("Unknown service: {}".format(srv_name))
         if not self._initialized:
-            raise RuntimeError("TaskPilot must be initialized before accepting requests")
+            raise RuntimeError(
+                "TaskPilot must be initialized before accepting requests"
+            )
         with self._state_condition:
-            epoch = self._lifecycle_epoch
+            submission_epoch = self._lifecycle_epoch
         if isinstance(priority, bool) or not isinstance(priority, int):
             raise TypeError("priority must be an integer")
         if idempotency_key is not None and not isinstance(idempotency_key, str):
@@ -382,7 +402,7 @@ class TaskPilot:
 
         request_content = copy.deepcopy(content)
         with self._state_condition:
-            if not self._initialized or epoch != self._lifecycle_epoch:
+            if not self._initialized or submission_epoch != self._lifecycle_epoch:
                 raise RuntimeError(
                     "TaskPilot stopped while the request was being prepared"
                 )
@@ -545,7 +565,9 @@ class TaskPilot:
                     "available": False,
                     "health": DeviceHealth.OFFLINE.value,
                     "observed_at": time.time(),
-                    "error": "Task status is not JSON-compatible: {}".format(exception_message(exc)),
+                    "error": "Task status is not JSON-compatible: {}".format(
+                        exception_message(exc)
+                    ),
                 }
         now = time.time()
         if stale_after is not None:
@@ -604,13 +626,7 @@ class TaskPilot:
             raise TypeError("after_revision must be an integer")
         if after_revision < 0:
             raise ValueError("after_revision must be non-negative")
-        if timeout is not None and (
-            isinstance(timeout, bool)
-            or not isinstance(timeout, Real)
-            or not math.isfinite(timeout)
-            or timeout < 0
-        ):
-            raise ValueError("timeout must be non-negative and finite, or None")
+        _validate_wait_timeout(timeout)
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._state_condition:
             if after_revision > self._health_revision:
@@ -630,16 +646,12 @@ class TaskPilot:
                 "pilot; submit follow-up work asynchronously"
             )
 
-    def wait_request(self, request_id: int, timeout: Optional[float] = None) -> RequestResult:
+    def wait_request(
+        self, request_id: int, timeout: Optional[float] = None
+    ) -> RequestResult:
         """Wait for a result; scheduler callbacks may only read completed results."""
         self._validate_request_id(request_id)
-        if timeout is not None and (
-            isinstance(timeout, bool)
-            or not isinstance(timeout, Real)
-            or not math.isfinite(timeout)
-            or timeout < 0
-        ):
-            raise ValueError("timeout must be non-negative and finite, or None")
+        _validate_wait_timeout(timeout)
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._state_condition:
             if request_id not in self._requests:
@@ -650,7 +662,9 @@ class TaskPilot:
         try:
             with self._state_condition:
                 while not self._requests[request_id].status.terminal:
-                    remaining = None if deadline is None else deadline - time.monotonic()
+                    remaining = (
+                        None if deadline is None else deadline - time.monotonic()
+                    )
                     if remaining is not None and remaining <= 0:
                         raise TimeoutError(
                             "Request {} did not finish in time".format(request_id)
@@ -668,13 +682,7 @@ class TaskPilot:
         self, request_ids: List[int], timeout: Optional[float] = None
     ) -> List[RequestResult]:
         """Wait in order with a shared deadline, retaining every group's result."""
-        if timeout is not None and (
-            isinstance(timeout, bool)
-            or not isinstance(timeout, Real)
-            or not math.isfinite(timeout)
-            or timeout < 0
-        ):
-            raise ValueError("timeout must be non-negative and finite, or None")
+        _validate_wait_timeout(timeout)
         ids = list(request_ids)
         if any(
             isinstance(request_id, bool) or not isinstance(request_id, int)
@@ -930,7 +938,8 @@ class TaskPilot:
             )
             if not accepted:
                 self._transition(
-                    request.request_id, RequestStatus.FAILED, error="Task rejected request"
+                    request.request_id, RequestStatus.FAILED,
+                    error="Task rejected request",
                 )
         except Exception as exc:
             logger.exception(
@@ -938,7 +947,9 @@ class TaskPilot:
                 request.service_name,
                 request.request_id,
             )
-            self._transition(request.request_id, RequestStatus.FAILED, error=exception_message(exc))
+            self._transition(
+                request.request_id, RequestStatus.FAILED, error=exception_message(exc)
+            )
 
     def _refresh_running(self, service_names: Optional[Set[str]] = None) -> None:
         with self._state_condition:
@@ -974,7 +985,9 @@ class TaskPilot:
                     content = copy.deepcopy(response.content)
                 except Exception as exc:
                     raise ValueError(
-                        "Task response could not be copied: {}".format(exception_message(exc))
+                        "Task response could not be copied: {}".format(
+                            exception_message(exc)
+                        )
                     ) from exc
                 self._transition(
                     request.request_id,
@@ -1005,7 +1018,9 @@ class TaskPilot:
             # Legacy adapters may only implement fire-and-forget invocation.
             return
         except Exception as exc:
-            self._transition(request.request_id, RequestStatus.FAILED, error=exception_message(exc))
+            self._transition(
+                request.request_id, RequestStatus.FAILED, error=exception_message(exc)
+            )
 
     def _cancel_nonterminal(self, reason: str) -> None:
         with self._state_condition:
@@ -1029,137 +1044,160 @@ class TaskPilot:
                         logger.exception("Failed to cancel request %s", request_id)
             self._transition(request_id, RequestStatus.CANCELLED, error=reason)
 
+    def _admit_queued_requests(
+        self,
+        waiting_for_motion: List[_QueueEntry],
+        ready_to_dispatch: List[_QueueEntry],
+    ) -> bool:
+        """Admit a bounded batch and report whether it adds motion dependencies."""
+        added_motion_dependency = False
+        # A fixed batch lets response collection and shutdown keep up with producers.
+        for _ in range(self._task_queue.qsize()):
+            if self._stop_event.is_set():
+                break
+            try:
+                queue_entry = self._task_queue.get_nowait()
+            except queue.Empty:
+                break
+            request = queue_entry[2]
+            with self._state_condition:
+                result = self._requests.get(request.request_id)
+            if result is None or result.status.terminal:
+                continue
+            if request.associated_move_id < 0:
+                heapq.heappush(ready_to_dispatch, queue_entry)
+            else:
+                self._transition(request.request_id, RequestStatus.WAITING_FOR_MOVE)
+                heapq.heappush(waiting_for_motion, queue_entry)
+                added_motion_dependency = True
+        return added_motion_dependency
+
+    def _promote_completed_moves(
+        self,
+        waiting_for_motion: List[_QueueEntry],
+        ready_to_dispatch: List[_QueueEntry],
+    ) -> List[_QueueEntry]:
+        """Resolve one set of motion snapshots and return the remaining wait heap."""
+        dependency_counts = Counter(
+            entry[2].associated_submodule for entry in waiting_for_motion
+        )
+        main_state = None
+        if None in dependency_counts:
+            try:
+                main_state = self._robot_task.query_state()
+            except Exception:
+                # A transient main-state failure leaves its requests waiting.
+                logger.exception("Failed to query robot state")
+
+        # Index shared sequences only within this pass. Sets and short batches
+        # keep their existing membership lookup without an extra allocation.
+        progress_by_submodule: Dict[Optional[str], Tuple[int, Container[int]]] = {}
+        still_waiting = []
+        while waiting_for_motion:
+            queue_entry = heapq.heappop(waiting_for_motion)
+            request = queue_entry[2]
+            with self._state_condition:
+                result = self._requests.get(request.request_id)
+            if result is None or result.status.terminal:
+                continue
+            submodule_name = request.associated_submodule
+            try:
+                if submodule_name not in progress_by_submodule:
+                    if submodule_name is None:
+                        if main_state is None:
+                            still_waiting.append(queue_entry)
+                            continue
+                        cancelled_move_ids = getattr(
+                            main_state, "cancelled_move_ids", ()
+                        )
+                        latest_finished_id = main_state.latest_finished_id
+                    else:
+                        submodule_state = self._robot_task.query_submodule_state(
+                            submodule_name
+                        )
+                        cancelled_move_ids = submodule_state.cancelled_move_ids
+                        latest_finished_id = submodule_state.latest_finished_id
+                    cancellation_lookup = (
+                        set(cancelled_move_ids)
+                        if dependency_counts[submodule_name] >= 4
+                        and isinstance(cancelled_move_ids, (list, tuple))
+                        else cancelled_move_ids
+                    )
+                    progress_by_submodule[submodule_name] = (
+                        latest_finished_id, cancellation_lookup
+                    )
+                latest_finished_id, cancelled_moves = progress_by_submodule[
+                    submodule_name
+                ]
+                if request.associated_move_id in cancelled_moves:
+                    self._transition(
+                        request.request_id,
+                        RequestStatus.CANCELLED,
+                        error=(
+                            "Associated move was cancelled" if submodule_name is None
+                            else "Associated submodule move was cancelled"
+                        ),
+                    )
+                    continue
+                move_finished = request.associated_move_id <= latest_finished_id
+            except Exception as exc:
+                self._transition(
+                    request.request_id, RequestStatus.FAILED,
+                    error=exception_message(exc),
+                )
+                continue
+            if move_finished:
+                heapq.heappush(ready_to_dispatch, queue_entry)
+            else:
+                still_waiting.append(queue_entry)
+        # Entries were popped in priority order; their subset is already a heap.
+        return still_waiting
+
+    def _dispatch_next_request(self, ready_to_dispatch: List[_QueueEntry]) -> None:
+        request = heapq.heappop(ready_to_dispatch)[2]
+        self._invoke_request(request)
+        # Collect inline results before the next call can evict a bounded response.
+        self._refresh_request(request)
+
     def _bg_thread_loop(self) -> None:
-        waiting: List[Tuple[int, int, TaskPilot.BackgroundRequest]] = []
-        ready: List[Tuple[int, int, TaskPilot.BackgroundRequest]] = []
+        waiting_for_motion: List[_QueueEntry] = []
+        ready_to_dispatch: List[_QueueEntry] = []
         next_poll_at = time.monotonic()
-        observed_move_revision = -1
+        observed_motion_revision = -1
         while not self._stop_event.is_set():
             self._wake_event.clear()
-            now = time.monotonic()
-            poll_due = now >= next_poll_at
-            new_waiting = False
-            # Limit admission to the current batch so continuous producers cannot
-            # starve response collection, motion checks, or shutdown.
-            for _ in range(self._task_queue.qsize()):
-                if self._stop_event.is_set():
-                    break
-                try:
-                    entry = self._task_queue.get_nowait()
-                except queue.Empty:
-                    break
-                request = entry[2]
-                with self._state_condition:
-                    result = self._requests.get(request.request_id)
-                if result is None or result.status.terminal:
-                    continue
-                if request.associated_move_id < 0:
-                    heapq.heappush(ready, entry)
-                else:
-                    self._transition(request.request_id, RequestStatus.WAITING_FOR_MOVE)
-                    heapq.heappush(waiting, entry)
-                    new_waiting = True
-
+            poll_due = time.monotonic() >= next_poll_at
+            added_motion_dependency = self._admit_queued_requests(
+                waiting_for_motion, ready_to_dispatch
+            )
             with self._state_condition:
-                move_revision = self._move_state_revision
-                dirty_services = self._dirty_services
+                motion_revision = self._move_state_revision
+                services_with_updates = self._dirty_services
                 self._dirty_services = set()
 
-            if waiting and (
-                new_waiting or poll_due or move_revision != observed_move_revision
+            if waiting_for_motion and (
+                added_motion_dependency
+                or poll_due
+                or motion_revision != observed_motion_revision
             ):
-                observed_move_revision = move_revision
-                needs_main_state = any(
-                    entry[2].associated_submodule is None for entry in waiting
+                observed_motion_revision = motion_revision
+                waiting_for_motion = self._promote_completed_moves(
+                    waiting_for_motion, ready_to_dispatch
                 )
-                robot_state = None
-                if needs_main_state:
-                    try:
-                        robot_state = self._robot_task.query_state()
-                    except Exception:
-                        logger.exception("Failed to query robot state")
-                submodule_states = {}
-                remaining = []
-                while waiting:
-                    priority_entry = heapq.heappop(waiting)
-                    request = priority_entry[2]
-                    with self._state_condition:
-                        result = self._requests.get(request.request_id)
-                    if result is None or result.status.terminal:
-                        continue
-                    move_finished = False
-                    if request.associated_submodule is not None:
-                        try:
-                            if request.associated_submodule not in submodule_states:
-                                submodule_states[request.associated_submodule] = (
-                                    self._robot_task.query_submodule_state(
-                                        request.associated_submodule
-                                    )
-                                )
-                            submodule_state = submodule_states[
-                                request.associated_submodule
-                            ]
-                            cancelled_move_ids = submodule_state.cancelled_move_ids
-                            latest_finished_id = submodule_state.latest_finished_id
-                            move_cancelled = request.associated_move_id in cancelled_move_ids
-                            move_finished = request.associated_move_id <= latest_finished_id
-                        except Exception as exc:
-                            self._transition(
-                                request.request_id,
-                                RequestStatus.FAILED,
-                                error=exception_message(exc),
-                            )
-                            continue
-                        if move_cancelled:
-                            self._transition(
-                                request.request_id,
-                                RequestStatus.CANCELLED,
-                                error="Associated submodule move was cancelled",
-                            )
-                            continue
-                    elif robot_state is not None:
-                        try:
-                            cancelled_move_ids = getattr(
-                                robot_state, "cancelled_move_ids", ()
-                            )
-                            if request.associated_move_id in cancelled_move_ids:
-                                self._transition(
-                                    request.request_id,
-                                    RequestStatus.CANCELLED,
-                                    error="Associated move was cancelled",
-                                )
-                                continue
-                            move_finished = (
-                                request.associated_move_id
-                                <= robot_state.latest_finished_id
-                            )
-                        except Exception as exc:
-                            self._transition(
-                                request.request_id, RequestStatus.FAILED, error=exception_message(exc)
-                            )
-                            continue
-                    if move_finished:
-                        heapq.heappush(ready, priority_entry)
-                    else:
-                        heapq.heappush(remaining, priority_entry)
-                waiting = remaining
 
             if poll_due:
                 self._refresh_running()
                 next_poll_at = time.monotonic() + self._poll_interval
-            elif dirty_services:
-                self._refresh_running(dirty_services)
+            elif services_with_updates:
+                self._refresh_running(services_with_updates)
 
             # Dispatch one request before checking new priorities and collecting
-            # results again. Inline tasks with bounded storage must be collected
-            # before another call can evict their response.
-            if ready:
-                request = heapq.heappop(ready)[2]
-                self._invoke_request(request)
-                self._refresh_request(request)
-            if not ready and self._task_queue.empty():
+            # results again. Helper frames release payloads and snapshots on return.
+            if ready_to_dispatch:
+                self._dispatch_next_request(ready_to_dispatch)
+            if not ready_to_dispatch and self._task_queue.empty():
                 with self._state_condition:
-                    needs_polling = bool(waiting or self._running_requests)
+                    needs_polling = bool(waiting_for_motion or self._running_requests)
                 timeout = (
                     max(0.0, next_poll_at - time.monotonic()) if needs_polling else None
                 )

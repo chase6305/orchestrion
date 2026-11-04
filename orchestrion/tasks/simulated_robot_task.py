@@ -4,6 +4,7 @@ import copy
 import queue
 import threading
 import time
+from bisect import bisect_left
 from typing import Callable, List, Optional
 
 from orchestrion.utils.logger import logger
@@ -26,7 +27,6 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
         self._queue: queue.SimpleQueue[ReducedRobotTaskInterface.MovementRequest] = (
             queue.SimpleQueue()
         )
-        self._wake_event = threading.Event()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._state_change_callback: Optional[Callable[[], None]] = None
@@ -48,7 +48,6 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
                 raise RuntimeError("Simulated robot thread is still stopping")
             return
         self._stop_event.clear()
-        self._wake_event.clear()
         self._thread = threading.Thread(
             target=self._run, name="orchestrion-simulated-robot"
         )
@@ -58,7 +57,6 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
             self._thread = None
             self._stop_event.set()
             raise
-        self._wake_event.set()
 
     def stop(self, timeout: float = 5.0) -> None:
         if threading.current_thread() is self._thread:
@@ -76,14 +74,14 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
             was_stopped = self._stop_event.is_set()
             self._stop_event.set()
             self._motion_epoch += 1
-            self._state.cancelled_move_ids = tuple(sorted(
-                set(self._state.cancelled_move_ids).union(range(
-                    self._state.latest_finished_id + 1,
-                    self._state.latest_sent_id + 1,
-                ))
-            ))
+            unfinished_move_ids = range(
+                self._state.latest_finished_id + 1,
+                self._state.latest_sent_id + 1,
+            )
+            self._state.cancelled_move_ids = tuple(
+                sorted(set(self._state.cancelled_move_ids).union(unfinished_move_ids))
+            )
             self._state_condition.notify_all()
-        self._wake_event.set()
         if not was_stopped:
             self._notify_state_change()
         if self._thread is not None and self._thread is not threading.current_thread():
@@ -107,38 +105,44 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
         if not isinstance(motion_target, (list, tuple)) or not motion_target:
             return -1
         with self._lock:
-            n_dof = len(self._state.jps)
-            epoch = self._motion_epoch
+            expected_joint_count = len(self._state.jps)
+            submission_epoch = self._motion_epoch
         motion_target = copy.deepcopy(motion_target)
         if not self._is_finite_trajectory(motion_target):
             return -1
-        if any(len(point) != n_dof for point in motion_target):
+        if any(len(point) != expected_joint_count for point in motion_target):
             return -1
-        endpoints = (
-            [len(motion_target)] if endpoint_index is None else copy.deepcopy(endpoint_index)
+        segment_endpoints = (
+            [len(motion_target)]
+            if endpoint_index is None
+            else copy.deepcopy(endpoint_index)
         )
-        if not self._check_assigned_endpoint_index(motion_target, endpoints):
+        if not self._check_assigned_endpoint_index(motion_target, segment_endpoints):
             return -1
 
         with self._lock:
-            if self._stop_event.is_set() or epoch != self._motion_epoch:
+            if self._stop_event.is_set() or submission_epoch != self._motion_epoch:
                 return -1
-            move_id_begin = self._state.latest_sent_id + 1
+            first_move_id = self._state.latest_sent_id + 1
             request = self.MovementRequest(
                 motion_target=motion_target,
                 interval=interval,
-                motion_id_begin=move_id_begin,
-                endpoint_index=endpoints,
+                motion_id_begin=first_move_id,
+                endpoint_index=segment_endpoints,
             )
             self._queue.put(request)
-            self._state.latest_sent_id += len(endpoints)
+            self._state.latest_sent_id += len(segment_endpoints)
+            self._state_condition.notify_all()
         self._notify_state_change()
-        self._wake_event.set()
-        return move_id_begin
+        return first_move_id
 
     def query_state(self) -> ReducedRobotTaskInterface.ReducedRobotState:
         with self._lock:
-            return copy.deepcopy(self._state)
+            # Integer history is immutable; copy the remaining state graph normally.
+            cancelled_move_ids = self._state.cancelled_move_ids
+            return copy.deepcopy(
+                self._state, memo={id(cancelled_move_ids): cancelled_move_ids}
+            )
 
     def wait_move(self, time_out: float = -1, interval: float = 0.05) -> bool:
         if not self._is_finite_real(time_out):
@@ -146,20 +150,28 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
         if not self._is_finite_real(interval) or interval <= 0:
             raise ValueError("interval must be positive and finite")
         with self._lock:
-            target_id = self._state.latest_sent_id
+            target_move_id = self._state.latest_sent_id
         deadline = None if time_out < 0 else time.monotonic() + time_out
         with self._state_condition:
             while True:
-                if target_id in self._state.cancelled_move_ids:
+                # stop() publishes sorted IDs; avoid rescanning on each wake.
+                cancelled_move_ids = self._state.cancelled_move_ids
+                cancelled_move_index = bisect_left(cancelled_move_ids, target_move_id)
+                if (
+                    cancelled_move_index < len(cancelled_move_ids)
+                    and cancelled_move_ids[cancelled_move_index] == target_move_id
+                ):
                     return False
-                if self._state.latest_finished_id >= target_id:
+                if self._state.latest_finished_id >= target_move_id:
                     return True
                 if self._stop_event.is_set():
                     return False
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     return False
-                wait_interval = interval if remaining is None else min(interval, remaining)
+                wait_interval = (
+                    interval if remaining is None else min(interval, remaining)
+                )
                 self._state_condition.wait(wait_interval)
 
     def _notify_state_change(self) -> None:
@@ -173,28 +185,30 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
-            self._wake_event.wait()
-            self._wake_event.clear()
-            while not self._stop_event.is_set():
-                try:
-                    request = self._queue.get_nowait()
-                except queue.Empty:
-                    break
+            self._run_next_trajectory()
 
-                endpoint_position = 0
-                finished_id = request.motion_id_begin
-                for index, joints in enumerate(request.motion_target, start=1):
-                    if self._stop_event.wait(request.interval):
-                        return
-                    if index >= request.endpoint_index[endpoint_position]:
-                        latest_finished_id = finished_id
-                        finished_id += 1
-                        endpoint_position += 1
-                    else:
-                        with self._lock:
-                            latest_finished_id = self._state.latest_finished_id
-                    with self._state_condition:
-                        self._state.jps = list(joints)
-                        self._state.latest_finished_id = latest_finished_id
-                        self._state_condition.notify_all()
-                    self._notify_state_change()
+    def _run_next_trajectory(self) -> None:
+        """Release the request and its point aliases before the next idle wait."""
+        with self._state_condition:
+            # Submission and the empty check share this lock, so a producer
+            # cannot notify between checking the queue and going to sleep.
+            while self._queue.empty() and not self._stop_event.is_set():
+                self._state_condition.wait()
+            if self._stop_event.is_set():
+                return
+            request = self._queue.get_nowait()
+
+        next_endpoint_index = 0
+        next_finished_move_id = request.motion_id_begin
+        for point_number, joint_positions in enumerate(request.motion_target, start=1):
+            if self._stop_event.wait(request.interval):
+                return
+            with self._state_condition:
+                self._state.jps = list(joint_positions)
+                # Endpoints count points from one, matching point_number.
+                if point_number == request.endpoint_index[next_endpoint_index]:
+                    self._state.latest_finished_id = next_finished_move_id
+                    next_finished_move_id += 1
+                    next_endpoint_index += 1
+                self._state_condition.notify_all()
+            self._notify_state_change()

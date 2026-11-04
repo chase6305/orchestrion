@@ -8,10 +8,8 @@ from typing import List, Optional
 class ReducedRobotTaskInterface(ABC):
 
     @dataclass
-    class ReducedRobotState(object):
-        """
-        Data class representing the robot's joint positions and movement IDs.
-        """
+    class ReducedRobotState:
+        """Joint positions and main-movement completion/cancellation history."""
 
         jps: List[float]  # Joint positions
         latest_finished_id: int = -1  # Last finished movement ID
@@ -19,10 +17,8 @@ class ReducedRobotTaskInterface(ABC):
         cancelled_move_ids: tuple = ()  # Accepted movements discarded on stop
 
     @dataclass
-    class MovementRequest(object):
-        """
-        Data class representing a movement request for the robot.
-        """
+    class MovementRequest:
+        """A joint trajectory split into completion-aware segments."""
 
         motion_target: List[List[float]]  # List of joint positions for the trajectory
         interval: float = 0.01  # Time interval between points
@@ -31,20 +27,12 @@ class ReducedRobotTaskInterface(ABC):
 
     @abstractmethod
     def initialize(self):
-        """
-        Initialize the robot state. Can be extended to read real robot state.
-        Returns:
-            bool: True if initialization succeeded.
-        """
+        """Acquire backend resources and initialize robot state."""
         raise NotImplementedError
 
     @abstractmethod
     def stop(self):
-        """
-        Stop the reduced robot task, clear movement queue, and invoke cancellation callbacks.
-        Returns:
-            bool: True if stopped successfully.
-        """
+        """Stop motion processing and release backend resources."""
         raise NotImplementedError
 
     @abstractmethod
@@ -58,52 +46,30 @@ class ReducedRobotTaskInterface(ABC):
 
     @abstractmethod
     def query_state(self) -> Optional[ReducedRobotState]:
-        """
-        Query the current robot state in a thread-safe manner.
-        Returns:
-            Optional[ReducedRobotState]: A copy of the current state.
-        """
+        """Return a thread-safe state snapshot, or None when unavailable."""
         raise NotImplementedError
 
     def full_task(self):
-        """
-        Return self if a full-featured task is needed.
-        Returns:
-            ReducedRobotTaskInterface: The current instance.
-        """
+        """Return this backend for legacy full-task callers."""
         return self
 
     @staticmethod
     def _check_assigned_endpoint_index(
         motion_target: List[List[float]], endpoint_index: List[int]
     ) -> bool:
-        """
-        Check if the assigned endpoint indices are valid for the given motion target.
-        Args:
-            motion_target (List[List[float]]): List of joint positions.
-            endpoint_index (List[int]): List of endpoint indices.
-        Returns:
-            bool: True if valid, False otherwise.
-        """
+        """Require increasing integer endpoints ending at the trajectory length."""
         if not isinstance(endpoint_index, (list, tuple)) or not endpoint_index:
             return False
 
-        # Check each endpoint index is greater than previous
         prev_endpoint = 0
-        n_endpoints = len(endpoint_index)
-        for i in range(n_endpoints):
-            endpoint_i = endpoint_index[i]
+        for endpoint_i in endpoint_index:
             if isinstance(endpoint_i, bool) or not isinstance(endpoint_i, int):
                 return False
             if endpoint_i <= prev_endpoint:
                 return False
             prev_endpoint = endpoint_i
 
-        # Last endpoint must match the length of motion_target
-        if prev_endpoint != len(motion_target):
-            return False
-
-        return True
+        return prev_endpoint == len(motion_target)
 
     @staticmethod
     def _is_finite_real(value: object) -> bool:

@@ -164,6 +164,48 @@ def test_explain_atomic_queue_head_even_when_requested_resource_is_free():
     asyncio.run(scenario())
 
 
+def test_explain_uses_the_ready_heap_head_without_scanning_the_backlog(monkeypatch):
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def hold(context, inputs):
+            entered.set()
+            await asyncio.wait_for(release.wait(), 2)
+
+        async with WorkflowEngine(
+            [Action("hold", hold, (ResourceClaim("arm"),))], [Resource("arm")]
+        ) as engine:
+            owner = engine.submit(Workflow((Node("owner", "hold"),)))
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                run = engine.submit(Workflow(tuple(
+                    Node("wait-{}".format(i), "hold") for i in range(100)
+                )))
+                before = list(engine._resource_waiters["arm"])
+                calls = 0
+                original = engine._is_ready
+
+                def count_readiness(entry):
+                    nonlocal calls
+                    calls += 1
+                    return original(entry)
+
+                monkeypatch.setattr(engine, "_is_ready", count_readiness)
+                explanation = run.explain("wait-99")
+                assert calls == 1
+                assert explanation["blockers"][-1] == {
+                    "kind": "resource_queue",
+                    "resource": "arm",
+                    "ahead": run.operation_id("wait-0"),
+                }
+                assert engine._resource_waiters["arm"] == before
+            finally:
+                release.set()
+            await asyncio.gather(owner.wait(2), run.wait(2))
+
+    asyncio.run(scenario())
+
+
 def test_explain_cancellation_keeps_stop_confirmation_and_resource_owner_visible():
     async def scenario():
         entered, stopping, release = asyncio.Event(), asyncio.Event(), asyncio.Event()

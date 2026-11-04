@@ -196,6 +196,33 @@ def test_runtime_waits_until_first_client_connects():
     assert "client connected" in runtime._demo_status.content
 
 
+def test_runtime_detects_client_connected_while_registering_callback():
+    class FakeServer:
+        clients = {}
+
+        def get_clients(self):
+            return self.clients
+
+        def on_client_connect(self, callback):
+            # The connect event occurred before the callback became active.
+            self.clients = {0: object()}
+            return callback
+
+    runtime = object.__new__(ViserDemoRuntime)
+    runtime.server = FakeServer()
+    runtime._monitor_stop = threading.Event()
+    runtime._demo_status = type("Status", (), {"content": ""})()
+    waiter = threading.Thread(target=runtime.wait_for_client)
+    waiter.start()
+    try:
+        waiter.join(timeout=0.5)
+        assert not waiter.is_alive()
+        assert "client connected" in runtime._demo_status.content
+    finally:
+        runtime._monitor_stop.set()
+        waiter.join(timeout=0.5)
+
+
 class VisibleStub:
     def __init__(self, visible):
         self.visible = visible

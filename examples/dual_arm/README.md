@@ -6,21 +6,14 @@ submodule and service APIs that a real dual-arm backend would implement.
 
 ```bash
 python -m examples.dual_arm --list
-python -m examples.dual_arm 01
 python -m examples.dual_arm 02
-python -m examples.dual_arm 03
-python -m examples.dual_arm 04
-python -m examples.dual_arm 05
-python -m examples.dual_arm 06
-python -m examples.dual_arm 07
 ```
 
 Install the optional visualization dependencies and add `--viser` to render any
 of the seven workflows with two live UR5 models:
 
 ```bash
-pip install -e ".[viser]"
-python -m examples.dual_arm 01 --viser
+python -m pip install -e ".[viser]"
 python -m examples.dual_arm 02 --viser --port 8081
 python -m examples.dual_arm 05 --viser --no-wait-for-client --duration 3
 ```
@@ -47,18 +40,9 @@ python -m examples.dual_arm 02 --viser --replay-file handoff.json --loop-replay
 The versioned JSON file contains visual state only, so it is portable and safe to
 share. Loading it does not initialize `TaskPilot` or any device/network service.
 
-The browser scene keeps the scheduler's abstract three-axis poses while mapping
-them onto FK-validated six-axis UR5 pose anchors. Input, handoff, and output
-objects are placed from the resulting end-effector transforms instead of manual
-scene coordinates; the two handoff end effectors meet within 2 mm, share the same
-payload axis, and face one another across the grasp. Animated two-finger grippers
-close around the FK-transformed payload center. This visual adapter does not
-change workflow or synchronization semantics. The
-panel reports both arm states, recent orchestration events, gripper state, and
-the current shared-zone owner. Green/orange end-effector blocks show open/closed
-grippers, while the shared zone turns red whenever a cycle reserves it. Visual
-mode also uses presentation-paced trajectories and shows the payload moving from
-the table to the left arm, through the overlap grasp, and finally to the right arm.
+The browser shows both UR5 arms, animated grippers, payload ownership, the shared
+zone and recent events. It maps the simulated joint paths onto predefined UR5
+poses; this is a visualization of the workflow, not a motion planner.
 
 | Demo | Focus |
 | --- | --- |
@@ -70,23 +54,9 @@ the table to the left arm, through the overlap grasp, and finally to the right a
 | 06 Health Revision Monitor | Event-driven request and health revisions during synchronized arm/gripper work |
 | 07 Handoff and Place | Complete input pick, protected handoff, output placement, and return-home production cycle |
 
-`common.py` contains the reusable pieces:
-
-- `DualArmRobot` maps the torso, arms, and grippers onto independent modular
-  submodules.
-- `DualArmRuntime` owns the robot, `TaskPilot`, thread pool, gripper command
-  services, and structured event log.
-- `SharedZoneCoordinator` prevents unrelated cycles from entering the handoff
-  workspace simultaneously while allowing idempotent reservations by the same
-  cycle.
-- `wait_submodule_moves()` waits for both arms against one shared deadline and
-  fails the group if either arm is cancelled.
-- `move_submodules_trajectories_async()` atomically validates and queues the two
-  trajectories, while `query_submodule_states()` returns a coherent joint snapshot.
-- `cancel_submodule_moves()` stops the coordinated group under one state lock when
-  either arm fails or the shared deadline expires.
-- `MoveSyncOption.sync_w_submodule()` lets each gripper request enter
-  `WAITING_FOR_MOVE` until its corresponding arm reaches the commanded pose.
+[`common.py`](common.py) owns the simulated robot, service adapters, shared-zone
+coordinator and event log. Arm moves use atomic batch submission and a shared
+wait deadline; synchronized gripper requests depend on their own arm's move ID.
 
 The poses are deliberately abstract joint vectors, so the default examples run
 without URDFs or visualization dependencies. `viser.py` is an optional observer

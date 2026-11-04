@@ -2,6 +2,8 @@
 
 import concurrent.futures
 import threading
+import weakref
+from dataclasses import dataclass, field
 
 import pytest
 
@@ -73,6 +75,18 @@ def test_main_move_cancellation_survives_restart(robot):
     assert cancelled in robot.query_state().cancelled_move_ids
 
 
+def test_cancelled_main_wait_returns_without_spending_its_timeout(robot):
+    robot.move_joint_trajectory_async([[1.0]])
+    robot.stop()
+    robot.initialize()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        waiting = executor.submit(robot.wait_move, 10.0, 10.0)
+        try:
+            assert waiting.result(timeout=0.5) is False
+        finally:
+            robot.stop(timeout=1.0)
+
+
 def test_restart_preserves_completed_main_move_id(robot):
     robot.initialize()
     completed = robot.move_joint_trajectory_async([[1.0]], interval=0.001)
@@ -81,6 +95,152 @@ def test_restart_preserves_completed_main_move_id(robot):
     robot.initialize()
     assert robot.wait_move(time_out=0.1)
     assert robot.query_state().latest_finished_id == completed
+
+
+def test_simulated_segments_publish_completion_only_at_their_endpoints():
+    robot = SimulatedRobotTask([0.0])
+    cancelled_move_id = robot.move_joint_trajectory_async([[-1.0]])
+    robot.stop()
+    observed = []
+    finished = threading.Event()
+
+    def observe_state():
+        state = robot.query_state()
+        if state.jps[0] > 0:
+            observed.append((state.jps[0], state.latest_finished_id))
+            if state.jps == [4.0]:
+                finished.set()
+
+    try:
+        robot.initialize()
+        robot.set_state_change_callback(observe_state)
+        first_move_id = robot.move_joint_trajectory_async(
+            [[1.0], [2.0], [3.0], [4.0]], interval=0.001, endpoint_index=[2, 4]
+        )
+        assert first_move_id > cancelled_move_id
+        assert finished.wait(1.0)
+        assert observed == [
+            (1.0, -1),
+            (2.0, first_move_id),
+            (3.0, first_move_id),
+            (4.0, first_move_id + 1),
+        ]
+        assert robot.query_state().cancelled_move_ids == (cancelled_move_id,)
+    finally:
+        robot.set_state_change_callback(None)
+        robot.stop(timeout=1.0)
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_idle_worker_wakes_for_motion_and_restart(robot, monkeypatch, restart):
+    idle = threading.Event()
+    original_wait = robot._state_condition.wait
+
+    def observe_idle(timeout=None):
+        if timeout is None:
+            idle.set()
+        return original_wait(timeout)
+
+    monkeypatch.setattr(robot._state_condition, "wait", observe_idle)
+    robot.initialize()
+    assert idle.wait(1.0)
+    if restart:
+        robot.stop(timeout=1.0)
+        idle.clear()
+        robot.initialize()
+        assert idle.wait(1.0)
+    idle.clear()
+    assert robot.move_joint_trajectory_async([[1.0], [2.0]], interval=0.001) == 0
+    assert robot.wait_move(time_out=1.0)
+    assert robot.query_state().jps[0] == 2.0
+    assert idle.wait(1.0)
+
+
+def test_completed_main_trajectory_is_released_while_robot_is_idle(robot, monkeypatch):
+    idle = threading.Event()
+    trajectory_reclaimed = threading.Event()
+    point_reclaimed = threading.Event()
+    trajectory_copies = []
+    point_copies = []
+
+    class TrackedPoint(list):
+        pass
+
+    class TrackedTrajectory(list):
+        def __deepcopy__(self, memo):
+            copied = type(self)([type(point)(point) for point in self])
+            trajectory_copies.append(
+                weakref.ref(copied, lambda _: trajectory_reclaimed.set())
+            )
+            point_copies.append(
+                weakref.ref(copied[-1], lambda _: point_reclaimed.set())
+            )
+            return copied
+
+    original_wait = robot._state_condition.wait
+
+    def observe_idle(timeout=None):
+        if timeout is None:
+            idle.set()
+        return original_wait(timeout)
+
+    monkeypatch.setattr(robot._state_condition, "wait", observe_idle)
+    assert robot.move_joint_trajectory_async(
+        TrackedTrajectory([[1.0], TrackedPoint([2.0])]), interval=0.001
+    ) == 0
+    robot.initialize()
+    assert robot.wait_move(time_out=1.0)
+    assert idle.wait(1.0)
+    assert trajectory_reclaimed.wait(1.0)
+    assert point_reclaimed.wait(1.0)
+    assert len(trajectory_copies) == 1 and trajectory_copies[0]() is None
+    assert len(point_copies) == 1 and point_copies[0]() is None
+
+
+def test_state_snapshot_is_isolated_from_caller_mutation(robot):
+    for value in range(3):
+        assert robot.move_joint_trajectory_async([[float(value)]]) == value
+    robot.stop()
+    snapshot = robot.query_state()
+    assert snapshot.cancelled_move_ids == (0, 1, 2)
+    snapshot.jps[0] = 99.0
+    snapshot.latest_sent_id = 99
+    snapshot.cancelled_move_ids += (99,)
+    current = robot.query_state()
+    assert current.jps[0] == 0.0
+    assert current.latest_sent_id == 2
+    assert current.cancelled_move_ids == (0, 1, 2)
+
+
+def test_simulated_snapshot_preserves_custom_state_fields_and_aliases():
+    @dataclass
+    class State(SimulatedRobotTask.ReducedRobotState):
+        details: dict = field(default_factory=dict)
+
+    class Robot(SimulatedRobotTask):
+        ReducedRobotState = State
+
+        def __init__(self):
+            super().__init__([0.0])
+            self._state.details["owner"] = ["simulator"]
+            self._state.details["positions"] = self._state.jps
+
+    robot = Robot()
+    try:
+        assert robot.move_joint_trajectory_async([[1.0]]) == 0
+        robot.stop()
+        snapshot = robot.query_state()
+        assert type(snapshot) is State
+        assert snapshot.cancelled_move_ids == (0,)
+        assert snapshot.details["owner"] == ["simulator"]
+        assert snapshot.details["positions"] is snapshot.jps
+        snapshot.details["owner"].append("caller")
+        snapshot.jps[0] = 99.0
+        current = robot.query_state()
+        assert current.details["owner"] == ["simulator"]
+        assert current.jps == [0.0]
+    finally:
+        robot.stop()
 
 
 def test_main_sync_is_cancelled_when_robot_stops_independently(robot):

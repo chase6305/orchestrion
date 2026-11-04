@@ -3,6 +3,7 @@
 import concurrent.futures
 import threading
 import time
+import weakref
 
 import pytest
 
@@ -12,6 +13,43 @@ from orchestrion.task_pilot import TaskPilot
 from orchestrion.tasks import CallableTask, GenericTask, InPlaceFunctionCallTask
 from orchestrion.tasks.reduced_robot_task_interface import ReducedRobotTaskInterface
 from orchestrion.utils.types import PeekResponseResult, PeekResponseResultType
+
+
+@pytest.mark.parametrize("synchronized", [False, True])
+@pytest.mark.parametrize("rejected", [False, True])
+def test_idle_scheduler_releases_completed_request_input(synchronized, rejected):
+    reclaimed = threading.Event()
+    copies = []
+
+    class TrackedPayload(dict):
+        def __deepcopy__(self, memo):
+            copied = type(self)(self)
+            copies.append(weakref.ref(copied, lambda _: reclaimed.set()))
+            return copied
+
+    class Task(InPlaceFunctionCallTask):
+        def invoke_async(self, request_id, content=None):
+            if rejected:
+                return False
+            return super().invoke_async(request_id, content)
+
+        def _call_fn(self, request_id, content):
+            return None
+
+    with TaskPilot(SimulatedRobotTask([0.0]), {"task": Task()}) as pilot:
+        sync = MoveSyncOption.no_sync()
+        if synchronized:
+            begin, _ = pilot.move_joint_trajectory_async([[1.0]], interval=0.001)
+            sync = MoveSyncOption.sync_w_explicit_id(begin)
+        request_id = pilot.call_srv_async(
+            "task", TrackedPayload(payload="x" * 100000), sync
+        )
+        result = pilot.wait_request(request_id, timeout=1.0)
+        assert result.status is (
+            RequestStatus.FAILED if rejected else RequestStatus.SUCCEEDED
+        )
+        assert reclaimed.wait(1.0)
+        assert len(copies) == 1 and copies[0]() is None
 
 
 class RobotTaskStub:
@@ -134,6 +172,66 @@ def test_synchronized_request_waits_for_move():
         assert wait_until(lambda: len(task.invoked) == 1)
     finally:
         pilot.stop()
+
+
+@pytest.mark.parametrize("submodule_name", [None, "arm"])
+def test_motion_batch_shares_history_lookup_and_preserves_priority(submodule_name):
+    class CancellationHistory(tuple):
+        inspected_ids = 0
+
+        def __iter__(self):
+            for move_id in super().__iter__():
+                self.inspected_ids += 1
+                yield move_id
+
+        def __contains__(self, move_id):
+            return any(cancelled_id == move_id for cancelled_id in self)
+
+    history = CancellationHistory((9, 2, 7))
+
+    class Robot(RobotTaskStub):
+        def query_state(self):
+            return ReducedRobotTaskInterface.ReducedRobotState([], 10, 10, history)
+
+        def query_submodule_state(self, name):
+            assert name == "arm"
+            return self.query_state()
+
+    task = RecordingTask()
+    with TaskPilot(Robot(), {"task": task}, poll_interval=10.0) as pilot:
+        blocker = pilot.call_srv_async(
+            "task", {"block": True}, MoveSyncOption.no_sync()
+        )
+        try:
+            assert task.started.wait(1.0)
+            request_ids = []
+            for move_id, priority in ((1, -1), (2, 20), (3, 10), (4, 10)):
+                sync_option = (
+                    MoveSyncOption.sync_w_explicit_id(move_id)
+                    if submodule_name is None
+                    else MoveSyncOption.sync_w_submodule(
+                        submodule_name, move_id=move_id
+                    )
+                )
+                request_ids.append(
+                    pilot.call_srv_async(
+                        "task", {"move_id": move_id}, sync_option, priority=priority
+                    )
+                )
+        finally:
+            task.release.set()
+        results = pilot.wait_requests([blocker] + request_ids, timeout=1.0)
+        assert [result.status for result in results] == [
+            RequestStatus.SUCCEEDED,
+            RequestStatus.SUCCEEDED,
+            RequestStatus.CANCELLED,
+            RequestStatus.SUCCEEDED,
+            RequestStatus.SUCCEEDED,
+        ]
+        assert task.calls == [
+            {"block": True}, {"move_id": 3}, {"move_id": 4}, {"move_id": 1}
+        ]
+        assert history.inspected_ids == len(history)
 
 
 def test_unknown_service_is_rejected():

@@ -107,6 +107,8 @@ class PollingTask(InPlaceFunctionCallTask):
                 with self._sample_lock:
                     self._last_error = message
                     self._consecutive_failures += 1
+            # Valid samples belong to the cache; rejected values can be released.
+            sample = None
             self._notify_completion()
             self._poll_stop.wait(self._interval)
 

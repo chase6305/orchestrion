@@ -25,6 +25,7 @@ jobs:
       - run: python -m pytest -q
       - run: python -m examples.simulated_pick_and_place
       - run: python -m examples.heterogeneous_workflow
+      - run: python -m examples.durable_device_workflow
       - if: contains(matrix.extras, 'viser')
         run: python -m examples.viser.02_pick_and_place --startup-delay 0 --duration 0 --steps 2 --interval 0.001
       - name: Build and smoke-test the wheel without optional dependencies
@@ -34,8 +35,10 @@ jobs:
           /tmp/orchestrion-wheel-env/bin/python -m pip install --no-deps dist/*.whl
           /tmp/orchestrion-wheel-env/bin/python -I - <<'PY'
           import asyncio
+          import tempfile
+          from pathlib import Path
           from orchestrion import CommandValidationError, FieldSpec, RequestSchema, SimulatedRobotTask, TaskPilot
-          from orchestrion.workflow import Action, Node, OutputRef, RunStatus, Workflow, WorkflowEngine
+          from orchestrion.workflow import Action, Node, OutputRef, RunStatus, SQLiteJournal, Workflow, WorkflowEngine, workflow_action
           with TaskPilot(SimulatedRobotTask([0.0])) as pilot:
               begin, end = pilot.move_joint_trajectory_async([[0.1]], interval=0.001)
               assert (begin, end) == (0, 1)
@@ -67,4 +70,22 @@ jobs:
                   assert engine.scheduler_snapshot()["scheduler_error"] is None
                   assert engine.prune_idempotency_keys(0) == 1
           asyncio.run(workflow_smoke())
+          async def durable_smoke(path):
+              scoped = workflow_action(
+                  "scope", Workflow((Node("echo", "echo", {"ok": True}),)),
+                  [Action("echo", echo, version="v1")],
+              )
+              workflow = Workflow((Node("scope", "scope"),))
+              with SQLiteJournal(path) as journal:
+                  async with WorkflowEngine([scoped], journal=journal) as engine:
+                      run = engine.submit(workflow, idempotency_key="durable-smoke")
+                      assert (await run.wait(1)).status == RunStatus.SUCCEEDED
+                      run_id = run.run_id
+              with SQLiteJournal(path) as journal:
+                  async with WorkflowEngine([scoped], journal=journal) as engine:
+                      replay = engine.submit(workflow, idempotency_key="durable-smoke")
+                      assert replay.run_id == run_id
+                      assert (await replay.wait(1)).status == RunStatus.SUCCEEDED
+          with tempfile.TemporaryDirectory() as directory:
+              asyncio.run(durable_smoke(Path(directory) / "cell.sqlite3"))
           PY
