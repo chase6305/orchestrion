@@ -2,8 +2,29 @@
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from fractions import Fraction
 
 from orchestrion.tasks.polling_task import PollingTask
+
+
+def test_fraction_interval_polls_repeatedly_and_stops_cleanly():
+    polled_twice = threading.Event()
+    samples = []
+
+    def poll():
+        samples.append(len(samples) + 1)
+        if len(samples) >= 2:
+            polled_twice.set()
+        return {"value": samples[-1]}
+
+    task = PollingTask(poll, interval=Fraction(1, 100))
+    task.initialize()
+    try:
+        assert polled_twice.wait(1)
+        assert task.peek_status()["health"] == "online"
+    finally:
+        task.stop()
+    assert not task.peek_status()["initialized"]
 
 
 def test_status_remains_readable_when_stop_clears_worker_reference():

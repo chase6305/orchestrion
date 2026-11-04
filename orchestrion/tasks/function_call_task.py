@@ -5,6 +5,7 @@ from abc import abstractmethod
 from functools import partial
 from typing import Callable, Dict, Optional
 
+from orchestrion.health import DeviceHealth
 from orchestrion.retry import RetryPolicy
 from orchestrion.schema import RequestSchema
 from orchestrion.tasks.generic_task import GenericTask
@@ -31,6 +32,7 @@ def _validate_request_id(request_id: int) -> None:
 
 
 class InPlaceFunctionCallTask(GenericTask):
+    """Run each call on the invoking thread and retain its response."""
 
     task_kind = "command"
     execution_mode = "in_place"
@@ -39,22 +41,16 @@ class InPlaceFunctionCallTask(GenericTask):
     def __init__(
         self, max_result_count: int = -1, metadata: Optional[Dict] = None
     ):
-        """
-        Initialize the in-place function call task.
+        """Retain responses with the largest IDs, up to max_result_count.
 
-        Args:
-            max_result_count (int): Maximum number of results to keep in memory.
-                                    If negative, unlimited.
+        A negative limit retains every response; zero is invalid.
         """
         super().__init__(metadata=metadata)
         _validate_max_result_count(max_result_count)
-        self._result_map: Dict[int, PeekResponseResult] = (
-            dict()
-        )  # Stores results for each request_id
-        self._latest_sent_request = -1  # Tracks the latest request_id sent
+        self._result_map: Dict[int, PeekResponseResult] = {}
+        self._latest_request_id = -1
         self._request_history = RequestHistory()
         self._pending_request_ids = set()
-        self._max_result_count = max_result_count  # Maximum number of results to retain
         self._lock = threading.Lock()
         self._retention = (
             None if max_result_count < 0 else ResultRetention(max_result_count)
@@ -62,37 +58,19 @@ class InPlaceFunctionCallTask(GenericTask):
 
     @abstractmethod
     def _call_fn(self, request_id: int, content: Optional[Dict]) -> Optional[Dict]:
-        """
-        Internal function to process the request. Should be overridden by subclasses.
-
-        Args:
-            request_id (int): The request identifier.
-            content (Optional[Dict]): Optional request content.
-
-        Returns:
-            Optional[Dict]: The result of the function call, or None if not implemented.
-        """
+        """Execute the request and return its response."""
         raise NotImplementedError
 
     def invoke_async(self, request_id: int, content: Optional[Dict] = None) -> bool:
-        """
-        Asynchronously invoke a function call and store the result.
-
-        Args:
-            request_id (int): The request identifier.
-            content (Optional[Dict]): Optional request content.
-
-        Returns:
-            bool: True if the request was accepted and processed, False otherwise.
-        """
+        """Execute inline and retain the response; reject duplicate request IDs."""
         _validate_request_id(request_id)
-        # Check if the request_id is valid and not duplicated
         with self._lock:
-            if not self._reserve_request_id_locked(request_id):
+            if not self._request_history.add(request_id):
                 return False
+            self._latest_request_id = max(self._latest_request_id, request_id)
             self._pending_request_ids.add(request_id)
         try:
-            out = self._call_fn(request_id, content)
+            response_content = self._call_fn(request_id, content)
         except Exception as exc:
             self._store_response(
                 PeekResponseResult(
@@ -104,46 +82,30 @@ class InPlaceFunctionCallTask(GenericTask):
             raise
         self._store_response(
             PeekResponseResult(
-                PeekResponseResultType.ResponseFound, request_id=request_id, content=out
+                PeekResponseResultType.ResponseFound,
+                request_id=request_id,
+                content=response_content,
             )
         )
         return True
 
     def _store_response(self, response: PeekResponseResult) -> None:
         request_id = response.request_id
+        expired_response = None
         with self._lock:
             self._pending_request_ids.discard(request_id)
             self._result_map[request_id] = response
-            if self._max_result_count > 0:
+            if self._retention is not None:
                 expired_id = self._retention.add(request_id)
                 if expired_id is not None:
-                    self._result_map.pop(expired_id, None)
+                    expired_response = self._result_map.pop(expired_id, None)
 
+        # SDK result destructors may query task state; release them without the lock.
+        del expired_response
         self._notify_completion()
 
-    def _reserve_request_id_locked(self, request_id: int) -> bool:
-        if not self._request_history.add(request_id):
-            return False
-        if request_id > self._latest_sent_request:
-            self._latest_sent_request = request_id
-        return True
-
-    def _request_id_is_reserved_locked(self, request_id: int) -> bool:
-        return (
-            request_id <= self._latest_sent_request
-            and request_id in self._request_history
-        )
-
     def peek_response(self, request_id: int) -> PeekResponseResult:
-        """
-        Peek for the response of a given request.
-
-        Args:
-            request_id (int): The request identifier.
-
-        Returns:
-            PeekResponseResult: The result of the peek operation. Returns error if not found.
-        """
+        """Return a response snapshot or distinguish pending, flushed and unsent IDs."""
         _validate_request_id(request_id)
         with self._lock:
             if request_id in self._pending_request_ids:
@@ -153,7 +115,7 @@ class InPlaceFunctionCallTask(GenericTask):
             if request_id not in self._result_map:
                 result_type = (
                     PeekResponseResultType.ResponseReceivedButFlushed
-                    if self._request_id_is_reserved_locked(request_id)
+                    if request_id in self._request_history
                     else PeekResponseResultType.ErrorRequestNotSent
                 )
                 return PeekResponseResult(result_type, request_id=request_id)
@@ -163,6 +125,7 @@ class InPlaceFunctionCallTask(GenericTask):
         return copy.deepcopy(response)
 
     def cancel_request(self, request_id: int) -> bool:
+        """Inline calls cannot be interrupted."""
         _validate_request_id(request_id)
         return False
 
@@ -170,22 +133,24 @@ class InPlaceFunctionCallTask(GenericTask):
         with self._lock:
             return {
                 "execution": "in_place",
-                "latest_request_id": self._latest_sent_request,
+                "latest_request_id": self._latest_request_id,
                 "retained_results": len(self._result_map),
             }
 
     def forget_response(self, request_id: int) -> bool:
         _validate_request_id(request_id)
         with self._lock:
-            if request_id not in self._result_map:
+            response = self._result_map.pop(request_id, None)
+            if response is None:
                 return False
-            self._result_map.pop(request_id)
             if self._retention is not None:
                 self._retention.discard(request_id)
-            return True
+        del response
+        return True
 
 
 class ThreadedPoolFunctionCallTask(GenericTask):
+    """Submit calls to a borrowed executor and retain their futures."""
 
     task_kind = "command"
     execution_mode = "thread_pool"
@@ -195,101 +160,69 @@ class ThreadedPoolFunctionCallTask(GenericTask):
     def __init__(
         self, max_result_count: int = -1, metadata: Optional[Dict] = None
     ):
-        """
-        Initialize the threaded pool function call task.
+        """Retain completed responses with the largest IDs and all pending futures.
 
-        Args:
-            max_result_count (int): Maximum number of results to keep in memory.
-                                    If negative, unlimited.
+        A negative limit retains every response; zero is invalid.
         """
         super().__init__(metadata=metadata)
         _validate_max_result_count(max_result_count)
-        self._executor_not_own: Optional[concurrent.futures.ThreadPoolExecutor] = (
-            None  # External thread pool executor
+        self._borrowed_executor: Optional[concurrent.futures.ThreadPoolExecutor] = (
+            None
         )
-        self._future_map: Dict[int, concurrent.futures.Future] = (
-            dict()
-        )  # Maps request_id to Future objects
+        self._future_map: Dict[int, concurrent.futures.Future] = {}
         self._pending_futures: Dict[int, concurrent.futures.Future] = {}
         self._outcomes: Dict[int, str] = {}
         self._outcome_counts = dict.fromkeys(("succeeded", "failed", "cancelled"), 0)
-        self._latest_sent_request = -1  # Tracks the latest request_id sent
+        self._latest_request_id = -1
         self._request_history = RequestHistory()
-        self._max_result_count = max_result_count  # Maximum number of results to retain
         self._lock = threading.Lock()
         self._retention = (
             None if max_result_count < 0 else ResultRetention(max_result_count)
         )
 
     def initialize(self, **kwargs):
-        """
-        Initialize the task with an external thread pool executor.
-
-        Args:
-            executor: ThreadPoolExecutor instance (must be provided in kwargs).
-        """
-        # Does NOT init executor, maintained outside
-        executor = kwargs.get("executor", None)
+        """Bind a caller-owned executor supplied as the executor keyword argument."""
+        executor = kwargs.get("executor")
         if executor is None:
             raise ValueError("ThreadedPoolFunctionCallTask requires an executor")
         if not callable(getattr(executor, "submit", None)):
             raise TypeError("executor must provide a callable submit method")
         with self._lock:
-            self._executor_not_own = executor
+            self._borrowed_executor = executor
 
     def stop(self):
-        """
-        Stop the task and cancel all pending futures. Does NOT destruct the executor.
-        """
+        """Cancel queued futures and detach from the caller-owned executor."""
         with self._lock:
-            futures = list(self._future_map.values())
-            self._executor_not_own = None
+            futures = list(self._pending_futures.values())
+            self._borrowed_executor = None
         for future in futures:
             future.cancel()
 
     @abstractmethod
     def _call_fn(self, request_id: int, content: Optional[Dict]) -> Optional[Dict]:
-        """
-        Internal function to process the request. Should be overridden by subclasses.
-
-        Args:
-            request_id (int): The request identifier.
-            content (Optional[Dict]): Optional request content.
-
-        Returns:
-            Optional[Dict]: The result of the function call, or None if not implemented.
-        """
+        """Execute the request and return its response."""
         raise NotImplementedError
 
     def invoke_async(self, request_id: int, content: Optional[Dict] = None) -> bool:
-        """
-        Asynchronously invoke a function call using a thread pool and store the future.
-
-        Args:
-            request_id (int): The request identifier.
-            content (Optional[Dict]): Optional request content.
-
-        Returns:
-            bool: True if the request was accepted and processed, False otherwise.
-        """
+        """Submit once; a failed executor submission leaves the request ID reusable."""
         _validate_request_id(request_id)
-        # Check if the request_id is valid and not duplicated
         with self._lock:
-            executor = self._executor_not_own
+            executor = self._borrowed_executor
             if executor is None:
                 raise RuntimeError("Task must be initialized before use")
-            if self._request_id_is_reserved_locked(request_id):
+            if request_id in self._request_history:
                 return False
             # Commit the ID only after submission succeeds. Holding the task lock
             # prevents another caller reserving it and avoids copying the entire
             # sparse-ID history on every submission.
-            invoke_future = self._submit_call(executor, request_id, content)
-            self._reserve_request_id_locked(request_id)
-            self._future_map[request_id] = invoke_future
-            self._pending_futures[request_id] = invoke_future
+            future = self._submit_call(executor, request_id, content)
+            self._request_history.add(request_id)
+            self._latest_request_id = max(self._latest_request_id, request_id)
+            self._future_map[request_id] = future
+            self._pending_futures[request_id] = future
         # Register outside the lock: add_done_callback() invokes synchronously
         # when a very fast future has already completed.
-        invoke_future.add_done_callback(partial(self._on_future_done, request_id))
+        future.add_done_callback(partial(self._on_future_done, request_id))
 
         return True
 
@@ -303,18 +236,21 @@ class ThreadedPoolFunctionCallTask(GenericTask):
     def _on_future_done(
         self, request_id: int, future: concurrent.futures.Future
     ) -> None:
+        expired_future = None
         with self._lock:
             self._record_outcome_locked(request_id, future)
             failed = self._outcomes.get(request_id) == "failed"
             if (
-                self._max_result_count > 0
+                self._retention is not None
                 and self._future_map.get(request_id) is future
             ):
                 # Only completed futures enter the eviction heap. Pending work
                 # never needs to be scanned, sorted, or cancelled to retain K results.
                 expired_id = self._retention.add(request_id)
                 if expired_id is not None:
-                    self._remove_future_locked(expired_id)
+                    expired_future = self._remove_future_locked(expired_id)
+        # Keep evicted results alive until SDK destructors can safely take the lock.
+        del expired_future
         # Logging and SDK exception formatters may call arbitrary application
         # code. Keep them outside the task lock, and always notify observers.
         try:
@@ -342,41 +278,22 @@ class ThreadedPoolFunctionCallTask(GenericTask):
         self._outcomes[request_id] = outcome
         self._outcome_counts[outcome] += 1
 
-    def _remove_future_locked(self, request_id: int) -> None:
-        self._future_map.pop(request_id, None)
+    def _remove_future_locked(
+        self, request_id: int
+    ) -> Optional[concurrent.futures.Future]:
+        future = self._future_map.pop(request_id, None)
         self._pending_futures.pop(request_id, None)
         outcome = self._outcomes.pop(request_id, None)
         if outcome is not None:
             self._outcome_counts[outcome] -= 1
-
-    def _reserve_request_id_locked(self, request_id: int) -> bool:
-        if not self._request_history.add(request_id):
-            return False
-        if request_id > self._latest_sent_request:
-            self._latest_sent_request = request_id
-        return True
-
-    def _request_id_is_reserved_locked(self, request_id: int) -> bool:
-        return (
-            request_id <= self._latest_sent_request
-            and request_id in self._request_history
-        )
+        return future
 
     def peek_response(self, request_id: int) -> PeekResponseResult:
-        """
-        Peek for the response of a given request.
-
-        Args:
-            request_id (int): The request identifier.
-
-        Returns:
-            PeekResponseResult: The result of the peek operation.
-                                Returns error if not found or not ready.
-        """
+        """Return a response snapshot or distinguish pending, flushed and unsent IDs."""
         _validate_request_id(request_id)
         with self._lock:
             future = self._future_map.get(request_id)
-            request_was_sent = self._request_id_is_reserved_locked(request_id)
+            request_was_sent = request_id in self._request_history
         if future is None:
             result_type = (
                 PeekResponseResultType.ResponseReceivedButFlushed
@@ -384,52 +301,55 @@ class ThreadedPoolFunctionCallTask(GenericTask):
                 else PeekResponseResultType.ErrorRequestNotSent
             )
             return PeekResponseResult(result_type, request_id=request_id)
-        if future.done():
-            if future.cancelled():
-                return PeekResponseResult(
-                    PeekResponseResultType.ErrorUnknown,
-                    request_id=request_id,
-                    content=None,
-                )
-            else:
-                exception = future.exception()
-                if exception is not None:
-                    return PeekResponseResult(
-                        PeekResponseResultType.ErrorUnknown,
-                        request_id=request_id,
-                        error=exception_message(exception),
-                    )
-                out = copy.deepcopy(future.result())
-                return PeekResponseResult(
-                    PeekResponseResultType.ResponseFound,
-                    request_id=request_id,
-                    content=out,
-                )
-        else:
+        if not future.done():
             return PeekResponseResult(
                 PeekResponseResultType.RequestSentNoResponse,
                 request_id=request_id,
-                content=None,
             )
+        if future.cancelled():
+            return PeekResponseResult(
+                PeekResponseResultType.ErrorUnknown, request_id=request_id
+            )
+        exception = future.exception()
+        if exception is not None:
+            return PeekResponseResult(
+                PeekResponseResultType.ErrorUnknown,
+                request_id=request_id,
+                error=exception_message(exception),
+            )
+        return PeekResponseResult(
+            PeekResponseResultType.ResponseFound,
+            request_id=request_id,
+            content=copy.deepcopy(future.result()),
+        )
 
     def cancel_request(self, request_id: int) -> bool:
+        """Cancel a retained future only if its execution has not started."""
         _validate_request_id(request_id)
         with self._lock:
             future = self._future_map.get(request_id)
         return future is not None and future.cancel()
 
     def peek_status(self) -> Dict:
-        """Count retained outcomes without revisiting already completed futures."""
+        """Return executor binding and retained outcome counts."""
         with self._lock:
-            # Future completion precedes callback dispatch. Reconcile only pending
-            # entries so a delayed callback does not make the snapshot stale.
-            for request_id, future in tuple(self._pending_futures.items()):
-                if future.done():
+            # Completion precedes callback dispatch. Collect before changing the
+            # pending map; unfinished entries do not need a temporary copy.
+            if self._pending_futures:
+                completed_requests = [
+                    (request_id, future)
+                    for request_id, future in self._pending_futures.items()
+                    if future.done()
+                ]
+                for request_id, future in completed_requests:
                     self._record_outcome_locked(request_id, future)
+            initialized = self._borrowed_executor is not None
+            health = DeviceHealth.ONLINE if initialized else DeviceHealth.OFFLINE
             return {
                 "execution": "thread_pool",
-                "initialized": self._executor_not_own is not None,
-                "latest_request_id": self._latest_sent_request,
+                "initialized": initialized,
+                "health": health.value,
+                "latest_request_id": self._latest_request_id,
                 "retained_results": len(self._future_map),
                 "pending": len(self._pending_futures),
                 **self._outcome_counts,
@@ -465,7 +385,9 @@ class CallableTask(ThreadedPoolFunctionCallTask):
             raise TypeError("status must be callable or None")
         if retry_policy is not None and not isinstance(retry_policy, RetryPolicy):
             raise TypeError("retry_policy must be a RetryPolicy or None")
-        if request_schema is not None and not isinstance(request_schema, RequestSchema):
+        if request_schema is not None and not isinstance(
+            request_schema, RequestSchema
+        ):
             raise TypeError("request_schema must be a RequestSchema or None")
         super().__init__(max_result_count=max_result_count, metadata=metadata)
         self._call = call
@@ -527,16 +449,16 @@ class CallableTask(ThreadedPoolFunctionCallTask):
     def _call_in_lifecycle(
         self, request_id: int, content: Optional[Dict], stop_event: threading.Event
     ) -> Optional[Dict]:
-        previous = getattr(self._call_context, "stop_event", None)
+        previous_stop_event = getattr(self._call_context, "stop_event", None)
         self._call_context.stop_event = stop_event
         try:
             # Preserve the inherited extension hook for CallableTask subclasses.
             return self._call_fn(request_id, content)
         finally:
-            if previous is None:
+            if previous_stop_event is None:
                 del self._call_context.stop_event
             else:
-                self._call_context.stop_event = previous
+                self._call_context.stop_event = previous_stop_event
 
     def _call_fn(self, request_id: int, content: Optional[Dict]) -> Optional[Dict]:
         stop_event = getattr(self._call_context, "stop_event", self._retry_stop_event)
@@ -581,14 +503,20 @@ class CallableTask(ThreadedPoolFunctionCallTask):
                     self._total_retries += 1
                 self._notify_completion()
                 delay = self._retry_policy.delay_before(attempt + 1)
-                if stop_event.wait(delay):
+                if delay > threading.TIMEOUT_MAX and not stop_event.is_set():
+                    raise ValueError(
+                        "retry delay must not exceed threading.TIMEOUT_MAX"
+                    )
+                if stop_event.wait(float(delay)):
                     raise concurrent.futures.CancelledError(
                         "Callable task stopped during retry backoff"
                     )
         raise AssertionError("unreachable")
 
     def peek_status(self) -> Dict:
+        """Merge device facts with the adapter's executor binding."""
         snapshot = super().peek_status()
+        initialized = snapshot["initialized"]
         with self._retry_lock:
             snapshot.update(
                 {
@@ -597,14 +525,17 @@ class CallableTask(ThreadedPoolFunctionCallTask):
                     "last_retry_error": self._last_retry_error,
                 }
             )
-        if self._status is None:
-            return snapshot
-        custom = self._status()
-        if custom is not None:
-            if not isinstance(custom, dict):
-                raise TypeError("status callable must return a dictionary or None")
-            custom = copy.deepcopy(custom)
-            if not isinstance(custom, dict):
-                raise TypeError("copied status must be a dictionary")
-            snapshot.update(custom)
+        if self._status is not None:
+            custom = self._status()
+            if custom is not None:
+                if not isinstance(custom, dict):
+                    raise TypeError("status callable must return a dictionary or None")
+                custom = copy.deepcopy(custom)
+                if not isinstance(custom, dict):
+                    raise TypeError("copied status must be a dictionary")
+                snapshot.update(custom)
+        # Device facts cannot make an unbound adapter accept commands.
+        snapshot["initialized"] = initialized
+        if not initialized:
+            snapshot.update(health=DeviceHealth.OFFLINE.value, available=False)
         return snapshot

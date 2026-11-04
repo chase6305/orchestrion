@@ -1,15 +1,14 @@
 """Background polling adapter for sensor and device telemetry services."""
 
 import copy
-import math
 import threading
 import time
-from numbers import Real
 from typing import Callable, Dict, Optional
 
 from orchestrion.health import DeviceHealth
 from orchestrion.tasks.function_call_task import InPlaceFunctionCallTask
 from orchestrion.utils.errors import exception_message
+from orchestrion.utils.numeric import is_finite_real
 
 
 class PollingTask(InPlaceFunctionCallTask):
@@ -27,13 +26,10 @@ class PollingTask(InPlaceFunctionCallTask):
     ):
         if not callable(poll):
             raise TypeError("poll must be callable")
-        if (
-            isinstance(interval, bool)
-            or not isinstance(interval, Real)
-            or not math.isfinite(interval)
-            or interval <= 0
-        ):
+        if not is_finite_real(interval) or interval <= 0:
             raise ValueError("interval must be positive and finite")
+        if interval > threading.TIMEOUT_MAX:
+            raise ValueError("interval must not exceed threading.TIMEOUT_MAX")
         super().__init__(max_result_count=max_result_count, metadata=metadata)
         self._poll = poll
         self._interval = float(interval)
@@ -82,8 +78,8 @@ class PollingTask(InPlaceFunctionCallTask):
                 self._poll_stop.set()
                 thread = self._poll_thread
                 if thread is not None and thread is not threading.current_thread():
-                    # Device SDK calls must configure their own I/O timeout. Keep framework
-                    # shutdown bounded even if a third-party poll function blocks.
+                    # SDK calls need their own I/O timeout; keep framework
+                    # shutdown bounded if a poll function blocks.
                     thread.join(timeout=1.0)
                     if not thread.is_alive():
                         self._poll_thread = None
@@ -92,12 +88,16 @@ class PollingTask(InPlaceFunctionCallTask):
 
     def _poll_loop(self) -> None:
         while not self._poll_stop.is_set():
+            previous_sample = None
             try:
                 sample = self._poll()
                 if sample is not None and not isinstance(sample, dict):
                     raise TypeError("poll callable must return a dictionary or None")
                 sample = copy.deepcopy(sample)
+                if sample is not None and not isinstance(sample, dict):
+                    raise TypeError("copied poll sample must be a dictionary or None")
                 with self._sample_lock:
+                    previous_sample = self._latest_sample
                     self._latest_sample = sample
                     self._observed_at = time.time()
                     self._last_error = None
@@ -107,6 +107,9 @@ class PollingTask(InPlaceFunctionCallTask):
                 with self._sample_lock:
                     self._last_error = message
                     self._consecutive_failures += 1
+            # Release retired and rejected SDK samples without the cache lock.
+            del previous_sample
+            sample = None
             self._notify_completion()
             self._poll_stop.wait(self._interval)
 

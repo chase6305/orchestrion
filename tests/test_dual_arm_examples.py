@@ -1,5 +1,6 @@
 import concurrent.futures
 import importlib
+from unittest.mock import Mock
 
 import pytest
 
@@ -43,6 +44,28 @@ def test_dual_arm_runtime_moves_both_arms_and_grippers_in_parallel():
         }
         assert runtime.robot.query_submodule_state("left_gripper").positions == [1.0]
         assert runtime.robot.query_submodule_state("right_gripper").positions == [1.0]
+
+
+@pytest.mark.parametrize("move_id", [0, -1], ids=["wait-failed", "rejected"])
+def test_gripper_wait_failure_cancels_only_an_accepted_move(monkeypatch, move_id):
+    with DualArmRuntime() as runtime:
+        wait = Mock(return_value=False)
+        cancel = Mock(return_value=True)
+        monkeypatch.setattr(
+            runtime.robot, "move_submodule_trajectory_async", Mock(return_value=move_id)
+        )
+        monkeypatch.setattr(runtime.robot, "wait_submodule_move", wait)
+        monkeypatch.setattr(runtime.robot, "cancel_submodule_move", cancel)
+        request_id = runtime.command_gripper("left", "close")
+        result = runtime.pilot.wait_request(request_id, timeout=1)
+        assert result.status.value == "failed"
+        assert "left_gripper movement failed" in result.error
+        if move_id >= 0:
+            wait.assert_called_once_with("left_gripper", move_id, timeout=1.0)
+            cancel.assert_called_once_with("left_gripper", move_id)
+        else:
+            wait.assert_not_called()
+            cancel.assert_not_called()
 
 
 def test_dual_arm_runtime_event_history_is_a_defensive_copy():

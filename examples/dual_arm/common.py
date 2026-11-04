@@ -278,6 +278,8 @@ class DualArmRuntime:
             if move_id < 0 or not self.robot.wait_submodule_move(
                 module_name, move_id, timeout=1.0
             ):
+                if move_id >= 0:
+                    self.robot.cancel_submodule_move(module_name, move_id)
                 raise RuntimeError("{} movement failed".format(module_name))
             self.record(
                 "gripper_finished",

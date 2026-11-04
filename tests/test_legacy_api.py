@@ -4,6 +4,7 @@ import concurrent.futures
 import json
 import threading
 import time
+from fractions import Fraction
 
 import pytest
 
@@ -14,9 +15,15 @@ from orchestrion import (
     TaskPilot,
 )
 from orchestrion.tasks.function_call_task import (
+    CallableTask,
     InPlaceFunctionCallTask,
     ThreadedPoolFunctionCallTask,
 )
+
+_UNREPRESENTABLE_REALS = [
+    pytest.param(10**1000, id="huge-int"),
+    pytest.param(Fraction(10**1000, 3), id="huge-fraction"),
+]
 
 
 class EchoTask(InPlaceFunctionCallTask):
@@ -391,6 +398,82 @@ def test_health_snapshot_reports_offline_peripheral_without_raising():
         pilot.stop()
 
 
+@pytest.mark.parametrize(
+    "task_factory",
+    [SlowTask, lambda: CallableTask(lambda request_id, content: content)],
+    ids=["threaded", "callable"],
+)
+def test_threaded_service_health_follows_executor_lifecycle(task_factory):
+    task = task_factory()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        pilot = TaskPilot(
+            SimulatedRobotTask([0.0]), {"device": task}, executor_owned=executor
+        )
+        try:
+            assert pilot.query_task_status("device")["health"] == "offline"
+            assert not pilot.query_task_status("device")["available"]
+            pilot.initialize()
+            assert pilot.query_health()["healthy"]
+
+            task.stop()
+            status = pilot.query_task_status("device")
+            assert not status["initialized"]
+            assert status["health"] == "offline"
+            assert not status["available"]
+            assert not pilot.query_health()["healthy"]
+
+            task.initialize(executor=executor)
+            assert pilot.query_health()["healthy"]
+        finally:
+            pilot.stop()
+
+
+@pytest.mark.parametrize(
+    "device_status, expected_health, expected_available",
+    [
+        ({"health": "offline"}, "offline", False),
+        ({"health": "degraded", "available": True}, "degraded", True),
+        ({"health": "online", "available": False}, "online", False),
+        (
+            {"health": "online", "available": True, "initialized": False},
+            "online", True,
+        ),
+    ],
+)
+def test_callable_status_preserves_device_health_while_bound(
+    device_status, expected_health, expected_available
+):
+    task = CallableTask(
+        lambda request_id, content: content, status=lambda: device_status
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        with TaskPilot(
+            SimulatedRobotTask([0.0]), {"device": task}, executor_owned=executor
+        ) as pilot:
+            status = pilot.query_task_status("device")
+            assert status["initialized"]
+            assert status["health"] == expected_health
+            assert status["available"] is expected_available
+
+
+def test_callable_device_status_cannot_hide_a_stopped_executor():
+    task = CallableTask(
+        lambda request_id, content: content,
+        status=lambda: {"initialized": True, "health": "online", "available": True},
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        with TaskPilot(
+            SimulatedRobotTask([0.0]), {"device": task}, executor_owned=executor
+        ) as pilot:
+            assert pilot.query_health()["healthy"]
+            task.stop()
+            status = pilot.query_task_status("device")
+            assert not status["initialized"]
+            assert status["health"] == "offline"
+            assert not status["available"]
+            assert not pilot.query_health()["healthy"]
+
+
 def test_health_snapshot_is_not_healthy_while_device_connects():
     class ConnectingTask(EchoTask):
         def peek_status(self):
@@ -428,6 +511,10 @@ def test_health_snapshot_marks_stale_device_as_degraded():
     [
         ({"health": "broken"}, "health state"),
         ({"observed_at": float("nan")}, "observed_at"),
+        pytest.param({"observed_at": 10**1000}, "observed_at", id="huge-int"),
+        pytest.param(
+            {"observed_at": Fraction(10**1000, 3)}, "observed_at", id="huge-fraction"
+        ),
     ],
 )
 def test_task_status_rejects_malformed_health_metadata(status, message):
@@ -440,24 +527,40 @@ def test_task_status_rejects_malformed_health_metadata(status, message):
         pilot.query_task_status("device")
 
 
-@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), True])
+@pytest.mark.parametrize(
+    "value", [0, -1, float("nan"), float("inf"), True, *_UNREPRESENTABLE_REALS]
+)
 def test_health_snapshot_rejects_invalid_stale_timeout(value):
     pilot = TaskPilot(SimulatedRobotTask([0.0]))
     with pytest.raises(ValueError, match="stale_after"):
         pilot.query_health(stale_after=value)
 
 
-def test_wait_health_change_returns_new_snapshot_without_polling():
+@pytest.mark.parametrize("timeout", [0.5, 1e300], ids=["short", "large"])
+def test_wait_health_change_returns_new_snapshot_without_polling(timeout, monkeypatch):
     pilot = TaskPilot(SimulatedRobotTask([0.0]), {"echo": EchoTask()})
+    waiting = threading.Event()
+    original_wait = pilot._state_condition.wait
+
+    def observe_wait(timeout=None):
+        waiting.set()
+        return original_wait(timeout)
+
+    monkeypatch.setattr(pilot._state_condition, "wait", observe_wait)
     pilot.initialize()
     try:
         revision = pilot.health_revision
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            waiter = executor.submit(pilot.wait_health_change, revision, 0.5)
-            request_id = pilot.call_srv_async(
-                "echo", {"value": 1}, MoveSyncOption.no_sync()
-            )
-            snapshot = waiter.result(timeout=0.5)
+            waiter = executor.submit(pilot.wait_health_change, revision, timeout)
+            try:
+                assert waiting.wait(0.5)
+                request_id = pilot.call_srv_async(
+                    "echo", {"value": 1}, MoveSyncOption.no_sync()
+                )
+                snapshot = waiter.result(timeout=0.5)
+            except BaseException:
+                pilot.stop()
+                raise
         assert snapshot is not None
         assert snapshot["revision"] > revision
         pilot.wait_request(request_id, timeout=0.5)
@@ -513,7 +616,9 @@ def test_callback_registration_failure_rolls_back_all_tasks():
     assert robot._thread is not None and not robot._thread.is_alive()
 
 
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), 0.0, -0.1, True])
+@pytest.mark.parametrize(
+    "value", [float("nan"), float("inf"), 0.0, -0.1, True, *_UNREPRESENTABLE_REALS]
+)
 def test_invalid_poll_interval_is_rejected(value):
     with pytest.raises(ValueError, match="poll_interval"):
         TaskPilot(SimulatedRobotTask([0.0]), poll_interval=value)
@@ -563,14 +668,22 @@ def test_concurrent_lifecycle_calls_are_serialized():
     assert robot.stop_count == 1
 
 
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1, True])
-def test_invalid_request_timeout_is_rejected(value):
+@pytest.mark.parametrize(
+    "value", [float("nan"), float("inf"), -0.1, True, *_UNREPRESENTABLE_REALS]
+)
+@pytest.mark.parametrize("reader", ["request", "group", "health"])
+def test_invalid_request_timeout_is_rejected(value, reader):
     pilot = TaskPilot(SimulatedRobotTask([0.0]), {"echo": EchoTask()})
     pilot.initialize()
     try:
         request_id = pilot.call_srv_async("echo", sync_option=MoveSyncOption.no_sync())
         with pytest.raises(ValueError, match="timeout"):
-            pilot.wait_request(request_id, timeout=value)
+            if reader == "request":
+                pilot.wait_request(request_id, timeout=value)
+            elif reader == "group":
+                pilot.wait_requests([request_id], timeout=value)
+            else:
+                pilot.wait_health_change(pilot.health_revision, timeout=value)
     finally:
         pilot.stop()
 
@@ -631,7 +744,9 @@ def test_simulated_robot_rejects_non_finite_or_non_numeric_joints(value):
     assert SimulatedRobotTask([0.0]).move_joint_trajectory_async([[value]]) == -1
 
 
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), "0.0", True])
+@pytest.mark.parametrize(
+    "value", [float("nan"), float("inf"), "0.0", True, *_UNREPRESENTABLE_REALS]
+)
 def test_simulated_robot_rejects_invalid_initial_joints(value):
     with pytest.raises(ValueError, match="finite real"):
         SimulatedRobotTask([value])
@@ -653,7 +768,7 @@ def test_simulated_wait_rejects_invalid_timing(time_out, interval):
 
 
 @pytest.mark.parametrize(
-    "timeout", [-0.1, float("nan"), float("inf"), "0.1", True]
+    "timeout", [-0.1, float("nan"), float("inf"), "0.1", True, *_UNREPRESENTABLE_REALS]
 )
 def test_simulated_stop_rejects_invalid_timeout(timeout):
     with pytest.raises(ValueError, match="timeout"):
@@ -696,11 +811,27 @@ def test_simulated_robot_concurrent_lifecycle_calls_are_serialized():
     assert not thread.is_alive()
 
 
-@pytest.mark.parametrize("timeout", [-0.1, float("nan"), float("inf"), True])
+@pytest.mark.parametrize(
+    "timeout", [-0.1, float("nan"), float("inf"), True, *_UNREPRESENTABLE_REALS]
+)
 def test_stop_rejects_invalid_timeout(timeout):
     pilot = TaskPilot(SimulatedRobotTask([0.0]))
     with pytest.raises(ValueError, match="timeout"):
         pilot.stop(timeout=timeout)
+
+
+def test_stop_accepts_a_fractional_timeout_and_cleans_up_devices():
+    robot = SimulatedRobotTask([0.0])
+    task = LifecycleTask()
+    pilot = TaskPilot(robot, {"device": task})
+    pilot.initialize()
+    try:
+        pilot.stop(timeout=Fraction(1, 2))
+        assert not pilot.is_running
+        assert task.stopped
+    finally:
+        pilot.stop()
+        robot.stop()
 
 
 def test_request_failure_is_observable():
@@ -749,19 +880,35 @@ def test_queued_request_snapshots_nested_content():
         pilot.stop()
 
 
-def test_stop_cancels_requests_and_unblocks_waiters():
+@pytest.mark.parametrize("timeout", [None, 1e300], ids=["unbounded", "large"])
+@pytest.mark.parametrize("grouped", [False, True], ids=["request", "group"])
+def test_stop_cancels_requests_and_unblocks_waiters(timeout, grouped, monkeypatch):
     pilot = TaskPilot(SimulatedRobotTask([0.0]), {"echo": EchoTask()})
+    waiting = threading.Event()
+    original_wait = pilot._state_condition.wait
+
+    def observe_wait(timeout=None):
+        waiting.set()
+        return original_wait(timeout)
+
+    monkeypatch.setattr(pilot._state_condition, "wait", observe_wait)
     pilot.initialize()
     request_id = pilot.call_srv_async(
         "echo", sync_option=MoveSyncOption.sync_w_explicit_id(99)
     )
-    outcome = []
-    waiter = threading.Thread(target=lambda: outcome.append(pilot.wait_request(request_id)))
-    waiter.start()
-    pilot.stop()
-    waiter.join(timeout=0.5)
-    assert not waiter.is_alive()
-    assert outcome[0].status is RequestStatus.CANCELLED
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        if grouped:
+            waiter = executor.submit(pilot.wait_requests, [request_id], timeout)
+        else:
+            waiter = executor.submit(pilot.wait_request, request_id, timeout)
+        try:
+            assert waiting.wait(0.5)
+        finally:
+            pilot.stop()
+        outcome = waiter.result(timeout=0.5)
+    if grouped:
+        outcome = outcome[0]
+    assert outcome.status is RequestStatus.CANCELLED
 
 
 def test_stop_does_not_allow_request_to_enqueue_after_cancellation_pass():
@@ -870,13 +1017,14 @@ def test_repeated_queued_cancellation_stays_cancelled():
             pilot.stop()
 
 
-def test_thread_pool_completion_wakes_scheduler():
+@pytest.mark.parametrize("poll_interval", [1.0, Fraction(1, 1)], ids=["float", "fraction"])
+def test_thread_pool_completion_wakes_scheduler(poll_interval):
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     pilot = TaskPilot(
         SimulatedRobotTask([0.0]),
         {"delayed": DelayedTask()},
         executor_owned=executor,
-        poll_interval=1.0,
+        poll_interval=poll_interval,
     )
     pilot.initialize()
     try:

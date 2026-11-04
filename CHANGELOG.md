@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- Reduce scheduler and snapshot overhead with linear motion-wait scans, cached
+  cancellation history, targeted JSON copies and smaller pending-status allocations.
+  Reuse normalized claims and batch durable event-history trimming.
+- Reuse owned feedback/checkpoint JSON internally while preserving isolated public
+  reads. Check final schema payloads and failure diagnostics for finite JSON,
+  isolation and byte limits.
+- Release retired SDK values outside locks. Stop failed robot workers, cancel local
+  trajectories and preserve cancellation history across explicit restarts.
+- Validate copied telemetry, metadata, schema choices and SDK request/motion IDs
+  before use. Clarify synchronization, segment endpoints and result retention.
+- Share finite timing checks, normalize `Fraction` delays and preserve long wait
+  deadlines. Reject unsupported native waits before queue or lifecycle changes.
+- Report unbound threaded adapters offline and prevent SDK status fields from
+  overriding executor binding.
+- Honor gripper cancellation during preparation and move-ID publication; cancel
+  accepted dual-arm gripper moves when their waits fail.
+- Batch concurrent durable dispatch intents and graph-stop results atomically;
+  interrupt remote queries on cancellation and reject inconsistent recovery leases.
+- Add optional SQLite workflow journals with committed dispatch intent, durable
+  keyed results/checkpoints, conservative hard-exit recovery, exclusive ownership,
+  reconciliation evidence and explicit retention. Storage faults close admission.
+- Add `TicketAction` and typed asynchronous operation backends; distinguish command
+  acceptance, final completion and cancellation confirmation without actuator retries.
+- Compose fixed DAGs into resource-scoped capabilities with `workflow_action`,
+  hierarchical operation IDs, inner concurrency and versioned execution identity.
+- Add action versions, independent stop-confirmation deadlines, draining-worker
+  accounting, late ticket checkpoints and opt-in JSON byte limits. Escape operation
+  ID components and expose `WorkflowRun.operation_id()` for safe reconciliation.
+- Demonstrate durable resource-scoped execution against the loopback HTTP device,
+  including restart replay without duplicate commands and lost-response recovery.
+- Avoid quadratic choice membership checks during schema construction while
+  preserving candidate validation, nested constraints, and defensive copies.
+  Add a reproducible scalar/composite enumeration benchmark.
 - Validate known input fields and composite choices even when a workflow node
   contains output references; reject invalid plans before any device action and
   recheck resolved values before dispatch. Add binding-independent template validation.

@@ -107,15 +107,22 @@ class FieldSpec:
             if value is not None and (
                 isinstance(value, bool) or not isinstance(value, int) or value < 0
             ):
-                raise ValueError("{} must be a nonnegative integer or None".format(name))
+                raise ValueError(
+                    "{} must be a nonnegative integer or None".format(name)
+                )
         if min_items is not None or max_items is not None:
             if value_type != "array":
                 raise ValueError("min_items and max_items require an array field")
-            if min_items is not None and max_items is not None and min_items > max_items:
+            if (
+                min_items is not None
+                and max_items is not None
+                and min_items > max_items
+            ):
                 raise ValueError("min_items must not exceed max_items")
         choice_list = None if choices is None else list(choices)
+        validated_choices = copy.deepcopy(choice_list)
         try:
-            json.dumps(choice_list, allow_nan=False)
+            json.dumps(validated_choices, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValueError("choices must be JSON-compatible") from exc
         self.value_type = value_type
@@ -126,23 +133,30 @@ class FieldSpec:
         self.maximum = (
             maximum if maximum is None or isinstance(maximum, int) else float(maximum)
         )
-        self.choices = copy.deepcopy(choice_list)
+        self.choices = None
         self.description = description
         self.items = copy.deepcopy(items)
         self.object_schema = copy.deepcopy(object_schema)
         self.min_items = min_items
         self.max_items = max_items
-        if self.choices is not None:
-            for choice in self.choices:
+        if validated_choices is not None:
+            # Every candidate is already a member of this enumeration. Check
+            # its other constraints without a redundant quadratic membership
+            # scan; nested fields still enforce their own choices.
+            for choice in validated_choices:
                 try:
                     self.validate("choice", choice)
                 except CommandValidationError as exc:
                     raise ValueError(
                         "choices must satisfy the field constraints"
                     ) from exc
+        self.choices = validated_choices
 
     def validate(
-        self, name: str, value: Any, *,
+        self,
+        name: str,
+        value: Any,
+        *,
         is_deferred: Optional[Callable[[Any], bool]] = None,
     ) -> None:
         """Check a value; template validation may defer explicitly marked values."""
@@ -163,7 +177,10 @@ class FieldSpec:
             )
         if self.choices is not None:
             matches = (
-                any(_matches_choice(value, choice, is_deferred) for choice in self.choices)
+                any(
+                    _matches_choice(value, choice, is_deferred)
+                    for choice in self.choices
+                )
                 if self.value_type in {"object", "array"}
                 else value in self.choices
             )
@@ -215,9 +232,7 @@ class FieldSpec:
 class RequestSchema:
     """Validate an object payload, including explicitly declared nested fields."""
 
-    def __init__(
-        self, fields: Mapping[str, FieldSpec], allow_extra: bool = False
-    ):
+    def __init__(self, fields: Mapping[str, FieldSpec], allow_extra: bool = False):
         if not isinstance(fields, Mapping):
             raise TypeError("fields must be a mapping")
         if not isinstance(allow_extra, bool):
@@ -260,7 +275,10 @@ class RequestSchema:
         self._validate_fields(content, is_deferred=is_deferred)
 
     def _validate_fields(
-        self, content: Dict, prefix: str = "", *,
+        self,
+        content: Dict,
+        prefix: str = "",
+        *,
         is_deferred: Optional[Callable[[Any], bool]] = None,
     ) -> None:
         if any(not isinstance(name, str) for name in content):
@@ -301,35 +319,38 @@ class RequestSchema:
                 raise TypeError("path requires string keys or integer indices")
             if isinstance(part, int) and part < 0:
                 raise ValueError("path indices must be nonnegative")
-        schema = self
-        spec = None
+        current_schema = self
+        current_field = None
         for part in parts:
-            value_type = "object" if spec is None else spec.value_type
+            value_type = "object" if current_field is None else current_field.value_type
             if isinstance(part, str):
                 if value_type != "object":
                     raise CommandValidationError("output path requires an object")
-                if schema is None:
+                if current_schema is None:
                     return
-                if part not in schema._fields:
-                    if schema._allow_extra:
+                if part not in current_schema._fields:
+                    if current_schema._allow_extra:
                         return
                     raise CommandValidationError("unknown output field: " + part)
-                spec = schema._fields[part]
+                current_field = current_schema._fields[part]
             else:
                 if value_type != "array":
                     raise CommandValidationError("output path requires an array")
-                if spec.max_items is not None and part >= spec.max_items:
-                    raise CommandValidationError("output index exceeds declared max_items")
-                spec = spec.items
-                if spec is None:
+                if (
+                    current_field.max_items is not None
+                    and part >= current_field.max_items
+                ):
+                    raise CommandValidationError(
+                        "output index exceeds declared max_items"
+                    )
+                current_field = current_field.items
+                if current_field is None:
                     return
-            schema = spec.object_schema
+            current_schema = current_field.object_schema
 
     def describe(self) -> Dict[str, Any]:
         return {
             "type": "object",
             "allow_extra": self._allow_extra,
-            "fields": {
-                name: spec.describe() for name, spec in self._fields.items()
-            },
+            "fields": {name: spec.describe() for name, spec in self._fields.items()},
         }

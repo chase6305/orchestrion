@@ -8,6 +8,7 @@ from orchestrion.utils.types import PeekResponseResult
 
 
 class GenericTask(ABC):
+    """Adapter hooks for request execution, status and lifecycle management."""
 
     task_kind = "custom"
     execution_mode = "custom"
@@ -15,16 +16,17 @@ class GenericTask(ABC):
     supports_response_pruning = False
 
     def __init__(self, metadata: Optional[Dict] = None):
-        """
-        Initialize the task instance.
-        """
+        """Snapshot optional JSON metadata for service discovery."""
         if metadata is not None and not isinstance(metadata, dict):
             raise TypeError("metadata must be a dictionary or None")
+        metadata_snapshot = copy.deepcopy({} if metadata is None else metadata)
+        if not isinstance(metadata_snapshot, dict):
+            raise TypeError("copied metadata must be a dictionary")
         try:
-            json.dumps(metadata or {}, allow_nan=False)
+            json.dumps(metadata_snapshot, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValueError("metadata must be JSON-compatible") from exc
-        self._metadata = copy.deepcopy(metadata or {})
+        self._metadata = metadata_snapshot
         self._completion_callback: Optional[Callable[[], None]] = None
 
     def describe(self) -> Dict:
@@ -41,51 +43,24 @@ class GenericTask(ABC):
             "metadata": copy.deepcopy(getattr(self, "_metadata", {})),
         }
 
-    def initialize(self, **kwargs):
-        """
-        Initialize the task with optional keyword arguments.
-        """
-        return None
+    def initialize(self, **kwargs) -> None:
+        """Acquire adapter resources; subclasses may accept configuration keywords."""
 
-    def stop(self):
-        """
-        Stop the task and release resources.
-        """
-        return None
+    def stop(self) -> None:
+        """Release adapter resources."""
 
     @abstractmethod
     def invoke_async(self, request_id: int, content: Optional[Dict] = None) -> bool:
-        """
-        Asynchronously invoke a request.
-
-        Args:
-        request_id (int): The request identifier.
-            content (Optional[Dict]): Optional request content.
-        Returns:
-            bool: True if the request was accepted, False otherwise.
-        """
+        """Submit a request and return whether it was accepted."""
         raise NotImplementedError
 
     @abstractmethod
     def peek_response(self, request_id: int) -> PeekResponseResult:
-        """
-        Peek for the response of a given request.
-
-        Args:
-            request_id (int): The request identifier.
-
-        Returns:
-            PeekResponseResult: The result of the peek operation.
-        """
+        """Read request progress or its response without waiting."""
         raise NotImplementedError
 
     def peek_status(self) -> Optional[Dict]:
-        """
-        Peek for the current status of the task.
-
-        Returns:
-            Optional[Dict]: Status information if available, otherwise None.
-        """
+        """Return status information, or None when status queries are unsupported."""
         return None
 
     def cancel_request(self, request_id: int) -> bool:

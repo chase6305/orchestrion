@@ -26,7 +26,9 @@ def test_scheduler_releases_completed_run_while_another_run_is_active(
                 raise ValueError("device failed")
             return None
 
-        async with WorkflowEngine([Action("hold", hold), Action("finish", finish)]) as engine:
+        async with WorkflowEngine(
+            [Action("hold", hold), Action("finish", finish)]
+        ) as engine:
             long_run = engine.submit(Workflow((Node("hold", "hold"),)))
             try:
                 await asyncio.wait_for(entered.wait(), 1)
@@ -49,5 +51,35 @@ def test_scheduler_releases_completed_run_while_another_run_is_active(
             finally:
                 release.set()
                 await long_run.wait(1)
+
+    asyncio.run(scenario())
+
+
+def test_background_child_context_does_not_retain_a_completed_engine():
+    async def scenario():
+        release = asyncio.Event()
+        background = []
+
+        async def observer():
+            await release.wait()
+
+        async def work(context, inputs):
+            background.append(asyncio.create_task(observer()))
+
+        try:
+            engine = WorkflowEngine([Action("work", work)])
+            reference = weakref.ref(engine)
+            async with engine:
+                run = engine.submit(Workflow((Node("n", "work"),)))
+                await run.wait(1)
+            del run, engine
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            gc.collect()
+            assert reference() is None
+            assert not background[0].done()
+        finally:
+            release.set()
+            await asyncio.gather(*background)
 
     asyncio.run(scenario())

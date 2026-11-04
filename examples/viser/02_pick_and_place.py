@@ -10,30 +10,26 @@ from examples.viser.common import HOME_Q, PICK_Q, PLACE_Q, ViserDemoRuntime, run
 from orchestrion import MoveSyncOption
 
 
-def gripper_after(runtime, action: str, move_end: int) -> int:
-    return runtime.pilot.call_srv_async(
-        "gripper",
-        {"action": action},
-        MoveSyncOption.sync_w_explicit_id(move_end - 1),
-    )
-
-
 def workflow(runtime: ViserDemoRuntime, args) -> None:
     runtime.add_workspace_markers()
-    runtime.set_status("approaching PICK")
-    _, pick_end = runtime.move(PICK_Q, args.steps, args.interval)
-    close_id = gripper_after(runtime, "close", pick_end)
+    runtime.set_status("1 / 4 · Move to PICK, then close")
+    runtime.move(PICK_Q, args.steps, args.interval)
+    close_id = runtime.pilot.call_srv_async(
+        "gripper", {"action": "close"}, MoveSyncOption.sync_w_latest_move()
+    )
     runtime.wait_success(close_id)
     runtime.attach_payload()
 
-    runtime.set_status("lifting payload")
+    runtime.set_status("2 / 4 · Lift with gripper closed")
     runtime.move_and_wait(HOME_Q, args.steps, args.interval)
-    runtime.set_status("carrying payload to PLACE")
-    _, place_end = runtime.move(PLACE_Q, args.steps, args.interval)
-    open_id = gripper_after(runtime, "open", place_end)
+    runtime.set_status("3 / 4 · Move to PLACE, then open")
+    runtime.move(PLACE_Q, args.steps, args.interval)
+    open_id = runtime.pilot.call_srv_async(
+        "gripper", {"action": "open"}, MoveSyncOption.sync_w_latest_move()
+    )
     runtime.wait_success(open_id)
     runtime.release_payload()
-    runtime.set_status("returning HOME")
+    runtime.set_status("4 / 4 · Payload placed; return HOME")
     runtime.move_and_wait(HOME_Q, args.steps, args.interval)
 
 

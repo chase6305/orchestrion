@@ -55,6 +55,33 @@ def test_status_tracks_eviction_pruning_and_shutdown():
         task.stop()
 
 
+def test_stop_only_visits_unfinished_work():
+    cancelled = []
+
+    class ObservedFuture(concurrent.futures.Future):
+        def cancel(self):
+            cancelled.append(self)
+            return super().cancel()
+
+    executor = Executor(ObservedFuture)
+    task = Task()
+    task.initialize(executor=executor)
+    try:
+        for request_id in range(100):
+            assert task.invoke_async(request_id)
+            executor.futures[-1].set_result(None)
+        assert task.invoke_async(100)
+        pending = executor.futures[-1]
+
+        task.stop()
+        assert cancelled == [pending]
+        assert counts(task) == (0, 100, 0, 1)
+        task.stop()
+        assert cancelled == [pending]
+    finally:
+        task.stop()
+
+
 def test_delayed_callbacks_do_not_leave_stale_or_duplicate_counts():
     class DelayedFuture(concurrent.futures.Future):
         def add_done_callback(self, callback):

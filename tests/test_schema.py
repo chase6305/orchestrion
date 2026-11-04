@@ -432,3 +432,77 @@ def test_composite_choices_distinguish_json_booleans_from_numbers(value_type, ch
 )
 def test_composite_choices_compare_numeric_and_array_values_as_json(value_type, choice, value):
     FieldSpec(value_type, choices=[choice]).validate("result", value)
+
+
+@pytest.mark.parametrize("value_type", ["array", "object"])
+def test_choice_construction_preserves_nested_enumeration_constraints(value_type):
+    item = FieldSpec("integer", choices=[1, 2])
+    if value_type == "array":
+        constraints = {"items": item}
+        allowed, disallowed = [1], [3]
+    else:
+        constraints = {"object_schema": RequestSchema({"value": item})}
+        allowed, disallowed = {"value": 1}, {"value": 3}
+
+    spec = FieldSpec(value_type, choices=[allowed], **constraints)
+    spec.validate("result", allowed)
+    # A later candidate must still satisfy the nested field's own enumeration.
+    with pytest.raises(ValueError, match="choices must satisfy"):
+        FieldSpec(value_type, choices=[allowed, disallowed], **constraints)
+    with pytest.raises(CommandValidationError, match="must be one of"):
+        spec.validate("result", disallowed)
+
+
+def test_choice_construction_keeps_isolated_nested_values():
+    choices = [{"pose": [1, 2]}]
+    spec = FieldSpec("object", choices=iter(choices))
+    choices[0]["pose"].append(3)
+    spec.validate("result", {"pose": [1, 2]})
+    with pytest.raises(CommandValidationError, match="must be one of"):
+        spec.validate("result", choices[0])
+
+
+@pytest.mark.parametrize("value_type", ["object", "array"])
+@pytest.mark.parametrize("invalid_value", [object(), float("nan")])
+def test_choice_construction_validates_json_in_the_stored_copy(
+    value_type, invalid_value
+):
+    class CopiedValue(int):
+        def __deepcopy__(self, memo):
+            return invalid_value
+
+    value = CopiedValue(1)
+    choice = {"value": value} if value_type == "object" else [value]
+    with pytest.raises(ValueError, match="choices must be JSON-compatible"):
+        FieldSpec(value_type, choices=[choice])
+
+
+@pytest.mark.parametrize("value_type, value", [("integer", 1), ("array", [])])
+def test_empty_choices_remain_an_empty_enumeration(value_type, value):
+    spec = FieldSpec(value_type, choices=[])
+    assert spec.describe()["choices"] == []
+    with pytest.raises(CommandValidationError, match="must be one of"):
+        spec.validate("result", value)
+
+
+@pytest.mark.parametrize("value_type", ["integer", "object"])
+def test_choice_construction_avoids_quadratic_candidate_comparisons(value_type):
+    comparisons = 0
+
+    class CountedInteger(int):
+        def __eq__(self, other):
+            nonlocal comparisons
+            comparisons += 1
+            return super().__eq__(other)
+
+        __hash__ = int.__hash__
+
+    choices = [
+        CountedInteger(index) if value_type == "integer"
+        else {"value": CountedInteger(index)}
+        for index in range(100)
+    ]
+    spec = FieldSpec(value_type, choices=choices)
+    # Count comparisons rather than imposing a machine-dependent time limit.
+    assert comparisons <= 2 * len(choices)
+    spec.validate("result", choices[-1])

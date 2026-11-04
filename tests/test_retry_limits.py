@@ -2,6 +2,7 @@
 
 import subprocess
 import sys
+from fractions import Fraction
 
 import pytest
 
@@ -34,9 +35,16 @@ def test_integer_and_float_backoff_agree(backoff):
 
 
 @pytest.mark.parametrize("field", ["delay", "backoff", "max_delay"])
-def test_unrepresentable_retry_parameter_has_a_validation_error(field):
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(10**1000, id="huge-int"),
+        pytest.param(Fraction(10**1000, 3), id="huge-fraction"),
+    ],
+)
+def test_unrepresentable_retry_parameter_has_a_validation_error(field, value):
     with pytest.raises(ValueError, match=field):
-        RetryPolicy(**{field: 10 ** 400})
+        RetryPolicy(**{field: value})
 
 
 @pytest.mark.parametrize("max_delay, expected", [(60, 1e-100), (1e-150, 1e-150)])

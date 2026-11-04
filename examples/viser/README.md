@@ -24,33 +24,28 @@ python -m examples.viser --list
 python -m examples.viser 02
 ```
 
-The original module commands and direct commands such as
-`python examples/viser/02_pick_and_place.py` are also supported.
+| Demo | What it shows |
+| --- | --- |
+| 01 Joint Sweep | Smooth joint interpolation and return home |
+| 02 Pick and Place | Move-synchronized close/open actions |
+| 03 Segmented Sync | Actions attached to two segment move IDs |
+| 04 Parallel Motion | Arm and gripper executing concurrently |
+| 05 Request Timeline | Live request states rendered in the GUI |
+| 06 Interactive Controls | GUI buttons for poses and gripper actions |
+| 07 Motion Trail | Animated robot plus its Cartesian end-effector path |
+| 08 Gripper Lab | Interactive position, speed, reversal, and cancellation |
 
-| Demo | What it shows | Command |
-| --- | --- | --- |
-| 01 Joint Sweep | Smooth joint interpolation and return home | `python -m examples.viser 01` |
-| 02 Pick and Place | Move-synchronized close/open actions | `python -m examples.viser 02` |
-| 03 Segmented Sync | Actions attached to two segment move IDs | `python -m examples.viser 03` |
-| 04 Parallel Motion | Arm and gripper executing concurrently | `python -m examples.viser 04` |
-| 05 Request Timeline | Live request states rendered in the GUI | `python -m examples.viser 05` |
-| 06 Interactive Controls | GUI buttons for poses and gripper actions | `python -m examples.viser 06` |
-| 07 Motion Trail | Animated robot plus its Cartesian end-effector path | `python -m examples.viser 07` |
-| 08 Gripper Lab | Interactive position, speed, reversal, and cancellation | `python -m examples.viser 08` |
-
-The repository README includes a real runtime recording of demo 02 at
-`assets/02-pick-and-place.webp`.
+The repository README features a real runtime recording of demo 02. Green marks
+PICK and blue marks PLACE; the yellow payload follows the gripper only after
+closure completes. The panel shows the four phases and peripheral health.
 
 For a quick headless smoke run:
 
 ```bash
-python -m examples.viser.02_pick_and_place \
+python -m examples.viser 02 \
   --startup-delay 0 --duration 0 --no-wait-for-client \
   --steps 2 --interval 0.001
 ```
-
-The legacy command `python -m examples.viser.viser_modular_robot_task` remains
-available and runs the pick-and-place workflow.
 
 ## Gripper Commands
 

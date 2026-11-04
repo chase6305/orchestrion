@@ -4,34 +4,25 @@ import threading
 import time
 from abc import abstractmethod
 from collections import deque
-from dataclasses import dataclass
-from typing import Callable, Deque, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 from orchestrion.tasks.reduced_robot_task_interface import ReducedRobotTaskInterface
 from orchestrion.utils.logger import logger
 
 
-class SubModuleTask(object):
+class SubModuleTask:
 
     def __init__(self, name: str = "", dof_begin: int = 0, n_dof: int = 0):
-        """
-        Initialize a SubModuleTask.
-
-        Args:
-            name (str): Name of the sub-module.
-            dof_begin (int): Starting index of the DOF for this sub-module.
-            n_dof (int): Number of DOF for this sub-module.
-        """
+        """Describe a named slice of the robot's joint vector."""
         self.name: str = name
         self.dof_begin: int = dof_begin
         self.n_dof: int = n_dof
 
 
 @dataclass
-class SubModuleMovementRequest(object):
-    """
-    Data class representing a movement request for the robot.
-    """
+class SubModuleMovementRequest:
+    """A queued trajectory for one independently scheduled component."""
 
     submodule_name: str
     motion_target: List[List[float]]
@@ -41,6 +32,8 @@ class SubModuleMovementRequest(object):
 
 @dataclass(frozen=True)
 class SubModuleState:
+    """Independent joint-group progress, including persistent cancellations."""
+
     name: str
     positions: List[float]
     latest_sent_id: int = -1
@@ -49,11 +42,17 @@ class SubModuleState:
     cancelled_move_ids: tuple = ()
 
 
+@dataclass
+class _SubmoduleSchedule:
+    """Worker-owned queue and cursor for one independent joint group."""
+
+    moves: Deque[SubModuleMovementRequest] = field(default_factory=deque)
+    point_index: int = 0
+    next_step_at: float = 0.0
+
+
 class ModularReducedRobotTask(ReducedRobotTaskInterface):
-    """
-    ModularReducedRobotTask implements a reduced robot task with modular sub-components.
-    It extends the ReducedRobotTaskInterface to support multiple sub-modules.
-    """
+    """Schedule a main joint group and independent submodule trajectories."""
 
     def __init__(
         self,
@@ -65,6 +64,8 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         super().__init__()
         if not self._is_finite_real(interval) or interval <= 0:
             raise ValueError("Scheduler interval must be positive and finite")
+        if interval > threading.TIMEOUT_MAX:
+            raise ValueError("Scheduler interval must not exceed threading.TIMEOUT_MAX")
         if not init_full_q or not self._is_finite_trajectory([init_full_q]):
             raise ValueError("Initial joints must be finite real numbers")
         self._lock = threading.RLock()
@@ -74,23 +75,23 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         self._finished_move_id = -1
         self._latest_sent_id = -1
         self._cancelled_move_ids = set()
+        # Cancellation history only grows; its size versions cached sorted tuples.
+        self._cancelled_move_snapshot: Tuple[int, ...] = ()
         self._motion_epoch = 0
-        self._interval = interval
+        self._interval = float(interval)
 
-        # Queues and threads
         self._main_task_queue = queue.SimpleQueue()
         self._main_task = copy.copy(main_task)
         self._bg_thread = None
         self._stop_event = threading.Event()
 
-        # Sub-module management
         self._sub_task_queue = queue.SimpleQueue()
         self._sub_task_map: Dict[str, SubModuleTask] = dict()
-        for elem in submodule_tasks:
-            if elem.name in self._sub_task_map:
-                raise ValueError("Duplicate submodule name: {}".format(elem.name))
-            self._validate_module(elem, len(init_full_q))
-            self._sub_task_map[elem.name] = copy.copy(elem)
+        for submodule in submodule_tasks:
+            if submodule.name in self._sub_task_map:
+                raise ValueError("Duplicate submodule name: {}".format(submodule.name))
+            self._validate_module(submodule, len(init_full_q))
+            self._sub_task_map[submodule.name] = copy.copy(submodule)
         self._validate_module(main_task, len(init_full_q))
         if main_task.name in self._sub_task_map:
             raise ValueError("Main task and submodule names must be unique")
@@ -112,7 +113,10 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         self._submodule_sent_ids = {name: -1 for name in self._sub_task_map}
         self._submodule_finished_ids = {name: -1 for name in self._sub_task_map}
         self._submodule_active_ids = {name: None for name in self._sub_task_map}
-        self._cancelled_submodule_moves = set()
+        self._cancelled_submodule_moves = {name: set() for name in self._sub_task_map}
+        self._cancelled_submodule_snapshots: Dict[str, Tuple[int, ...]] = dict.fromkeys(
+            self._sub_task_map, ()
+        )
         self._state_change_callback: Optional[Callable[[], None]] = None
 
     @staticmethod
@@ -151,9 +155,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
                 logger.exception("Robot state-change callback failed")
 
     def initialize(self):
-        """
-        Initialize and start the background thread for processing movement requests.
-        """
+        """Start the motion-processing worker."""
         with self._lifecycle_lock:
             self._initialize_locked()
 
@@ -176,9 +178,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
             raise
 
     def stop(self, timeout: float = 5.0):
-        """
-        Stop the background thread and wait for it to finish.
-        """
+        """Cancel unfinished motion and wait for the worker to stop."""
         if threading.current_thread() is self._bg_thread:
             self._stop_locked(timeout)
             return
@@ -188,21 +188,29 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
     def _stop_locked(self, timeout: float) -> None:
         if not self._is_finite_real(timeout) or timeout < 0:
             raise ValueError("timeout must be non-negative and finite")
+        if timeout > threading.TIMEOUT_MAX:
+            raise ValueError("timeout must not exceed threading.TIMEOUT_MAX")
+        timeout = float(timeout)
         with self._state_condition:
             was_stopped = self._stop_event.is_set()
             self._stop_event.set()
             self._motion_epoch += 1
-            self._cancelled_move_ids.update(range(
-                self._finished_move_id + 1, self._latest_sent_id + 1
-            ))
+            self._cancelled_move_ids.update(
+                range(self._finished_move_id + 1, self._latest_sent_id + 1)
+            )
             for name in self._sub_task_map:
-                for move_id in range(
-                    self._submodule_finished_ids[name] + 1,
-                    self._submodule_sent_ids[name] + 1,
-                ):
-                    self._cancelled_submodule_moves.add((name, move_id))
+                self._cancelled_submodule_moves[name].update(
+                    range(
+                        self._submodule_finished_ids[name] + 1,
+                        self._submodule_sent_ids[name] + 1,
+                    )
+                )
                 self._submodule_active_ids[name] = None
             self._state_condition.notify_all()
+        # Admission is closed. Discard queued work before callbacks or joins can
+        # fail, so a later explicit restart cannot replay cancelled trajectories.
+        self._drain_queue(self._main_task_queue)
+        self._drain_queue(self._sub_task_queue)
         if not was_stopped:
             self._notify_state_change()
         if (
@@ -213,8 +221,6 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
             self._bg_thread.join(timeout=timeout)
             if self._bg_thread.is_alive():
                 raise TimeoutError("Robot background thread did not stop in time")
-        self._drain_queue(self._main_task_queue)
-        self._drain_queue(self._sub_task_queue)
 
     @staticmethod
     def _drain_queue(task_queue: queue.SimpleQueue) -> None:
@@ -230,29 +236,24 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         interval: float = 0.01,
         endpoint_index: Optional[List[int]] = None,
     ) -> int:
-        """
-        Move the robot along a joint trajectory asynchronously.
-
-        Args:
-            motion_target (List[List[float]]): Target joint positions for the trajectory.
-            interval (float): Time interval between points.
-            endpoint_index (Optional[List[int]]): Segment endpoints.
-
-        Returns:
-            int: Move ID if the request was accepted, -1 otherwise.
-        """
+        """Enqueue a trajectory; return its first move ID or -1 on rejection."""
         if not self._is_finite_real(interval) or interval <= 0:
             return -1
+        if interval > threading.TIMEOUT_MAX:
+            return -1
+        interval = float(interval)
         if not isinstance(motion_target, (list, tuple)) or not motion_target:
             return -1
         with self._lock:
-            epoch = self._motion_epoch
+            submission_epoch = self._motion_epoch
         motion_target = copy.deepcopy(motion_target)
-        assigned_endpoint_idx = (
-            [len(motion_target)] if endpoint_index is None else copy.deepcopy(endpoint_index)
+        segment_endpoints = (
+            [len(motion_target)]
+            if endpoint_index is None
+            else copy.deepcopy(endpoint_index)
         )
         if not self._check_assigned_endpoint_index(
-            motion_target, assigned_endpoint_idx
+            motion_target, segment_endpoints
         ):
             return -1
 
@@ -261,19 +262,20 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         if any(len(point) != self._main_task.n_dof for point in motion_target):
             return -1
         with self._lock:
-            if self._stop_event.is_set() or epoch != self._motion_epoch:
+            if self._stop_event.is_set() or submission_epoch != self._motion_epoch:
                 return -1
-            move_id_begin = self._latest_sent_id + 1
+            first_move_id = self._latest_sent_id + 1
             request = self.MovementRequest(
                 motion_target=motion_target,
                 interval=interval,
-                motion_id_begin=move_id_begin,
-                endpoint_index=assigned_endpoint_idx,
+                motion_id_begin=first_move_id,
+                endpoint_index=segment_endpoints,
             )
             self._main_task_queue.put(request)
-            self._latest_sent_id += len(assigned_endpoint_idx)
+            self._latest_sent_id += len(segment_endpoints)
+            self._state_condition.notify_all()
         self._notify_state_change()
-        return move_id_begin
+        return first_move_id
 
     def move_submodule_async(
         self,
@@ -281,17 +283,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         motion_target: List[List[float]],
         interval: float = 0.01,
     ) -> bool:
-        """
-        Move a sub-module asynchronously.
-
-        Args:
-            submodule_name (str): Name of the sub-module to move.
-            motion_target (List[List[float]]): Target joint positions for the sub-module.
-            interval (float): Time interval between points.
-
-        Returns:
-            bool: True if the request was accepted, False otherwise.
-        """
+        """Compatibility wrapper returning whether a submodule move was accepted."""
         return self.move_submodule_trajectory_async(
             submodule_name, motion_target, interval
         ) >= 0
@@ -304,6 +296,9 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
     ) -> int:
         if not self._is_finite_real(interval) or interval <= 0:
             return -1
+        if interval > threading.TIMEOUT_MAX:
+            return -1
+        interval = float(interval)
         module = self._sub_task_map.get(submodule_name)
         if (
             module is None
@@ -312,14 +307,14 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         ):
             return -1
         with self._lock:
-            epoch = self._motion_epoch
+            submission_epoch = self._motion_epoch
         motion_target = copy.deepcopy(motion_target)
         if not motion_target or not self._is_finite_trajectory(motion_target):
             return -1
         if any(len(point) != module.n_dof for point in motion_target):
             return -1
         with self._state_condition:
-            if self._stop_event.is_set() or epoch != self._motion_epoch:
+            if self._stop_event.is_set() or submission_epoch != self._motion_epoch:
                 return -1
             move_id = self._submodule_sent_ids[submodule_name] + 1
             self._submodule_sent_ids[submodule_name] = move_id
@@ -345,8 +340,11 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
             return {}
         if not self._is_finite_real(interval) or interval <= 0:
             return {}
+        if interval > threading.TIMEOUT_MAX:
+            return {}
+        interval = float(interval)
         with self._lock:
-            epoch = self._motion_epoch
+            submission_epoch = self._motion_epoch
         # Snapshot the whole batch before assigning any move IDs. This preserves
         # all-or-nothing submission even if a caller mutates its input concurrently
         # or a custom container fails during copying.
@@ -366,7 +364,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
                 return {}
 
         with self._state_condition:
-            if self._stop_event.is_set() or epoch != self._motion_epoch:
+            if self._stop_event.is_set() or submission_epoch != self._motion_epoch:
                 return {}
             move_ids = {
                 submodule_name: self._submodule_sent_ids[submodule_name] + 1
@@ -392,20 +390,19 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         if module is None:
             raise KeyError("Unknown submodule: {}".format(submodule_name))
         with self._lock:
+            cancelled_moves = self._cancelled_submodule_moves[submodule_name]
+            cancelled_snapshot = self._cancelled_submodule_snapshots[submodule_name]
+            if len(cancelled_snapshot) != len(cancelled_moves):
+                cancelled_snapshot = tuple(sorted(cancelled_moves))
+                self._cancelled_submodule_snapshots[submodule_name] = cancelled_snapshot
             begin = module.dof_begin
             return SubModuleState(
                 name=submodule_name,
-                positions=self._current_full_q[begin : begin + module.n_dof].copy(),
+                positions=self._current_full_q[begin : begin + module.n_dof],
                 latest_sent_id=self._submodule_sent_ids[submodule_name],
                 latest_finished_id=self._submodule_finished_ids[submodule_name],
                 active_move_id=self._submodule_active_ids[submodule_name],
-                cancelled_move_ids=tuple(
-                    sorted(
-                        move_id
-                        for name, move_id in self._cancelled_submodule_moves
-                        if name == submodule_name
-                    )
-                ),
+                cancelled_move_ids=cancelled_snapshot,
             )
 
     def query_submodule_states(
@@ -445,7 +442,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
                     )
                 )
             while True:
-                if (submodule_name, move_id) in self._cancelled_submodule_moves:
+                if move_id in self._cancelled_submodule_moves[submodule_name]:
                     return False
                 if self._submodule_finished_ids[submodule_name] >= move_id:
                     return True
@@ -454,6 +451,8 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     return False
+                if remaining is not None:
+                    remaining = min(remaining, threading.TIMEOUT_MAX)
                 self._state_condition.wait(remaining)
 
     def wait_submodule_moves(
@@ -485,7 +484,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
                     )
             while True:
                 if any(
-                    (submodule_name, move_id) in self._cancelled_submodule_moves
+                    move_id in self._cancelled_submodule_moves[submodule_name]
                     for submodule_name, move_id in requested
                 ):
                     return False
@@ -499,6 +498,8 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     return False
+                if remaining is not None:
+                    remaining = min(remaining, threading.TIMEOUT_MAX)
                 self._state_condition.wait(remaining)
 
     @staticmethod
@@ -513,13 +514,13 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         with self._state_condition:
             if submodule_name not in self._sub_task_map:
                 raise KeyError("Unknown submodule: {}".format(submodule_name))
-            if (submodule_name, move_id) in self._cancelled_submodule_moves:
+            if move_id in self._cancelled_submodule_moves[submodule_name]:
                 return False
             if move_id > self._submodule_sent_ids[submodule_name]:
                 return False
             if move_id <= self._submodule_finished_ids[submodule_name]:
                 return False
-            self._cancelled_submodule_moves.add((submodule_name, move_id))
+            self._cancelled_submodule_moves[submodule_name].add(move_id)
             if self._submodule_active_ids[submodule_name] == move_id:
                 self._submodule_active_ids[submodule_name] = None
             self._state_condition.notify_all()
@@ -541,15 +542,15 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
                     raise KeyError("Unknown submodule: {}".format(submodule_name))
             results = {}
             for submodule_name, move_id in requested:
-                move_key = (submodule_name, move_id)
+                cancelled_moves = self._cancelled_submodule_moves[submodule_name]
                 can_cancel = (
-                    move_key not in self._cancelled_submodule_moves
+                    move_id not in cancelled_moves
                     and move_id <= self._submodule_sent_ids[submodule_name]
                     and move_id > self._submodule_finished_ids[submodule_name]
                 )
                 results[submodule_name] = can_cancel
                 if can_cancel:
-                    self._cancelled_submodule_moves.add(move_key)
+                    cancelled_moves.add(move_id)
                     if self._submodule_active_ids[submodule_name] == move_id:
                         self._submodule_active_ids[submodule_name] = None
             changed = any(results.values())
@@ -560,312 +561,215 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         return results
 
     def query_state(self) -> Optional[ReducedRobotTaskInterface.ReducedRobotState]:
-        """
-        Query the current state of the robot.
-
-        Returns:
-            Optional[ReducedRobotTaskInterface.ReducedRobotState]: The current robot state.
-        """
-        state: Optional[ReducedRobotTaskInterface.ReducedRobotState] = None
+        """Return a snapshot of joints and main movement IDs."""
         with self._lock:
-            state = self.ReducedRobotState(
+            if len(self._cancelled_move_snapshot) != len(self._cancelled_move_ids):
+                self._cancelled_move_snapshot = tuple(sorted(self._cancelled_move_ids))
+            return self.ReducedRobotState(
                 jps=self._current_full_q.copy(),
                 latest_finished_id=self._finished_move_id,
                 latest_sent_id=self._latest_sent_id,
-                cancelled_move_ids=tuple(sorted(self._cancelled_move_ids)),
+                cancelled_move_ids=self._cancelled_move_snapshot,
             )
-        return state
 
     def wait_move(self, time_out: float = -1, interval: float = 0.05) -> bool:
-        """
-        Wait for all robot movements to finish or until timeout.
-
-        Args:
-            time_out (float): Maximum time to wait in seconds. If negative, wait indefinitely. Default is -1.
-            interval (float): Polling interval in seconds. Default is 0.05s.
-
-        Returns:
-            bool: True if movements finished before timeout, False otherwise.
-        """
+        """Wait for the latest main move; negative time_out means no deadline."""
         if not self._is_finite_real(time_out):
             raise ValueError("time_out must be finite")
         if not self._is_finite_real(interval) or interval <= 0:
             raise ValueError("interval must be positive and finite")
-        sent_id = self.query_state().latest_sent_id
+        interval = min(float(interval), threading.TIMEOUT_MAX)
+        with self._lock:
+            target_move_id = self._latest_sent_id
         deadline = None if time_out < 0 else time.monotonic() + time_out
         with self._state_condition:
             while True:
-                if sent_id in self._cancelled_move_ids:
+                if target_move_id in self._cancelled_move_ids:
                     return False
-                if self._finished_move_id >= sent_id:
+                if self._finished_move_id >= target_move_id:
                     return True
                 if self._stop_event.is_set():
                     return False
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     return False
-                wait_interval = interval if remaining is None else min(interval, remaining)
+                wait_interval = (
+                    interval if remaining is None else min(interval, remaining)
+                )
                 self._state_condition.wait(wait_interval)
 
     @abstractmethod
     def _on_robot_state_bg_thread(self, jps: List[float], jps_move_id: int):
-        """
-        Callback for updating the main robot state in the background thread.
-
-        Args:
-            jps (List[float]): Current joint positions.
-            jps_move_id (int): Move ID associated with the joint positions.
-        """
+        """Render or forward a joint update from the motion worker."""
         raise NotImplementedError
 
     @abstractmethod
     def _on_initial_state_bg_thread(self, jps: List[float]):
-        """
-        Callback for initial state update of the main robot in the background thread.
-
-        Args:
-            jps (List[float]): Current joint positions.
-        """
+        """Publish the initial joints when the motion worker starts."""
         raise NotImplementedError
 
-    def _bg_thread_loop(self):
-        """
-        Main loop of the background thread.
-        Responsible for executing movement requests and updating robot state.
-        """
-        # Local copy of joint positions and finished move id
+    def _admit_submodule_moves(
+        self, schedules: Dict[str, _SubmoduleSchedule]
+    ) -> None:
+        # The shared submission lock keeps a validated batch visible to all
+        # components in the same tick. No intermediate request list is needed.
         with self._lock:
-            current_full_jps: List[float] = self._current_full_q.copy()
-            finished_move_id: int = self._finished_move_id
-        self._on_initial_state_bg_thread(current_full_jps)
+            while True:
+                try:
+                    request = self._sub_task_queue.get_nowait()
+                except queue.Empty:
+                    return
+                if request is None:
+                    return
+                schedule = schedules.get(request.submodule_name)
+                if (
+                    schedule is None
+                    or request.move_id
+                    in self._cancelled_submodule_moves[request.submodule_name]
+                ):
+                    continue
+                if not schedule.moves:
+                    schedule.point_index = 0
+                    schedule.next_step_at = time.monotonic()
+                schedule.moves.append(request)
 
-        # State for the current movement
-        current_move: Optional[self.MovementRequest] = None
-        idx_in_current_move: int = -1
-        next_endpoint2check: int = 0
-        next_finished_move_id: int = -1
-        next_main_step_at: float = 0.0
+    def _advance_submodule_moves(
+        self,
+        schedules: Dict[str, _SubmoduleSchedule],
+        next_joint_positions: List[float],
+    ) -> Tuple[bool, bool]:
+        """Stage due points and report joint updates and completed requests."""
+        joints_updated = False
+        move_completed = False
+        for submodule_name, schedule in schedules.items():
+            if not schedule.moves:
+                continue
+            request = schedule.moves[0]
+            with self._lock:
+                cancelled = (
+                    request.move_id in self._cancelled_submodule_moves[submodule_name]
+                )
+                if not cancelled:
+                    self._submodule_active_ids[submodule_name] = request.move_id
+            if cancelled:
+                schedule.moves.popleft()
+                schedule.point_index = 0
+                schedule.next_step_at = time.monotonic()
+                continue
+            if time.monotonic() < schedule.next_step_at:
+                continue
+            if schedule.point_index < len(request.motion_target):
+                module = self._sub_task_map[submodule_name]
+                begin = module.dof_begin
+                next_joint_positions[begin : begin + module.n_dof] = (
+                    request.motion_target[schedule.point_index]
+                )
+                schedule.point_index += 1
+                schedule.next_step_at = time.monotonic() + max(
+                    request.interval, self._interval
+                )
+                joints_updated = True
+            else:
+                # The final point is already published; keep its interval before
+                # announcing completion.
+                schedule.moves.popleft()
+                schedule.point_index = 0
+                schedule.next_step_at = time.monotonic()
+                with self._state_condition:
+                    self._submodule_finished_ids[submodule_name] = max(
+                        self._submodule_finished_ids[submodule_name], request.move_id
+                    )
+                    self._submodule_active_ids[submodule_name] = None
+                    self._state_condition.notify_all()
+                move_completed = True
+        return joints_updated, move_completed
 
-        @dataclass
-        class SubTaskState(object):
-            idx_in_current_move: int = -1
-            next_step_at: float = 0.0
+    def _bg_thread_loop(self) -> None:
+        try:
+            self._process_motion()
+        except Exception:
+            try:
+                logger.exception("Robot motion worker failed")
+            finally:
+                # Stop software scheduling and release waiters. The device
+                # adapter remains responsible for confirming physical shutdown.
+                self._stop_locked(0.0)
 
-        # Init for local queue
-        local_submodule_task_queue: Dict[str, Deque[SubModuleMovementRequest]] = dict()
-        local_submodule_task_state: Dict[str, SubTaskState] = dict()
-        for task_name in self._sub_task_map.keys():
-            local_submodule_task_queue[task_name] = deque()
-            local_submodule_task_state[task_name] = SubTaskState(idx_in_current_move=-1)
-        submodule_current_move = None
+    def _process_motion(self) -> None:
+        """Advance due points and publish the combined main/submodule snapshot."""
+        with self._lock:
+            current_joint_positions = self._current_full_q.copy()
+            finished_move_id = self._finished_move_id
+        self._on_initial_state_bg_thread(current_joint_positions)
 
-        # Execution loop
+        current_move: Optional[ReducedRobotTaskInterface.MovementRequest] = None
+        main_point_index = 0
+        next_endpoint_index = 0
+        next_main_step_at = 0.0
+        schedules = {name: _SubmoduleSchedule() for name in self._sub_task_map}
+
         while not self._stop_event.is_set():
-            # 1. If no current move, try to get a new move from the queue
             if current_move is None:
                 try:
-                    elem: self.MovementRequest = self._main_task_queue.get_nowait()
-                    current_move = elem
-                    idx_in_current_move = 0
-                    next_endpoint2check = 0
-                    next_finished_move_id = elem.motion_id_begin
+                    current_move = self._main_task_queue.get_nowait()
+                    main_point_index = 0
+                    next_endpoint_index = 0
                     next_main_step_at = time.monotonic()
-                    assert self._check_assigned_endpoint_index(
-                        elem.motion_target, elem.endpoint_index
-                    )
                 except queue.Empty:
                     pass
+            self._admit_submodule_moves(schedules)
+            next_joint_positions = current_joint_positions.copy()
+            submodule_updated, submodule_completed = self._advance_submodule_moves(
+                schedules, next_joint_positions
+            )
 
-            # 2. get tasks from _task_queue_submodules
-            pop_submodule_tasks: List[SubModuleMovementRequest] = list()
-            # Submissions use the same lock, so a validated batch becomes visible
-            # to the scheduler all at once rather than one arm at a time.
-            with self._lock:
-                while True:
-                    subtask_elem: Optional[SubModuleMovementRequest] = None
-                    try:
-                        subtask_elem = self._sub_task_queue.get_nowait()
-                    except queue.Empty:
-                        subtask_elem = None
-
-                    if subtask_elem is not None:
-                        pop_submodule_tasks.append(subtask_elem)
-                    else:
-                        break
-
-            # 3. push into local map
-            for i in range(len(pop_submodule_tasks)):
-                # Check instance
-                inst_i: SubModuleMovementRequest = pop_submodule_tasks[i]
-                if inst_i.submodule_name not in local_submodule_task_queue:
-                    continue
-                with self._lock:
-                    if (
-                        inst_i.submodule_name,
-                        inst_i.move_id,
-                    ) in self._cancelled_submodule_moves:
-                        continue
-
-                # Init the submodule task status
-                if len(local_submodule_task_queue[inst_i.submodule_name]) == 0:
-                    local_submodule_task_state[inst_i.submodule_name] = SubTaskState(
-                        idx_in_current_move=0, next_step_at=time.monotonic()
-                    )
-
-                # Push the request
-                local_submodule_task_queue[inst_i.submodule_name].append(inst_i)
-
-            # 4. reset the submodule task state
-            next_full_jps = current_full_jps.copy()
-            submodule_updated = False
-            submodule_completed = False
-
-            for submodule_name in local_submodule_task_queue.keys():
-                # Extract the movement of submodule
-                assert (
-                    submodule_name in local_submodule_task_queue
-                ), "Submodule name not found in local task queue."
-                submodule_current_move: Optional[SubModuleMovementRequest] = None
-                if len(local_submodule_task_queue[submodule_name]) > 0:
-                    submodule_current_move = local_submodule_task_queue[submodule_name][
-                        0
-                    ]
-
-                # Continue if submodule has no current move
-                if submodule_current_move is None:
-                    continue
-                with self._lock:
-                    cancelled = (
-                        (submodule_name, submodule_current_move.move_id)
-                        in self._cancelled_submodule_moves
-                    )
-                if cancelled:
-                    local_submodule_task_queue[submodule_name].popleft()
-                    local_submodule_task_state[submodule_name] = SubTaskState(
-                        idx_in_current_move=(
-                            0
-                            if local_submodule_task_queue[submodule_name]
-                            else -1
-                        ),
-                        next_step_at=time.monotonic(),
-                    )
-                    continue
-
-                with self._lock:
-                    self._submodule_active_ids[submodule_name] = (
-                        submodule_current_move.move_id
-                    )
-
-                # Update jps for current module
-                submodule_task_config = self._sub_task_map[submodule_name]
-                idx_in_current_submodule_move = local_submodule_task_state[
-                    submodule_name
-                ].idx_in_current_move
-                if (
-                    time.monotonic()
-                    < local_submodule_task_state[submodule_name].next_step_at
-                ):
-                    continue
-                assert (
-                    idx_in_current_submodule_move >= 0
-                ), "Submodule task index is invalid."
-                if idx_in_current_submodule_move < len(
-                    submodule_current_move.motion_target
-                ):
-                    # Get jps
-                    current_jps_submodule = submodule_current_move.motion_target[
-                        idx_in_current_submodule_move
-                    ]
-                    submodule_updated = True
-
-                    # Update jps
-                    for k in range(submodule_task_config.n_dof):
-                        next_full_jps[submodule_task_config.dof_begin + k] = (
-                            current_jps_submodule[k]
-                        )
-
-                    # Update index
-                    next_idx_in_current_submodule_move = (
-                        idx_in_current_submodule_move + 1
-                    )
-                    local_submodule_task_state[submodule_name] = SubTaskState(
-                        idx_in_current_move=next_idx_in_current_submodule_move,
-                        next_step_at=time.monotonic()
-                        + max(submodule_current_move.interval, self._interval),
-                    )
-                else:
-                    # Pop this one from front
-                    local_submodule_task_queue[submodule_name].popleft()
-                    with self._state_condition:
-                        self._submodule_finished_ids[submodule_name] = max(
-                            self._submodule_finished_ids[submodule_name],
-                            submodule_current_move.move_id,
-                        )
-                        self._submodule_active_ids[submodule_name] = None
-                        self._state_condition.notify_all()
-                    submodule_completed = True
-                    if len(local_submodule_task_queue[submodule_name]) > 0:
-                        local_submodule_task_state[submodule_name] = SubTaskState(
-                            idx_in_current_move=0, next_step_at=time.monotonic()
-                        )
-                    else:
-                        local_submodule_task_state[submodule_name] = SubTaskState(
-                            idx_in_current_move=-1
-                        )
-
-            # 5. Reset of main task state
             main_updated = False
             if current_move is not None:
-                assert idx_in_current_move >= 0 and next_endpoint2check >= 0
-                if (
-                    idx_in_current_move < len(current_move.motion_target)
-                    and time.monotonic() >= next_main_step_at
-                ):
-                    # Update joint positions for this step
-                    current_jps_main = current_move.motion_target[idx_in_current_move]
-
-                    # Update jps
-                    for k in range(self._main_task.n_dof):
-                        next_full_jps[self._main_task.dof_begin + k] = current_jps_main[
-                            k
-                        ]
-
-                    # Check if this point reaches a segment endpoint
-                    if (
-                        idx_in_current_move + 1
-                        >= current_move.endpoint_index[next_endpoint2check]
-                    ):
-                        assert next_finished_move_id >= finished_move_id
-                        finished_move_id = next_finished_move_id
-                        next_endpoint2check += 1
-                        next_finished_move_id += 1
-
-                    self._on_robot_state_bg_thread(next_full_jps, finished_move_id)
+                if main_point_index >= len(current_move.motion_target):
+                    current_move = None
+                elif time.monotonic() >= next_main_step_at:
+                    begin = self._main_task.dof_begin
+                    next_joint_positions[begin : begin + self._main_task.n_dof] = (
+                        current_move.motion_target[main_point_index]
+                    )
+                    # Endpoints count points from one; the cursor is zero-based.
+                    if main_point_index + 1 == current_move.endpoint_index[
+                        next_endpoint_index
+                    ]:
+                        finished_move_id = (
+                            current_move.motion_id_begin + next_endpoint_index
+                        )
+                        next_endpoint_index += 1
+                    main_point_index += 1
                     main_updated = True
 
-                    # Move to next point in trajectory
-                    idx_in_current_move += 1
+            if main_updated or submodule_updated:
+                self._on_robot_state_bg_thread(next_joint_positions, finished_move_id)
+                if main_updated:
+                    # Preserve the full point interval after the device callback.
                     next_main_step_at = time.monotonic() + max(
                         current_move.interval, self._interval
                     )
 
-                elif idx_in_current_move >= len(current_move.motion_target):
-                    # Movement finished, reset state for next movement
-                    idx_in_current_move = -1
-                    current_move = None
-            # 6. Update for submodule only move
-            if submodule_updated and not main_updated:
-                self._on_robot_state_bg_thread(next_full_jps, finished_move_id)
-
-            # Update shared state (non-blocking)
-            current_full_jps = next_full_jps
+            current_joint_positions = next_joint_positions
             with self._state_condition:
-                self._current_full_q = next_full_jps
+                self._current_full_q = next_joint_positions
                 self._finished_move_id = finished_move_id
                 if main_updated or submodule_updated:
                     self._state_condition.notify_all()
             if main_updated or submodule_updated or submodule_completed:
                 self._notify_state_change()
 
-            # Sleep
-            self._stop_event.wait(self._interval)
+            if current_move is None and not any(
+                schedule.moves for schedule in schedules.values()
+            ):
+                # Share the submission lock so the empty check cannot miss a wake.
+                with self._state_condition:
+                    if (
+                        self._main_task_queue.empty()
+                        and self._sub_task_queue.empty()
+                        and not self._stop_event.is_set()
+                    ):
+                        self._state_condition.wait()
+            else:
+                self._stop_event.wait(self._interval)

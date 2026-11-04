@@ -3,12 +3,19 @@
 import math
 from dataclasses import dataclass, field
 from enum import Enum
+from json import dumps
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
+from urllib.parse import quote
 
 
 def _name(value: str, label: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("{} must be a nonempty string".format(label))
+
+
+def _operation_id(run_id: str, node_id: str) -> str:
+    """Encode one node component so nested paths cannot alias literal slashes."""
+    return run_id + "/" + quote(node_id, safe="", errors="surrogatepass")
 
 
 def _positive_int(value: int, label: str) -> None:
@@ -70,28 +77,81 @@ class OutputRef:
                 raise ValueError("output indices must be nonnegative")
 
 
-def _snapshot(value: Any, *, references: bool = False) -> Any:
+def _snapshot(
+    value: Any, *, references: bool = False, max_bytes: Optional[int] = None
+) -> Any:
     """Copy finite JSON without deepcopy hooks; reject cycles and nonfinite data."""
-    if value is None or isinstance(value, (str, bool, int)):
+    if max_bytes is None and (value is None or isinstance(value, (str, bool, int))):
         return value
     ancestors = set()
+    remaining = max_bytes
+
+    if max_bytes is not None:
+
+        def charge(amount: int) -> None:
+            nonlocal remaining
+            if remaining is not None:
+                remaining -= amount
+                if remaining < 0:
+                    raise PayloadLimitError(
+                        "JSON payload exceeds {} bytes".format(max_bytes)
+                    )
+
+        def scalar(item: Any) -> None:
+            if isinstance(item, str):
+                # Reject huge strings before allocating their escaped representation.
+                charge(len(item) + 2)
+                charge(len(dumps(item, ensure_ascii=True)) - len(item) - 2)
+            elif item is None or item is True:
+                charge(4)  # null / true
+            elif item is False:
+                charge(5)
+            elif isinstance(item, int):
+                # A lower decimal-digit bound avoids converting enormous integers.
+                # 0.30102 is a lower bound for log10(2); bit_length covers both signs.
+                minimum_size = max(
+                    1, (int.bit_length(item) - 1) * 30102 // 100000 + 1
+                )
+                if int.__lt__(item, 0):
+                    minimum_size += 1
+                charge(minimum_size)
+                # JSON uses the base numeric repr, bypassing subclass overrides.
+                charge(len(int.__repr__(item)) - minimum_size)
+            else:
+                # visit() only passes finite floats through this branch.
+                charge(len(float.__repr__(item)))
 
     def visit(item: Any) -> Any:
         if item is None or isinstance(item, (str, bool, int)):
+            if remaining is not None:
+                scalar(item)
             return item
         if isinstance(item, float) and math.isfinite(item):
+            if remaining is not None:
+                scalar(item)
             return item
         if references and isinstance(item, OutputRef):
+            if remaining is not None:
+                visit({"$output": {"node_id": item.node_id, "path": list(item.path)}})
             return item
         if isinstance(item, (dict, list, tuple)):
             if id(item) in ancestors:
                 raise ValueError("workflow data must not contain cycles")
             ancestors.add(id(item))
             try:
+                if remaining is not None:
+                    charge(2 + max(0, len(item) - 1))
                 if isinstance(item, dict):
                     if any(not isinstance(key, str) for key in item):
                         raise TypeError("workflow data requires string dictionary keys")
-                    return {key: visit(child) for key, child in item.items()}
+                    if remaining is None:
+                        return {key: visit(child) for key, child in item.items()}
+                    result = {}
+                    for key, child in item.items():
+                        scalar(key)
+                        charge(1)
+                        result[key] = visit(child)
+                    return result
                 return [visit(child) for child in item]
             finally:
                 ancestors.remove(id(item))
@@ -114,6 +174,7 @@ class Node:
     claims: Tuple[ResourceClaim, ...] = ()
     priority: int = 0
     timeout: Optional[float] = None
+    stop_timeout: Optional[float] = None
 
     def __post_init__(self) -> None:
         _name(self.node_id, "node ID")
@@ -134,6 +195,7 @@ class Node:
         if isinstance(self.priority, bool) or not isinstance(self.priority, int):
             raise TypeError("priority must be an integer")
         _timeout(self.timeout)
+        _timeout(self.stop_timeout)
 
 
 @dataclass(frozen=True)
@@ -198,6 +260,8 @@ class NodeResult:
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     feedback_dropped: int = 0
+    checkpoint: Any = None
+    action_version: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -228,3 +292,7 @@ class ExecutionUncertain(Exception):
 
 class ActionOutputError(ValueError):
     """A completed action returned data that violates its declared output schema."""
+
+
+class PayloadLimitError(ValueError):
+    """A JSON input, output or feedback report exceeds its configured byte budget."""

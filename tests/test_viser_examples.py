@@ -196,6 +196,33 @@ def test_runtime_waits_until_first_client_connects():
     assert "client connected" in runtime._demo_status.content
 
 
+def test_runtime_detects_client_connected_while_registering_callback():
+    class FakeServer:
+        clients = {}
+
+        def get_clients(self):
+            return self.clients
+
+        def on_client_connect(self, callback):
+            # The connect event occurred before the callback became active.
+            self.clients = {0: object()}
+            return callback
+
+    runtime = object.__new__(ViserDemoRuntime)
+    runtime.server = FakeServer()
+    runtime._monitor_stop = threading.Event()
+    runtime._demo_status = type("Status", (), {"content": ""})()
+    waiter = threading.Thread(target=runtime.wait_for_client)
+    waiter.start()
+    try:
+        waiter.join(timeout=0.5)
+        assert not waiter.is_alive()
+        assert "client connected" in runtime._demo_status.content
+    finally:
+        runtime._monitor_stop.set()
+        waiter.join(timeout=0.5)
+
+
 class VisibleStub:
     def __init__(self, visible):
         self.visible = visible
@@ -369,6 +396,117 @@ def test_cancel_rejects_unknown_and_completed_requests():
             assert time.monotonic() < deadline
             time.sleep(0.005)
         assert not task.cancel_request(0)
+
+
+def test_cancel_during_gripper_preparation_prevents_motion():
+    preparing, release, completed = (
+        threading.Event(), threading.Event(), threading.Event()
+    )
+
+    class PreparingRobot(RobotStub):
+        def query_submodule_state(self, name):
+            state = super().query_submodule_state(name)
+            if not preparing.is_set():
+                preparing.set()
+                assert release.wait(2)
+            return state
+
+    robot = PreparingRobot()
+    task = ViserGripperTask(robot)
+    task.set_completion_callback(completed.set)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        try:
+            assert task.invoke_async(0, {"action": "close"})
+            assert preparing.wait(1)
+            assert task.cancel_request(0)
+            release.set()
+            assert completed.wait(1)
+            response = task.peek_response(0)
+            assert response.result_type is PeekResponseResultType.ErrorUnknown
+            assert "cancelled" in response.error.lower()
+            assert robot.requests == []
+
+            completed.clear()
+            assert task.invoke_async(1, {"action": "open"})
+            assert completed.wait(1)
+            response = task.peek_response(1)
+            assert response.result_type is PeekResponseResultType.ResponseFound
+            assert [request[1][-1] for request in robot.requests] == [[0.0]]
+        finally:
+            release.set()
+            task.stop()
+
+
+@pytest.mark.parametrize("reentrant", [False, True], ids=["return-window", "callback"])
+def test_cancel_before_gripper_move_id_publication_stops_motion(reentrant):
+    submitted, release, completed = (
+        threading.Event(), threading.Event(), threading.Event()
+    )
+
+    class PublishingRobot(RobotStub):
+        def __init__(self):
+            super().__init__()
+            self.active_moves = set()
+            self.cancelled_moves = []
+            self.completed_moves = []
+
+        def move_submodule_trajectory_async(self, name, trajectory, interval):
+            super().move_submodule_trajectory_async(name, trajectory, interval)
+            move_id = len(self.requests) + 3
+            self.active_moves.add(move_id)
+            if move_id == 4:
+                if reentrant:
+                    assert task._lock.acquire(timeout=0.1)
+                    task._lock.release()
+                    assert task.cancel_request(0)
+                else:
+                    submitted.set()
+                    assert release.wait(2)
+            return move_id
+
+        def cancel_submodule_move(self, name, move_id):
+            assert task._lock.acquire(timeout=0.1)
+            task._lock.release()
+            self.cancelled_moves.append(move_id)
+            self.active_moves.discard(move_id)
+            return True
+
+        def wait_submodule_move(self, name, move_id, timeout):
+            if move_id not in self.active_moves:
+                return False
+            self.active_moves.remove(move_id)
+            self.completed_moves.append(move_id)
+            return True
+
+    robot = PublishingRobot()
+    task = ViserGripperTask(robot)
+    task.set_completion_callback(completed.set)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        try:
+            assert task.invoke_async(0, {"action": "close"})
+            if not reentrant:
+                assert submitted.wait(1)
+                assert task.cancel_request(0)
+                release.set()
+            assert completed.wait(1)
+            response = task.peek_response(0)
+            assert response.result_type is PeekResponseResultType.ErrorUnknown
+            assert "cancelled" in response.error.lower()
+            assert robot.cancelled_moves == [4]
+            assert robot.completed_moves == []
+            assert not robot.active_moves
+
+            completed.clear()
+            assert task.invoke_async(1, {"action": "open"})
+            assert completed.wait(1)
+            response = task.peek_response(1)
+            assert response.result_type is PeekResponseResultType.ResponseFound
+            assert robot.completed_moves == [5]
+        finally:
+            release.set()
+            task.stop()
 
 
 def test_gripper_task_can_restart_after_stopping_queued_request():
@@ -653,29 +791,47 @@ def test_concurrent_executor_preserves_gripper_command_order():
 
 def test_cancelling_queued_gripper_command_does_not_block_following_command():
     robot = make_gripper_robot()
+    release_worker = threading.Event()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    blocker = executor.submit(release_worker.wait, 2.0)
+    gripper_task = ViserGripperTask(robot)
     pilot = TaskPilot(
-        robot, {"gripper": ViserGripperTask(robot)}, executor_owned=executor
+        robot, {"gripper": gripper_task}, executor_owned=executor
     )
     pilot.initialize()
     try:
         first = pilot.call_srv_async(
-            "gripper", {"position": 0.2, "speed": 0.5}, MoveSyncOption.no_sync()
+            "gripper", {"position": 0.2, "speed": 100.0}, MoveSyncOption.no_sync()
         )
         cancelled = pilot.call_srv_async(
-            "gripper", {"position": 0.7, "speed": 0.5}, MoveSyncOption.no_sync()
+            "gripper", {"position": 0.7, "speed": 100.0}, MoveSyncOption.no_sync()
         )
         last = pilot.call_srv_async(
             "gripper", {"position": 0.1, "speed": 100.0}, MoveSyncOption.no_sync()
         )
         deadline = time.monotonic() + 0.5
-        while pilot.query_request(cancelled).status is not RequestStatus.RUNNING:
+        while (
+            gripper_task.peek_response(cancelled).result_type
+            is PeekResponseResultType.ErrorRequestNotSent
+        ):
             assert time.monotonic() < deadline
             time.sleep(0.002)
+        # The adapter accepted this request, and its sole worker is still gated.
+        assert (
+            gripper_task.peek_response(cancelled).result_type
+            is PeekResponseResultType.RequestSentNoResponse
+        )
+        assert not blocker.done()
         assert pilot.cancel_request(cancelled)
+        release_worker.set()
+        assert blocker.result(timeout=0.5)
         assert pilot.wait_request(first, timeout=1.0).status is RequestStatus.SUCCEEDED
         assert pilot.wait_request(last, timeout=1.0).status is RequestStatus.SUCCEEDED
         assert pilot.query_request(cancelled).status is RequestStatus.CANCELLED
         assert robot.query_submodule_state("gripper").positions == [pytest.approx(0.1)]
+        assert [trajectory[-1][0] for trajectory in robot.submodule_trajectories] == [
+            pytest.approx(0.2), pytest.approx(0.1)
+        ]
     finally:
+        release_worker.set()
         pilot.stop()

@@ -16,6 +16,7 @@ from .model import (
     ResourceClaim,
     Workflow,
     _name,
+    _operation_id,
     _positive_int,
     _snapshot,
     _timeout,
@@ -37,10 +38,13 @@ class ActionContext:
         *,
         max_pending_feedback: int = 128,
         feedback_overflow: Optional[Callable[[int], None]] = None,
+        max_feedback_bytes: Optional[int] = None,
+        checkpoint: Optional[Callable[[Any], None]] = None,
     ) -> None:
         _positive_int(max_pending_feedback, "max_pending_feedback")
         self._run_id = run_id
         self._node_id = node_id
+        self._operation_id = _operation_id(run_id, node_id)
         self._loop = asyncio.get_running_loop()
         self._cancelled = asyncio.Event()
         self._cancel_token: Optional[threading.Event] = None
@@ -48,10 +52,16 @@ class ActionContext:
         self._feedback = feedback
         self._feedback_overflow = feedback_overflow
         self._feedback_limit = max_pending_feedback
+        if max_feedback_bytes is not None:
+            _positive_int(max_feedback_bytes, "max_feedback_bytes")
+        self._max_feedback_bytes = max_feedback_bytes
+        self._checkpoint = checkpoint
+        self._late_checkpoint = False
         self._feedback_lock = threading.Lock()
         self._feedback_channel: Optional[FeedbackChannel] = None
         self._active = True
         self._handler_started = False
+        self._stop_deadline: Optional[float] = None
 
     @property
     def run_id(self) -> str:
@@ -63,7 +73,7 @@ class ActionContext:
 
     @property
     def operation_id(self) -> str:
-        return "{}/{}".format(self._run_id, self._node_id)
+        return self._operation_id
 
     @property
     def cancel_requested(self) -> bool:
@@ -99,7 +109,7 @@ class ActionContext:
         """Report small JSON; SDK-thread overflow drops oldest pending progress."""
         if not self._active:
             return
-        snapshot = _snapshot(feedback)
+        snapshot = _snapshot(feedback, max_bytes=self._max_feedback_bytes)
         try:
             current_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -117,11 +127,33 @@ class ActionContext:
                 return
             if self._feedback_channel is None:
                 self._feedback_channel = FeedbackChannel(
-                    self._loop, self._feedback, self._feedback_overflow,
+                    self._loop,
+                    self._feedback,
+                    self._feedback_overflow,
                     self._feedback_limit,
                 )
             channel = self._feedback_channel
         channel.post(snapshot)
+
+    def checkpoint(self, data: Any) -> None:
+        """Record small recovery metadata on the event loop before continuing I/O.
+
+        This replaces the previous checkpoint (64 KiB compact ASCII JSON limit).
+        With a journal, return means the metadata is durably committed. A failed
+        commit raises; an adapter with an accepted operation must report UNKNOWN.
+        Unlike optional progress, recovery metadata must never be silently lost.
+        A still-draining adapter may record a late ticket after a stop deadline;
+        this does not change UNKNOWN or release its resources.
+        """
+        if not self._active and not self._late_checkpoint:
+            raise RuntimeError("ActionContext has already completed")
+        if asyncio.get_running_loop() is not self._loop:
+            raise RuntimeError(
+                "ActionContext checkpoints must use their original event loop"
+            )
+        snapshot = _snapshot(data, max_bytes=65536)
+        if self._checkpoint is not None:
+            self._checkpoint(snapshot)
 
     def _check_loop(self) -> None:
         if not self._active:
@@ -129,10 +161,13 @@ class ActionContext:
         if asyncio.get_running_loop() is not self._loop:
             raise RuntimeError("ActionContext waits must use their original event loop")
 
-    def _finish(self) -> int:
+    def _finish(self, *, draining: bool = False) -> int:
         with self._feedback_lock:
             self._active = False
             self._feedback = self._feedback_overflow = None
+            self._late_checkpoint = draining
+            if not draining:
+                self._checkpoint = None
             channel = self._feedback_channel
         return 0 if channel is None else channel.close()
 
@@ -175,9 +210,12 @@ class Action:
     claims: Tuple[ResourceClaim, ...] = ()
     input_schema: Optional[RequestSchema] = None
     output_schema: Optional[RequestSchema] = None
+    version: Optional[str] = None
 
     def __post_init__(self) -> None:
         _name(self.name, "action name")
+        if self.version is not None:
+            _name(self.version, "action version")
         if not callable(self.handler) or not (
             inspect.iscoroutinefunction(self.handler)
             or inspect.iscoroutinefunction(getattr(self.handler, "__call__", None))

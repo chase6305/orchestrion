@@ -69,42 +69,36 @@ class ViserDemoRuntime:
         self.server = viser.ViserServer(host=host, port=port, label=title)
         self.server.gui.configure_theme(
             control_layout="fixed",
-            control_width="medium",
+            control_width="small",
             dark_mode=True,
+            show_logo=False,
             show_share_button=False,
             brand_color=(70, 110, 230),
         )
-        self.server.initial_camera.position = (1.25, -1.25, 0.95)
-        self.server.initial_camera.look_at = (0.0, 0.0, 0.35)
-        self.server.initial_camera.up_direction = (0.0, 0.0, 1.0)
+        self.server.initial_camera.position = (0.85, -1.15, 0.80)
+        self.server.initial_camera.look_at = (0.12, -0.25, 0.34)
+        self.server.initial_camera.fov = np.deg2rad(42)
+        self.server.initial_camera.up = (0.0, 0.0, 1.0)
         self.server.scene.add_grid(
             "/world/grid",
-            width=2.4,
-            height=2.4,
+            width=1.6,
+            height=1.6,
             cell_size=0.1,
             section_size=0.5,
+            cell_color=(55, 65, 80),
+            section_color=(85, 100, 120),
+            position=(0.1, -0.2, -0.01),
         )
-        self.server.scene.add_frame(
-            "/world/base_frame", axes_length=0.2, axes_radius=0.008
+        self.server.gui.add_markdown(
+            "## {}\nRobot motion + synchronized peripheral actions".format(title)
         )
-        self.server.gui.add_markdown("# {}\nOrchestrion v0.2 Viser demo".format(title))
         self._demo_status = self.server.gui.add_markdown(
             "**Demo:** waiting for browser client"
         )
-        self._gripper_slider = self.server.gui.add_slider(
-            "Gripper joint",
-            min=0.0,
-            max=0.725,
-            step=0.005,
-            initial_value=0.0,
-            disabled=True,
-        )
         self._gripper_status = self.server.gui.add_markdown(
-            "## Peripheral health\n"
-            "**gripper** · starting · idle\n\n"
-            "Position `0.000` · Move `—` · Pending `0` · Failed `0`"
+            "**Gripper:** starting"
         )
-        self._payload_status = self.server.gui.add_markdown("**Payload:** not configured")
+        self._payload_status = self.server.gui.add_markdown("")
         self._monitor_stop = threading.Event()
         self._monitor_thread = None
 
@@ -162,14 +156,14 @@ class ViserDemoRuntime:
         self._demo_status.content = "**Demo:** {}".format(message)
 
     def wait_for_client(self) -> None:
-        if self.server.get_clients():
-            return
         connected = threading.Event()
 
         @self.server.on_client_connect
         def _on_connect(_client) -> None:
             connected.set()
 
+        if self.server.get_clients():
+            connected.set()
         self.set_status("waiting for browser client")
         print(
             "Waiting for a browser client before starting the workflow...",
@@ -206,60 +200,36 @@ class ViserDemoRuntime:
                 status = self.pilot.query_task_status("gripper")
             except Exception as exc:
                 self._gripper_status.content = (
-                    "## Peripheral health\n"
-                    "**gripper** · **offline**\n\nDetail: `{}`".format(exc)
+                    "**Gripper:** offline\n\n`{}`".format(exc)
                 )
                 continue
             if status is None:
-                self._gripper_status.content = (
-                    "## Peripheral health\n"
-                    "**gripper** · unknown\n\nDetail: status unsupported"
-                )
+                self._gripper_status.content = "**Gripper:** status unavailable"
                 continue
-            self._gripper_slider.value = status["position"]
             self._gripper_status.content = (
-                "## Peripheral health\n"
-                "**gripper** · {} · {}\n\n"
-                "Position `{:.3f}` · Move `{}/{}` · Pending `{}` · Failed `{}`".format(
+                "**Gripper:** {} · {}".format(
                     "online" if status["initialized"] else "offline",
                     status["activity"],
-                    status["position"],
-                    status["latest_finished_move_id"],
-                    status["latest_move_id"],
-                    status["pending"],
-                    status["failed"],
                 )
             )
+            if status["failed"]:
+                self._gripper_status.content += " · {} failed".format(status["failed"])
 
     def add_workspace_markers(self, include_payload: bool = True) -> None:
         pick_position = self.fk_position(PICK_Q)
         place_position = self.fk_position(PLACE_Q)
-        self.server.scene.add_box(
-            "/world/pick",
-            color=(50, 180, 80),
-            dimensions=(0.16, 0.16, 0.08),
-            position=pick_position,
-            opacity=0.25,
-        )
-        self.server.scene.add_label(
-            "/world/pick/label",
-            "PICK",
-            position=pick_position + np.array([0.0, 0.0, 0.15]),
-        )
-        self.server.scene.add_box(
-            "/world/place",
-            color=(70, 110, 230),
-            dimensions=(0.16, 0.16, 0.08),
-            position=place_position,
-            opacity=0.25,
-        )
-        self.server.scene.add_label(
-            "/world/place/label",
-            "PLACE",
-            position=place_position + np.array([0.0, 0.0, 0.15]),
-        )
+        for name, position, color in (
+            ("pick", pick_position, (60, 190, 155)),
+            ("place", place_position, (90, 145, 245)),
+        ):
+            self.server.scene.add_box(
+                "/world/" + name,
+                color=color,
+                dimensions=(0.16, 0.16, 0.025),
+                position=position - np.array([0.0, 0.0, 0.075]),
+            )
+        self.server.gui.add_markdown("**Stations:** PICK (green) → PLACE (blue)")
         if not include_payload:
-            self._payload_status.content = "**Payload:** not used in this demo"
             return
         self._pick_object = self.server.scene.add_box(
             "/world/payload_at_pick",
