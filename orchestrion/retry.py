@@ -2,8 +2,9 @@
 
 import math
 from dataclasses import dataclass
-from numbers import Real
 from typing import Tuple, Type
+
+from orchestrion.utils.numeric import is_finite_real
 
 
 @dataclass(frozen=True)
@@ -28,16 +29,7 @@ class RetryPolicy:
             ("backoff", self.backoff, False),
             ("max_delay", self.max_delay, True),
         ):
-            try:
-                valid = (
-                    not isinstance(value, bool)
-                    and isinstance(value, Real)
-                    and math.isfinite(value)
-                    and value >= 0
-                    and (allow_zero or value != 0)
-                )
-            except OverflowError:
-                valid = False
+            valid = is_finite_real(value) and value >= 0 and (allow_zero or value != 0)
             if not valid:
                 qualifier = "non-negative" if allow_zero else "positive"
                 raise ValueError("{} must be {} and finite".format(name, qualifier))

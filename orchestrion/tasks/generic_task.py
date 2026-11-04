@@ -19,11 +19,14 @@ class GenericTask(ABC):
         """Snapshot optional JSON metadata for service discovery."""
         if metadata is not None and not isinstance(metadata, dict):
             raise TypeError("metadata must be a dictionary or None")
+        metadata_snapshot = copy.deepcopy({} if metadata is None else metadata)
+        if not isinstance(metadata_snapshot, dict):
+            raise TypeError("copied metadata must be a dictionary")
         try:
-            json.dumps(metadata or {}, allow_nan=False)
+            json.dumps(metadata_snapshot, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValueError("metadata must be JSON-compatible") from exc
-        self._metadata = copy.deepcopy(metadata or {})
+        self._metadata = metadata_snapshot
         self._completion_callback: Optional[Callable[[], None]] = None
 
     def describe(self) -> Dict:

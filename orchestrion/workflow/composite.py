@@ -1,7 +1,6 @@
 """Compose a fixed workflow into one capability with a continuous resource lease."""
 
 import asyncio
-import copy
 import hashlib
 import json
 from dataclasses import replace
@@ -217,11 +216,13 @@ class _WorkflowAction:
                 finally:
                     cancellation.cancel()
                     await asyncio.gather(cancellation, return_exceptions=True)
+            # wait() already isolated these outputs; the outer engine snapshots
+            # the returned detail before retaining or binding it to later nodes.
             detail = {
                 "nodes": {
                     node_id: {
                         "status": node.status.value,
-                        "output": copy.deepcopy(node.output),
+                        "output": node.output,
                         "error": node.error,
                     }
                     for node_id, node in result.nodes.items()

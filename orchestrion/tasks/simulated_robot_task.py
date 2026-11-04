@@ -13,7 +13,7 @@ from .reduced_robot_task_interface import ReducedRobotTaskInterface
 
 
 class SimulatedRobotTask(ReducedRobotTaskInterface):
-    """Execute joint trajectories in real time without robot hardware."""
+    """Pace joint trajectories with interruptible delays, without robot hardware."""
 
     def __init__(self, initial_joints: List[float]):
         if not initial_joints:
@@ -70,6 +70,9 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
     def _stop_locked(self, timeout: float) -> None:
         if not self._is_finite_real(timeout) or timeout < 0:
             raise ValueError("timeout must be non-negative and finite")
+        if timeout > threading.TIMEOUT_MAX:
+            raise ValueError("timeout must not exceed threading.TIMEOUT_MAX")
+        timeout = float(timeout)
         with self._state_condition:
             was_stopped = self._stop_event.is_set()
             self._stop_event.set()
@@ -82,17 +85,19 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
                 sorted(set(self._state.cancelled_move_ids).union(unfinished_move_ids))
             )
             self._state_condition.notify_all()
+        # Admission is closed. Discard queued work before callbacks or joins can
+        # fail, so a later explicit restart cannot replay cancelled trajectories.
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
         if not was_stopped:
             self._notify_state_change()
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
                 raise TimeoutError("Simulated robot did not stop in time")
-        while True:
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                break
 
     def move_joint_trajectory_async(
         self,
@@ -102,6 +107,9 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
     ) -> int:
         if not self._is_finite_real(interval) or interval <= 0:
             return -1
+        if interval > threading.TIMEOUT_MAX:
+            return -1
+        interval = float(interval)
         if not isinstance(motion_target, (list, tuple)) or not motion_target:
             return -1
         with self._lock:
@@ -149,6 +157,7 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
             raise ValueError("time_out must be finite")
         if not self._is_finite_real(interval) or interval <= 0:
             raise ValueError("interval must be positive and finite")
+        interval = min(float(interval), threading.TIMEOUT_MAX)
         with self._lock:
             target_move_id = self._state.latest_sent_id
         deadline = None if time_out < 0 else time.monotonic() + time_out
@@ -184,8 +193,14 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
                 logger.exception("Robot state-change callback failed")
 
     def _run(self) -> None:
-        while not self._stop_event.is_set():
-            self._run_next_trajectory()
+        try:
+            while not self._stop_event.is_set():
+                self._run_next_trajectory()
+        except Exception:
+            try:
+                logger.exception("Simulated robot motion worker failed")
+            finally:
+                self._stop_locked(0.0)
 
     def _run_next_trajectory(self) -> None:
         """Release the request and its point aliases before the next idle wait."""

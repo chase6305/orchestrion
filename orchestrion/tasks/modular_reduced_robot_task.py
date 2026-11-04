@@ -32,6 +32,8 @@ class SubModuleMovementRequest:
 
 @dataclass(frozen=True)
 class SubModuleState:
+    """Independent joint-group progress, including persistent cancellations."""
+
     name: str
     positions: List[float]
     latest_sent_id: int = -1
@@ -62,6 +64,8 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         super().__init__()
         if not self._is_finite_real(interval) or interval <= 0:
             raise ValueError("Scheduler interval must be positive and finite")
+        if interval > threading.TIMEOUT_MAX:
+            raise ValueError("Scheduler interval must not exceed threading.TIMEOUT_MAX")
         if not init_full_q or not self._is_finite_trajectory([init_full_q]):
             raise ValueError("Initial joints must be finite real numbers")
         self._lock = threading.RLock()
@@ -71,8 +75,10 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         self._finished_move_id = -1
         self._latest_sent_id = -1
         self._cancelled_move_ids = set()
+        # Cancellation history only grows; its size versions cached sorted tuples.
+        self._cancelled_move_snapshot: Tuple[int, ...] = ()
         self._motion_epoch = 0
-        self._interval = interval
+        self._interval = float(interval)
 
         self._main_task_queue = queue.SimpleQueue()
         self._main_task = copy.copy(main_task)
@@ -108,6 +114,9 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         self._submodule_finished_ids = {name: -1 for name in self._sub_task_map}
         self._submodule_active_ids = {name: None for name in self._sub_task_map}
         self._cancelled_submodule_moves = {name: set() for name in self._sub_task_map}
+        self._cancelled_submodule_snapshots: Dict[str, Tuple[int, ...]] = dict.fromkeys(
+            self._sub_task_map, ()
+        )
         self._state_change_callback: Optional[Callable[[], None]] = None
 
     @staticmethod
@@ -179,6 +188,9 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
     def _stop_locked(self, timeout: float) -> None:
         if not self._is_finite_real(timeout) or timeout < 0:
             raise ValueError("timeout must be non-negative and finite")
+        if timeout > threading.TIMEOUT_MAX:
+            raise ValueError("timeout must not exceed threading.TIMEOUT_MAX")
+        timeout = float(timeout)
         with self._state_condition:
             was_stopped = self._stop_event.is_set()
             self._stop_event.set()
@@ -195,6 +207,10 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
                 )
                 self._submodule_active_ids[name] = None
             self._state_condition.notify_all()
+        # Admission is closed. Discard queued work before callbacks or joins can
+        # fail, so a later explicit restart cannot replay cancelled trajectories.
+        self._drain_queue(self._main_task_queue)
+        self._drain_queue(self._sub_task_queue)
         if not was_stopped:
             self._notify_state_change()
         if (
@@ -205,8 +221,6 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
             self._bg_thread.join(timeout=timeout)
             if self._bg_thread.is_alive():
                 raise TimeoutError("Robot background thread did not stop in time")
-        self._drain_queue(self._main_task_queue)
-        self._drain_queue(self._sub_task_queue)
 
     @staticmethod
     def _drain_queue(task_queue: queue.SimpleQueue) -> None:
@@ -225,6 +239,9 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         """Enqueue a trajectory; return its first move ID or -1 on rejection."""
         if not self._is_finite_real(interval) or interval <= 0:
             return -1
+        if interval > threading.TIMEOUT_MAX:
+            return -1
+        interval = float(interval)
         if not isinstance(motion_target, (list, tuple)) or not motion_target:
             return -1
         with self._lock:
@@ -279,6 +296,9 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
     ) -> int:
         if not self._is_finite_real(interval) or interval <= 0:
             return -1
+        if interval > threading.TIMEOUT_MAX:
+            return -1
+        interval = float(interval)
         module = self._sub_task_map.get(submodule_name)
         if (
             module is None
@@ -320,6 +340,9 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
             return {}
         if not self._is_finite_real(interval) or interval <= 0:
             return {}
+        if interval > threading.TIMEOUT_MAX:
+            return {}
+        interval = float(interval)
         with self._lock:
             submission_epoch = self._motion_epoch
         # Snapshot the whole batch before assigning any move IDs. This preserves
@@ -367,6 +390,11 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         if module is None:
             raise KeyError("Unknown submodule: {}".format(submodule_name))
         with self._lock:
+            cancelled_moves = self._cancelled_submodule_moves[submodule_name]
+            cancelled_snapshot = self._cancelled_submodule_snapshots[submodule_name]
+            if len(cancelled_snapshot) != len(cancelled_moves):
+                cancelled_snapshot = tuple(sorted(cancelled_moves))
+                self._cancelled_submodule_snapshots[submodule_name] = cancelled_snapshot
             begin = module.dof_begin
             return SubModuleState(
                 name=submodule_name,
@@ -374,9 +402,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
                 latest_sent_id=self._submodule_sent_ids[submodule_name],
                 latest_finished_id=self._submodule_finished_ids[submodule_name],
                 active_move_id=self._submodule_active_ids[submodule_name],
-                cancelled_move_ids=tuple(
-                    sorted(self._cancelled_submodule_moves[submodule_name])
-                ),
+                cancelled_move_ids=cancelled_snapshot,
             )
 
     def query_submodule_states(
@@ -425,6 +451,8 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     return False
+                if remaining is not None:
+                    remaining = min(remaining, threading.TIMEOUT_MAX)
                 self._state_condition.wait(remaining)
 
     def wait_submodule_moves(
@@ -470,6 +498,8 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     return False
+                if remaining is not None:
+                    remaining = min(remaining, threading.TIMEOUT_MAX)
                 self._state_condition.wait(remaining)
 
     @staticmethod
@@ -533,11 +563,13 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
     def query_state(self) -> Optional[ReducedRobotTaskInterface.ReducedRobotState]:
         """Return a snapshot of joints and main movement IDs."""
         with self._lock:
+            if len(self._cancelled_move_snapshot) != len(self._cancelled_move_ids):
+                self._cancelled_move_snapshot = tuple(sorted(self._cancelled_move_ids))
             return self.ReducedRobotState(
                 jps=self._current_full_q.copy(),
                 latest_finished_id=self._finished_move_id,
                 latest_sent_id=self._latest_sent_id,
-                cancelled_move_ids=tuple(sorted(self._cancelled_move_ids)),
+                cancelled_move_ids=self._cancelled_move_snapshot,
             )
 
     def wait_move(self, time_out: float = -1, interval: float = 0.05) -> bool:
@@ -546,6 +578,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
             raise ValueError("time_out must be finite")
         if not self._is_finite_real(interval) or interval <= 0:
             raise ValueError("interval must be positive and finite")
+        interval = min(float(interval), threading.TIMEOUT_MAX)
         with self._lock:
             target_move_id = self._latest_sent_id
         deadline = None if time_out < 0 else time.monotonic() + time_out
@@ -651,7 +684,18 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
                 move_completed = True
         return joints_updated, move_completed
 
-    def _bg_thread_loop(self):
+    def _bg_thread_loop(self) -> None:
+        try:
+            self._process_motion()
+        except Exception:
+            try:
+                logger.exception("Robot motion worker failed")
+            finally:
+                # Stop software scheduling and release waiters. The device
+                # adapter remains responsible for confirming physical shutdown.
+                self._stop_locked(0.0)
+
+    def _process_motion(self) -> None:
         """Advance due points and publish the combined main/submodule snapshot."""
         with self._lock:
             current_joint_positions = self._current_full_q.copy()

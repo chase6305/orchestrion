@@ -64,9 +64,11 @@ for diagnosis. Optional or dynamic data still requires runtime validation.
 
 Optional engine limits `max_input_bytes_per_node`, `max_output_bytes_per_node`
 and `max_feedback_bytes_per_report` measure compact ASCII JSON. Inputs are checked
-before admission and after binding. Oversized outputs fail before retention or
-downstream dispatch. Keep images and point clouds in artifact storage and pass
-references; these limits do not bound total process memory.
+before admission and again after schema validation of resolved bindings. Final
+schema payloads are isolated finite JSON objects and remain subject to byte limits.
+Oversized outputs fail before retention or downstream dispatch. Keep images and
+point clouds in artifact storage and pass references; these limits do not bound
+total process memory.
 
 `context.report()` accepts JSON progress, including from SDK threads. Each action
 has a bounded queue (`max_pending_feedback_per_action=128` by default); overflow

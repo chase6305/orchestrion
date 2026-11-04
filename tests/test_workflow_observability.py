@@ -643,14 +643,19 @@ def test_sdk_thread_feedback_is_snapshotted_and_delivered_on_the_event_loop():
 def test_events_are_bounded_and_defensive_with_monotonic_sequences():
     async def scenario():
         async def report(context, inputs):
-            for i in range(10):
-                context.report({"progress": [i]})
+            for step in range(10):
+                payload = {"progress": [step]}
+                context.report(payload)
+                payload["progress"].clear()
+            checkpoint = {"progress": [10]}
+            context.checkpoint(checkpoint)
+            checkpoint["progress"].clear()
 
         async with WorkflowEngine(
             [Action("report", report)], max_events_per_run=4
         ) as engine:
             run = engine.submit(Workflow((Node("report", "report"),)))
-            await run.wait(1)
+            result = await run.wait(1)
             events = run.events()
             assert len(events) == 4
             assert events[0].sequence > 1
@@ -658,5 +663,15 @@ def test_events_are_bounded_and_defensive_with_monotonic_sequences():
             assert run.events(after=events[-2].sequence) == events[-1:]
             events[0].detail["progress"].clear()
             assert run.events()[0].detail["progress"]
+            checkpoint_event = next(
+                event for event in events if event.kind == "checkpoint"
+            )
+            assert checkpoint_event.detail == {"progress": [10]}
+            checkpoint_event.detail["progress"].clear()
+            assert run.snapshot().nodes["report"].checkpoint == {"progress": [10]}
+            result.nodes["report"].checkpoint["progress"].append(11)
+            assert next(
+                event.detail for event in run.events() if event.kind == "checkpoint"
+            ) == {"progress": [10]}
 
     asyncio.run(scenario())

@@ -43,13 +43,7 @@ class ViserModularReducedRobotTask(ModularReducedRobotTask):
         self._viser_urdf_dict = viser_handle_dict
 
     def _on_robot_state_bg_thread(self, jps: List[float], jps_move_id: int) -> None:
-        """
-        Update the Viser URDF with the current joint positions.
-
-        Args:
-            jps (List[float]): Current joint positions.
-            jps_move_id (int): Move ID associated with the joint positions.
-        """
+        """Update each URDF handle from its slice of the joint vector."""
         main_begin = self._main_task.dof_begin
         main_end = main_begin + self._main_task.n_dof
         self._viser_urdf_dict["main"].update_cfg(np.asarray(jps[main_begin:main_end]))
@@ -186,13 +180,21 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
         )
         steps = max(2, math.ceil(abs(target - current) / (speed * interval)) + 1)
         trajectory = [[float(value)] for value in np.linspace(current, target, steps)]
+        with self._lock:
+            if request_id in self._cancelled_requests:
+                raise concurrent.futures.CancelledError("Gripper request cancelled")
         move_id = self._robot_task.move_submodule_trajectory_async(
             "gripper", trajectory, interval=interval
         )
         if move_id < 0:
             raise RuntimeError("Gripper trajectory was rejected")
+        # Cancellation may arrive before the backend returns its move ID.
         with self._lock:
             self._request_move_ids[request_id] = move_id
+            cancel_requested = request_id in self._cancelled_requests
+        if cancel_requested:
+            self._robot_task.cancel_submodule_move("gripper", move_id)
+            raise concurrent.futures.CancelledError("Gripper request cancelled")
         if not self._robot_task.wait_submodule_move("gripper", move_id, timeout):
             self._robot_task.cancel_submodule_move("gripper", move_id)
             raise concurrent.futures.CancelledError(

@@ -18,6 +18,8 @@ Keep integration scenarios alongside the corresponding example or public API.
 | File | Responsibility |
 | --- | --- |
 | `test_task.py` | Inline and threaded calls, retries, telemetry, result retention, task lifecycle |
+| `test_task_finalizers.py` | SDK result cleanup that reenters task status during eviction or replacement |
+| `test_thread_wait_limits.py` | Native wait limits, atomic rejection and larger deadline budgets |
 | `test_task_pilot.py` | Motion synchronization, dispatch, scheduler lifecycle and cancellation races |
 | `test_legacy_api.py` | Public request, health, lifecycle and simulated-motion compatibility |
 | `test_schema.py` | Flat/nested input validation, templates, composite choices, defensive copies and reference paths |
@@ -34,7 +36,7 @@ Keep integration scenarios alongside the corresponding example or public API.
 | `test_workflow_composite.py` | Continuous resource scopes, inner concurrency, cancellation and plan identity |
 | `test_workflow_remote.py` | Ticket protocol acceptance, bounded queries, stop confirmation and durable operation IDs |
 | `test_workflow_stop_deadline.py` | Stop acknowledgement budgets, draining adapters and late metadata |
-| `test_workflow_payloads.py` | Exact JSON byte budgets, bound inputs and SDK-thread feedback |
+| `test_workflow_payloads.py` | JSON budgets, schema-copy boundaries, failure diagnostics and SDK-thread feedback |
 | `test_durable_network_workflow.py` | Loopback HTTP workflow, restart replay and lost submission responses |
 | `test_workflow_idempotency.py` | Submission identity, replay, retention and explicit pruning |
 | `test_heterogeneous_workflow.py` | Simulated arm, fixture, speech, vision and mobile-base integration |

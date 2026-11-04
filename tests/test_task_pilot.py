@@ -14,6 +14,14 @@ from orchestrion.tasks import CallableTask, GenericTask, InPlaceFunctionCallTask
 from orchestrion.tasks.reduced_robot_task_interface import ReducedRobotTaskInterface
 from orchestrion.utils.types import PeekResponseResult, PeekResponseResultType
 
+_INVALID_PROGRESS_IDS = [
+    pytest.param(False, id="false"),
+    pytest.param(True, id="true"),
+    pytest.param(0.0, id="float-zero"),
+    pytest.param(-1.0, id="float-sentinel"),
+    pytest.param(-2, id="below-sentinel"),
+]
+
 
 @pytest.mark.parametrize("synchronized", [False, True])
 @pytest.mark.parametrize("rejected", [False, True])
@@ -92,6 +100,11 @@ class GenericTaskStub:
     def invoke_async(self, request_id, content=None):
         self.invoked.append((request_id, content))
         return True
+
+
+class SubmoduleRobotTaskStub(RobotTaskStub):
+    def query_submodule_state(self, name):
+        return self.query_state()
 
 
 class ClearCallbackFailingRobot(RobotTaskStub):
@@ -234,6 +247,61 @@ def test_motion_batch_shares_history_lookup_and_preserves_priority(submodule_nam
         assert history.inspected_ids == len(history)
 
 
+def test_motion_waiters_preserve_priority_and_fifo_across_submission_batches():
+    class Robot(RobotTaskStub):
+        def set_state_change_callback(self, callback):
+            self.callback = callback
+
+    robot = Robot()
+    robot.latest_finished_id = 4
+    task = RecordingTask()
+    sync_option = MoveSyncOption.sync_w_explicit_id(5)
+    with TaskPilot(robot, {"task": task}, poll_interval=10.0) as pilot:
+        cancelled = pilot.call_srv_async(
+            "task", {"cancelled": True}, sync_option, priority=50
+        )
+        first_tie = pilot.call_srv_async(
+            "task", {"first": True}, sync_option, priority=10
+        )
+        assert wait_until(
+            lambda: pilot.query_request(first_tie).status
+            is RequestStatus.WAITING_FOR_MOVE
+        )
+        blocker = pilot.call_srv_async(
+            "task", {"block": True}, MoveSyncOption.no_sync()
+        )
+        try:
+            assert task.started.wait(1.0)
+            high = pilot.call_srv_async(
+                "task", {"high": True}, sync_option, priority=20
+            )
+            second_tie = pilot.call_srv_async(
+                "task", {"second": True}, sync_option, priority=10
+            )
+            assert pilot.cancel_request(cancelled)
+            robot.latest_finished_id = 5
+            robot.callback()
+        finally:
+            task.release.set()
+
+        results = pilot.wait_requests(
+            [cancelled, first_tie, blocker, high, second_tie], timeout=1.0
+        )
+        assert [result.status for result in results] == [
+            RequestStatus.CANCELLED,
+            RequestStatus.SUCCEEDED,
+            RequestStatus.SUCCEEDED,
+            RequestStatus.SUCCEEDED,
+            RequestStatus.SUCCEEDED,
+        ]
+        assert task.calls == [
+            {"block": True},
+            {"high": True},
+            {"first": True},
+            {"second": True},
+        ]
+
+
 def test_unknown_service_is_rejected():
     pilot = TaskPilot(RobotTaskStub())
     with pytest.raises(KeyError):
@@ -248,6 +316,117 @@ def test_call_rejects_invalid_sync_option():
             pilot.call_srv_async("task", sync_option=object())
     finally:
         pilot.stop()
+
+
+@pytest.mark.parametrize("submodule_name", [None, "arm"], ids=["main", "submodule"])
+@pytest.mark.parametrize("invalid_id", _INVALID_PROGRESS_IDS)
+def test_invalid_latest_sent_id_does_not_reserve_a_request_or_idempotency_key(
+    submodule_name, invalid_id
+):
+    robot = SubmoduleRobotTaskStub()
+    robot.latest_sent_id = invalid_id
+    robot.latest_finished_id = 0
+    task = RecordingTask()
+    sync_option = (
+        MoveSyncOption.sync_w_latest_move()
+        if submodule_name is None
+        else MoveSyncOption.sync_w_submodule(submodule_name)
+    )
+    with TaskPilot(robot, {"device": task}) as pilot:
+        error_type = ValueError if invalid_id == -2 else TypeError
+        with pytest.raises(error_type, match="associated_move_id"):
+            pilot.call_srv_async(
+                "device", {"invalid": True}, sync_option, idempotency_key="retry"
+            )
+        assert task.calls == []
+        robot.latest_sent_id = 0
+        request_id = pilot.call_srv_async(
+            "device", {"valid": True}, sync_option, idempotency_key="retry"
+        )
+        assert request_id == 0
+        result = pilot.wait_request(request_id, timeout=1)
+        assert result.status is RequestStatus.SUCCEEDED
+        assert result.content == {"valid": True}
+        assert task.calls == [{"valid": True}]
+
+
+@pytest.mark.parametrize("submodule_name", [None, "arm"], ids=["main", "submodule"])
+@pytest.mark.parametrize("invalid_id", _INVALID_PROGRESS_IDS)
+def test_invalid_latest_finished_id_fails_only_its_synchronized_request(
+    submodule_name, invalid_id
+):
+    robot = SubmoduleRobotTaskStub()
+    robot.latest_sent_id = 0
+    robot.latest_finished_id = invalid_id
+    synchronized, unrelated = RecordingTask(), RecordingTask()
+    sync_option = (
+        MoveSyncOption.sync_w_explicit_id(0)
+        if submodule_name is None
+        else MoveSyncOption.sync_w_submodule(submodule_name, move_id=0)
+    )
+    with TaskPilot(robot, {"synced": synchronized, "unrelated": unrelated}) as pilot:
+        request_id = pilot.call_srv_async("synced", sync_option=sync_option)
+        result = pilot.wait_request(request_id, timeout=1)
+        assert result.status is RequestStatus.FAILED
+        assert "latest_finished_id" in result.error
+        assert synchronized.calls == []
+        next_id = pilot.call_srv_async(
+            "unrelated", {"ready": True}, MoveSyncOption.no_sync()
+        )
+        assert pilot.wait_request(next_id, timeout=1).status is RequestStatus.SUCCEEDED
+        assert unrelated.calls == [{"ready": True}]
+        assert pilot.is_running
+
+
+@pytest.mark.parametrize("submodule_name", [None, "arm"], ids=["main", "submodule"])
+def test_integer_unfinished_sentinel_keeps_zero_move_pending_until_completion(
+    submodule_name,
+):
+    pending_observed = threading.Event()
+
+    class PendingRobot(SubmoduleRobotTaskStub):
+        def query_state(self):
+            state = super().query_state()
+            if threading.current_thread() is not threading.main_thread():
+                pending_observed.set()
+            return state
+
+    robot = PendingRobot()
+    robot.latest_sent_id = 0
+    robot.latest_finished_id = -1
+    task = RecordingTask()
+    sync_option = (
+        MoveSyncOption.sync_w_latest_move()
+        if submodule_name is None
+        else MoveSyncOption.sync_w_submodule(submodule_name)
+    )
+    with TaskPilot(robot, {"device": task}) as pilot:
+        request_id = pilot.call_srv_async("device", {"ready": True}, sync_option)
+        assert pending_observed.wait(1)
+        assert task.calls == []
+        robot.latest_finished_id = 0
+        result = pilot.wait_request(request_id, timeout=1)
+        assert result.status is RequestStatus.SUCCEEDED
+        assert task.calls == [{"ready": True}]
+
+
+@pytest.mark.parametrize("submodule_name", [None, "arm"], ids=["main", "submodule"])
+@pytest.mark.parametrize("reported_id", [-1, 0], ids=["unset", "zero"])
+def test_latest_move_sync_accepts_integer_unset_and_zero_progress(
+    submodule_name, reported_id
+):
+    robot = SubmoduleRobotTaskStub()
+    robot.latest_sent_id = robot.latest_finished_id = reported_id
+    sync_option = (
+        MoveSyncOption.sync_w_latest_move()
+        if submodule_name is None
+        else MoveSyncOption.sync_w_submodule(submodule_name)
+    )
+    with TaskPilot(robot, {"device": RecordingTask()}) as pilot:
+        request_id = pilot.call_srv_async("device", {"valid": True}, sync_option)
+        result = pilot.wait_request(request_id, timeout=1)
+        assert result.status is RequestStatus.SUCCEEDED
+        assert result.associated_move_id == reported_id
 
 
 def test_malformed_submodule_state_fails_request_without_stopping_scheduler():
@@ -662,18 +841,64 @@ def test_request_prepared_before_stop_cannot_enter_a_restarted_pilot():
             "different request",
         ),
         (PeekResponseResult(PeekResponseResultType.ErrorRequestNotSent), "no record"),
+        *[
+            pytest.param(
+                PeekResponseResult(PeekResponseResultType.ResponseFound, request_id),
+                "request_id must be an integer",
+                id=label,
+            )
+            for request_id, label in (
+                (False, "false"),
+                (True, "true"),
+                (0.0, "float-zero"),
+                (-1.0, "float-sentinel"),
+            )
+        ],
+        pytest.param(
+            PeekResponseResult(PeekResponseResultType.ResponseFound, -2),
+            "different request",
+            id="below-sentinel",
+        ),
+        pytest.param(
+            PeekResponseResult(PeekResponseResultType.ResponseFound, -1),
+            None,
+            id="unset",
+        ),
+        pytest.param(
+            PeekResponseResult(PeekResponseResultType.ResponseFound, 0),
+            None,
+            id="zero",
+        ),
     ],
 )
-def test_inconsistent_backend_response_fails_the_affected_request(response, error):
+def test_backend_response_validation_isolates_device_errors(response, error):
     class InconsistentTask(RecordingTask):
         def peek_response(self, request_id):
             return response
 
-    with TaskPilot(SimulatedRobotTask([0.0]), {"device": InconsistentTask()}) as pilot:
+    with TaskPilot(
+        SimulatedRobotTask([0.0]),
+        {"device": InconsistentTask(), "working": RecordingTask()},
+    ) as pilot:
+        if response.request_id is True:
+            # True aliases request 1 just as False aliases request 0.
+            primer = pilot.call_srv_async(
+                "working", sync_option=MoveSyncOption.no_sync()
+            )
+            pilot.wait_request(primer, timeout=1)
         request_id = pilot.call_srv_async("device")
         result = pilot.wait_request(request_id, timeout=1.0)
-        assert result.status is RequestStatus.FAILED
-        assert error in result.error
+        if error is None:
+            assert result.status is RequestStatus.SUCCEEDED
+        else:
+            assert result.status is RequestStatus.FAILED
+            assert error in result.error
+        working_id = pilot.call_srv_async(
+            "working", sync_option=MoveSyncOption.no_sync()
+        )
+        assert (
+            pilot.wait_request(working_id, timeout=1).status is RequestStatus.SUCCEEDED
+        )
 
 
 def test_backend_attribute_error_is_reported_instead_of_waiting_forever():

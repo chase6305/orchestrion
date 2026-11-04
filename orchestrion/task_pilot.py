@@ -4,14 +4,12 @@ import concurrent.futures
 import copy
 import heapq
 import json
-import math
 import queue
 import threading
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, replace
 from functools import partial
-from numbers import Real
 from typing import Any, Container, Dict, List, Optional, Set, Tuple
 
 from orchestrion.health import DeviceHealth
@@ -21,6 +19,7 @@ from orchestrion.tasks.generic_task import GenericTask
 from orchestrion.tasks.reduced_robot_task_interface import ReducedRobotTaskInterface
 from orchestrion.utils.errors import exception_message
 from orchestrion.utils.logger import logger
+from orchestrion.utils.numeric import is_finite_real
 from orchestrion.utils.types import PeekResponseResult, PeekResponseResultType
 
 # (-priority, request_id, request): higher priorities first, FIFO for ties.
@@ -29,12 +28,7 @@ _QueueEntry = Tuple[int, int, "TaskPilot.BackgroundRequest"]
 
 def _validate_wait_timeout(timeout: Optional[float]) -> None:
     """Apply the same timeout contract to request and health waits."""
-    if timeout is not None and (
-        isinstance(timeout, bool)
-        or not isinstance(timeout, Real)
-        or not math.isfinite(timeout)
-        or timeout < 0
-    ):
+    if timeout is not None and (not is_finite_real(timeout) or timeout < 0):
         raise ValueError("timeout must be non-negative and finite, or None")
 
 
@@ -58,13 +52,10 @@ class TaskPilot:
         poll_interval: float = 0.05,
         timeline_capacity: int = 1000,
     ):
-        if (
-            isinstance(poll_interval, bool)
-            or not isinstance(poll_interval, Real)
-            or not math.isfinite(poll_interval)
-            or poll_interval <= 0
-        ):
+        if not is_finite_real(poll_interval) or poll_interval <= 0:
             raise ValueError("poll_interval must be positive and finite")
+        if poll_interval > threading.TIMEOUT_MAX:
+            raise ValueError("poll_interval must not exceed threading.TIMEOUT_MAX")
         if isinstance(timeline_capacity, bool) or not isinstance(
             timeline_capacity, int
         ):
@@ -75,12 +66,12 @@ class TaskPilot:
         self._task_map = dict(task_map) if task_map is not None else {}
         if any(not isinstance(name, str) or not name for name in self._task_map):
             raise ValueError("Task service names must be non-empty strings")
-        self._services_by_task: Dict[int, Set[str]] = {}
+        self._service_names_by_task_id: Dict[int, Set[str]] = {}
         self._lifecycle_tasks = []
         for name, task in self._task_map.items():
-            if id(task) not in self._services_by_task:
+            if id(task) not in self._service_names_by_task_id:
                 self._lifecycle_tasks.append((name, task))
-            self._services_by_task.setdefault(id(task), set()).add(name)
+            self._service_names_by_task_id.setdefault(id(task), set()).add(name)
         self._executor = executor_owned
         self._executor_shutdown = False
         self._poll_interval = poll_interval
@@ -125,7 +116,7 @@ class TaskPilot:
 
     @property
     def health_revision(self) -> int:
-        """Monotonic version incremented when observable runtime state changes."""
+        """Version advanced by pilot transitions and adapter notifications."""
         with self._state_condition:
             return self._health_revision
 
@@ -149,7 +140,7 @@ class TaskPilot:
     def _on_task_completion(self, service_name: str) -> None:
         with self._state_condition:
             self._dirty_services.update(
-                self._services_by_task[id(self._task_map[service_name])]
+                self._service_names_by_task_id[id(self._task_map[service_name])]
             )
             self._mark_health_changed_locked()
         self._wake_event.set()
@@ -250,13 +241,11 @@ class TaskPilot:
             self._stop_locked(timeout)
 
     def _stop_locked(self, timeout: float) -> None:
-        if (
-            isinstance(timeout, bool)
-            or not isinstance(timeout, Real)
-            or not math.isfinite(timeout)
-            or timeout < 0
-        ):
+        if not is_finite_real(timeout) or timeout < 0:
             raise ValueError("timeout must be non-negative and finite")
+        if timeout > threading.TIMEOUT_MAX:
+            raise ValueError("timeout must not exceed threading.TIMEOUT_MAX")
+        timeout = float(timeout)
         # Elect one cleanup owner before calling device code. A scheduler callback
         # can request stop while an external caller is already joining that thread.
         with self._state_condition:
@@ -317,8 +306,8 @@ class TaskPilot:
             try:
                 if self._executor is not None:
                     # Running Python callbacks cannot be forcefully interrupted.
-                    # Keep stop(timeout=...) bounded while still rejecting new
-                    # submissions and cancelling work that has not started.
+                    # Shut down admission immediately and cancel queued calls;
+                    # running callbacks finish on their existing worker threads.
                     self._executor.shutdown(wait=False, cancel_futures=True)
                     self._executor_shutdown = True
             finally:
@@ -399,6 +388,12 @@ class TaskPilot:
                 if robot_state is None:
                     raise RuntimeError("Robot state is unavailable")
                 associated_move_id = robot_state.latest_sent_id
+            if isinstance(associated_move_id, bool) or not isinstance(
+                associated_move_id, int
+            ):
+                raise TypeError("associated_move_id must be an integer")
+            if associated_move_id < -1:
+                raise ValueError("associated_move_id must be -1 or non-negative")
 
         request_content = copy.deepcopy(content)
         with self._state_condition:
@@ -482,11 +477,7 @@ class TaskPilot:
             raise ValueError("Task status available must be a boolean")
         status.setdefault("observed_at", time.time())
         observed_at = status["observed_at"]
-        if (
-            isinstance(observed_at, bool)
-            or not isinstance(observed_at, Real)
-            or not math.isfinite(observed_at)
-        ):
+        if not is_finite_real(observed_at):
             raise ValueError("Task status observed_at must be finite")
         return status
 
@@ -527,10 +518,7 @@ class TaskPilot:
     def query_health(self, stale_after: Optional[float] = None) -> Dict[str, Any]:
         """Return a JSON-compatible health snapshot for monitoring integrations."""
         if stale_after is not None and (
-            isinstance(stale_after, bool)
-            or not isinstance(stale_after, Real)
-            or not math.isfinite(stale_after)
-            or stale_after <= 0
+            not is_finite_real(stale_after) or stale_after <= 0
         ):
             raise ValueError("stale_after must be positive and finite, or None")
         with self._state_condition:
@@ -576,15 +564,13 @@ class TaskPilot:
                     continue
                 observed_at = status.get("observed_at")
                 stale = (
-                    isinstance(observed_at, Real)
-                    and not isinstance(observed_at, bool)
-                    and math.isfinite(observed_at)
+                    is_finite_real(observed_at)
                     and now - observed_at > stale_after
                 )
                 status["stale"] = stale
                 if stale and status.get("health") == DeviceHealth.ONLINE.value:
                     status["health"] = DeviceHealth.DEGRADED.value
-        peripherals_available = all(
+        peripherals_healthy = all(
             status is None
             or (
                 status.get("available", True)
@@ -597,7 +583,7 @@ class TaskPilot:
                 initialized
                 and scheduler_alive
                 and robot["available"]
-                and peripherals_available
+                and peripherals_healthy
             ),
             "revision": revision,
             "generated_at": now,
@@ -617,9 +603,11 @@ class TaskPilot:
     def wait_health_change(
         self, after_revision: int, timeout: Optional[float] = None
     ) -> Optional[Dict[str, Any]]:
-        """Wait for observable state newer than ``after_revision``.
+        """Wait for a pilot transition or adapter notification after a revision.
 
         Returns a fresh health snapshot, or ``None`` when the timeout expires.
+        Passive device changes need query_health(); sample aging is checked with
+        query_health(stale_after=...). Neither change automatically notifies.
         Blocking waits are not allowed from this pilot's scheduler callbacks.
         """
         if isinstance(after_revision, bool) or not isinstance(after_revision, int):
@@ -636,6 +624,9 @@ class TaskPilot:
                 if remaining is not None and remaining <= 0:
                     return None
                 self._check_scheduler_wait()
+                # Bound each native wait while preserving the overall deadline.
+                if remaining is not None:
+                    remaining = min(remaining, threading.TIMEOUT_MAX)
                 self._state_condition.wait(remaining)
         return self.query_health()
 
@@ -670,6 +661,8 @@ class TaskPilot:
                             "Request {} did not finish in time".format(request_id)
                         )
                     self._check_scheduler_wait()
+                    if remaining is not None:
+                        remaining = min(remaining, threading.TIMEOUT_MAX)
                     self._state_condition.wait(remaining)
                 result = self._requests[request_id]
             # Keep the waiter registered while copying outside the scheduler lock.
@@ -978,6 +971,10 @@ class TaskPilot:
                 response.result_type, PeekResponseResultType
             ):
                 raise TypeError("Task returned an invalid response envelope")
+            if isinstance(response.request_id, bool) or not isinstance(
+                response.request_id, int
+            ):
+                raise TypeError("Task response request_id must be an integer")
             if response.request_id not in (-1, request.request_id):
                 raise ValueError("Task returned a response for a different request")
             if response.result_type is PeekResponseResultType.ResponseFound:
@@ -1068,7 +1065,7 @@ class TaskPilot:
                 heapq.heappush(ready_to_dispatch, queue_entry)
             else:
                 self._transition(request.request_id, RequestStatus.WAITING_FOR_MOVE)
-                heapq.heappush(waiting_for_motion, queue_entry)
+                waiting_for_motion.append(queue_entry)
                 added_motion_dependency = True
         return added_motion_dependency
 
@@ -1077,7 +1074,7 @@ class TaskPilot:
         waiting_for_motion: List[_QueueEntry],
         ready_to_dispatch: List[_QueueEntry],
     ) -> List[_QueueEntry]:
-        """Resolve one set of motion snapshots and return the remaining wait heap."""
+        """Resolve shared motion snapshots and retain unfinished dependencies."""
         dependency_counts = Counter(
             entry[2].associated_submodule for entry in waiting_for_motion
         )
@@ -1093,8 +1090,7 @@ class TaskPilot:
         # keep their existing membership lookup without an extra allocation.
         progress_by_submodule: Dict[Optional[str], Tuple[int, Container[int]]] = {}
         still_waiting = []
-        while waiting_for_motion:
-            queue_entry = heapq.heappop(waiting_for_motion)
+        for queue_entry in waiting_for_motion:
             request = queue_entry[2]
             with self._state_condition:
                 result = self._requests.get(request.request_id)
@@ -1117,6 +1113,14 @@ class TaskPilot:
                         )
                         cancelled_move_ids = submodule_state.cancelled_move_ids
                         latest_finished_id = submodule_state.latest_finished_id
+                    if isinstance(latest_finished_id, bool) or not isinstance(
+                        latest_finished_id, int
+                    ):
+                        raise TypeError("Robot latest_finished_id must be an integer")
+                    if latest_finished_id < -1:
+                        raise ValueError(
+                            "Robot latest_finished_id must be -1 or non-negative"
+                        )
                     cancellation_lookup = (
                         set(cancelled_move_ids)
                         if dependency_counts[submodule_name] >= 4
@@ -1150,7 +1154,6 @@ class TaskPilot:
                 heapq.heappush(ready_to_dispatch, queue_entry)
             else:
                 still_waiting.append(queue_entry)
-        # Entries were popped in priority order; their subset is already a heap.
         return still_waiting
 
     def _dispatch_next_request(self, ready_to_dispatch: List[_QueueEntry]) -> None:

@@ -98,22 +98,28 @@ def _snapshot(
                     )
 
         def scalar(item: Any) -> None:
-            if remaining is None:
-                return
             if isinstance(item, str):
                 # Reject huge strings before allocating their escaped representation.
                 charge(len(item) + 2)
                 charge(len(dumps(item, ensure_ascii=True)) - len(item) - 2)
+            elif item is None or item is True:
+                charge(4)  # null / true
+            elif item is False:
+                charge(5)
+            elif isinstance(item, int):
+                # A lower decimal-digit bound avoids converting enormous integers.
+                # 0.30102 is a lower bound for log10(2); bit_length covers both signs.
+                minimum_size = max(
+                    1, (int.bit_length(item) - 1) * 30102 // 100000 + 1
+                )
+                if int.__lt__(item, 0):
+                    minimum_size += 1
+                charge(minimum_size)
+                # JSON uses the base numeric repr, bypassing subclass overrides.
+                charge(len(int.__repr__(item)) - minimum_size)
             else:
-                if isinstance(item, int) and not isinstance(item, bool):
-                    # A lower decimal-digit bound avoids converting enormous integers.
-                    lower = max(1, (abs(item).bit_length() - 1) * 30102 // 100000 + 1)
-                    lower += int(item < 0)
-                    charge(lower)
-                    # Account for sign and exact length after the cheap lower bound.
-                    charge(len(dumps(item)) - lower)
-                else:
-                    charge(len(dumps(item, allow_nan=False)))
+                # visit() only passes finite floats through this branch.
+                charge(len(float.__repr__(item)))
 
     def visit(item: Any) -> Any:
         if item is None or isinstance(item, (str, bool, int)):

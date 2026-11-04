@@ -101,6 +101,57 @@ def test_sample_copy_does_not_hold_status_lock():
     assert task._call_fn(2, None)["sample"] == {"values": [1]}
 
 
+@pytest.mark.parametrize("has_cached_sample", [False, True])
+def test_invalid_poll_copy_preserves_cache_and_recovers(has_cached_sample):
+    class InvalidSample(dict):
+        def __deepcopy__(self, memo):
+            return ["not a dictionary"]
+
+    failed, recover, recovered = threading.Event(), threading.Event(), threading.Event()
+    initial_samples = [{"values": [1]}] if has_cached_sample else []
+
+    def poll():
+        if initial_samples:
+            return initial_samples.pop()
+        return {"values": [2]} if recover.is_set() else InvalidSample()
+
+    task = PollingTask(poll, interval=0.005)
+
+    def on_sample():
+        status = task.peek_status()
+        if status["last_error"]:
+            failed.set()
+        elif recover.is_set():
+            recovered.set()
+
+    task.set_completion_callback(on_sample)
+    task.initialize()
+    try:
+        assert failed.wait(1)
+        status = task.peek_status()
+        assert status["health"] == ("degraded" if has_cached_sample else "offline")
+        assert status["available"] is has_cached_sample
+        assert status["consecutive_failures"] >= 1
+        assert "copied poll sample" in status["last_error"]
+        if has_cached_sample:
+            assert task.invoke_async(0)
+            assert task.peek_response(0).content["sample"] == {"values": [1]}
+        else:
+            with pytest.raises(RuntimeError, match="copied poll sample"):
+                task.invoke_async(0)
+
+        recover.set()
+        assert recovered.wait(1)
+        status = task.peek_status()
+        assert status["health"] == "online"
+        assert status["consecutive_failures"] == 0
+        assert status["last_error"] is None
+        assert task.invoke_async(1)
+        assert task.peek_response(1).content["sample"] == {"values": [2]}
+    finally:
+        task.stop()
+
+
 def test_failed_result_polling_logs_once_and_formats_once_per_read(caplog):
     formatted = []
     completed = threading.Event()

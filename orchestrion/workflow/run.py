@@ -1,7 +1,6 @@
 """Workflow run handles, defensive snapshots and bounded in-memory events."""
 
 import asyncio
-import copy
 import time
 import uuid
 from collections import deque
@@ -136,7 +135,17 @@ class WorkflowRun:
 
     def snapshot(self) -> RunResult:
         """Return a defensive snapshot; terminal UNKNOWN is not a stop confirmation."""
-        return RunResult(self.run_id, self._status, copy.deepcopy(self._results))
+        # Result metadata is immutable. Copy only the JSON payloads instead of
+        # reconstructing every field and enum through generic deepcopy machinery.
+        results = {
+            node_id: replace(
+                result,
+                output=_snapshot(result.output),
+                checkpoint=_snapshot(result.checkpoint),
+            )
+            for node_id, result in self._results.items()
+        }
+        return RunResult(self.run_id, self._status, results)
 
     def explain(self, node_id: str) -> Dict[str, Any]:
         """Describe a node's current wait or unresolved stop without device I/O."""
@@ -149,7 +158,9 @@ class WorkflowRun:
         if isinstance(after, bool) or not isinstance(after, int) or after < 0:
             raise ValueError("after must be a nonnegative integer")
         return tuple(
-            copy.deepcopy(event) for event in self._events if event.sequence > after
+            replace(event, detail=_snapshot(event.detail))
+            for event in self._events
+            if event.sequence > after
         )
 
     def cancel(self) -> bool:
@@ -175,6 +186,7 @@ class WorkflowRun:
         return self.snapshot()
 
     def _emit(self, node_id: str, kind: str, detail: Any = None) -> None:
+        """Record JSON owned by the engine; public reads return isolated copies."""
         self._sequence += 1
         self._events.append(
             WorkflowEvent(
@@ -184,7 +196,7 @@ class WorkflowRun:
                 kind,
                 self._results[node_id].status,
                 time.time(),
-                _snapshot(detail),
+                detail,
             )
         )
 

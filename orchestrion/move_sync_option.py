@@ -1,18 +1,15 @@
+"""Select the main or submodule motion a peripheral request waits for."""
+
 from dataclasses import dataclass
 from typing import Optional
 
 
 @dataclass
-class MoveSyncOption(object):
-    """
-    Option class for movement synchronization.
+class MoveSyncOption:
+    """Choose a motion dependency, resolved when the request is submitted.
 
-    Attributes:
-        need_sync (bool): Whether synchronization is required.
-        associated_move_id (int): The move ID to synchronize with.
-                                  -1 means latest.
-        submodule_name (Optional[str]): Modular component whose move ID should be
-                                        observed, or None for the main robot move.
+    With synchronization enabled, move ID -1 selects the latest submitted move.
+    ``submodule_name=None`` selects the main robot's movement history.
     """
 
     need_sync: bool = True
@@ -39,41 +36,21 @@ class MoveSyncOption(object):
 
     @staticmethod
     def sync_w_latest_move() -> "MoveSyncOption":
-        """
-        Create a MoveSyncOption to sync with the latest move.
-
-        Returns:
-            MoveSyncOption: Option to sync with the latest move.
-        """
+        """Wait for the latest submitted main move."""
         return MoveSyncOption(need_sync=True, associated_move_id=-1)
 
     @staticmethod
     def no_sync() -> "MoveSyncOption":
-        """
-        Create a MoveSyncOption with no synchronization.
-
-        Returns:
-            MoveSyncOption: Option with no synchronization.
-        """
+        """Dispatch without waiting for motion."""
         return MoveSyncOption(need_sync=False, associated_move_id=-1)
 
     @staticmethod
     def sync_w_explicit_id(move_id: int) -> "MoveSyncOption":
-        """
-        Create a MoveSyncOption to sync with a specific move ID.
-
-        Args:
-            move_id (int): The explicit move ID to sync with.
-
-        Returns:
-            MoveSyncOption: Option to sync with the given move ID.
-        """
+        """Wait for the specified main move ID; -1 selects the latest."""
         return MoveSyncOption(need_sync=True, associated_move_id=move_id)
 
     @staticmethod
-    def sync_w_submodule(
-        submodule_name: str, move_id: int = -1
-    ) -> "MoveSyncOption":
+    def sync_w_submodule(submodule_name: str, move_id: int = -1) -> "MoveSyncOption":
         """Synchronize with a specific or latest move of one robot submodule."""
         return MoveSyncOption(
             need_sync=True,

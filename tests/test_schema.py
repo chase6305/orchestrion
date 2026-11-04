@@ -462,6 +462,21 @@ def test_choice_construction_keeps_isolated_nested_values():
         spec.validate("result", choices[0])
 
 
+@pytest.mark.parametrize("value_type", ["object", "array"])
+@pytest.mark.parametrize("invalid_value", [object(), float("nan")])
+def test_choice_construction_validates_json_in_the_stored_copy(
+    value_type, invalid_value
+):
+    class CopiedValue(int):
+        def __deepcopy__(self, memo):
+            return invalid_value
+
+    value = CopiedValue(1)
+    choice = {"value": value} if value_type == "object" else [value]
+    with pytest.raises(ValueError, match="choices must be JSON-compatible"):
+        FieldSpec(value_type, choices=[choice])
+
+
 @pytest.mark.parametrize("value_type, value", [("integer", 1), ("array", [])])
 def test_empty_choices_remain_an_empty_enumeration(value_type, value):
     spec = FieldSpec(value_type, choices=[])

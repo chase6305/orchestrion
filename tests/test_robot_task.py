@@ -4,6 +4,7 @@ import concurrent.futures
 import threading
 import weakref
 from dataclasses import dataclass, field
+from fractions import Fraction
 
 import pytest
 
@@ -13,6 +14,7 @@ from orchestrion.tasks.modular_reduced_robot_task import (
     ModularReducedRobotTask,
     SubModuleTask,
 )
+from orchestrion.utils.logger import logger
 
 
 class ModularRobot(ModularReducedRobotTask):
@@ -61,6 +63,214 @@ def test_copy_failure_does_not_consume_submodule_move_id():
     assert robot.query_submodule_state("gripper").latest_sent_id == -1
     assert robot.move_submodule_trajectory_async("gripper", [[2.0]]) == 0
     robot.stop()
+
+
+def test_fraction_motion_timing_and_stop(robot):
+    interval = Fraction(1, 1000)
+    robot.initialize()
+    try:
+        assert robot.move_joint_trajectory_async([[0.5]], interval=interval) == 0
+        assert robot.wait_move(time_out=Fraction(1), interval=interval)
+        assert robot.query_state().jps[0] == 0.5
+        robot.stop(timeout=Fraction(1))
+    finally:
+        robot.stop()
+
+
+@pytest.mark.parametrize("interval", [Fraction(1, 1000), 1e300], ids=["fraction", "huge"])
+def test_main_wait_accepts_real_intervals_and_large_deadlines(
+    robot, monkeypatch, interval
+):
+    waiting = threading.Event()
+    original_wait = robot._state_condition.wait
+
+    def observe_wait(timeout=None):
+        waiting.set()
+        return original_wait(timeout)
+
+    monkeypatch.setattr(robot._state_condition, "wait", observe_wait)
+    assert robot.move_joint_trajectory_async([[0.5]]) == 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(robot.wait_move, 1e300, interval)
+        try:
+            assert waiting.wait(1)
+            with pytest.raises(concurrent.futures.TimeoutError):
+                pending.result(timeout=0.01)
+        finally:
+            robot.stop(timeout=1)
+        assert pending.result(timeout=1) is False
+
+
+@pytest.mark.parametrize("group", [False, True], ids=["single", "group"])
+def test_submodule_large_deadline_is_woken_by_cancellation(monkeypatch, group):
+    robot = ModularRobot()
+    waiting = threading.Event()
+    original_wait = robot._state_condition.wait
+
+    def observe_wait(timeout=None):
+        waiting.set()
+        return original_wait(timeout)
+
+    monkeypatch.setattr(robot._state_condition, "wait", observe_wait)
+    move_id = robot.move_submodule_trajectory_async("gripper", [[0.5]])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        pending = (
+            executor.submit(robot.wait_submodule_moves, {"gripper": move_id}, 1e300)
+            if group
+            else executor.submit(robot.wait_submodule_move, "gripper", move_id, 1e300)
+        )
+        try:
+            assert waiting.wait(1)
+            with pytest.raises(concurrent.futures.TimeoutError):
+                pending.result(timeout=0.01)
+        finally:
+            robot.stop(timeout=1)
+        assert pending.result(timeout=1) is False
+
+
+def test_worker_failure_cancels_queued_motion_and_wakes_waiters(robot, monkeypatch):
+    entered, release, waiting = threading.Event(), threading.Event(), threading.Event()
+    step_name = (
+        "_run_next_trajectory"
+        if isinstance(robot, SimulatedRobotTask)
+        else "_process_motion"
+    )
+    original_step = getattr(robot, step_name)
+    original_wait = robot._state_condition.wait
+
+    class BrokenMessageError(RuntimeError):
+        def __str__(self):
+            raise ValueError("broken device exception formatter")
+
+    def fail_step():
+        entered.set()
+        assert release.wait(1.0)
+        raise BrokenMessageError()
+
+    def observe_wait(timeout=None):
+        waiting.set()
+        return original_wait(timeout)
+
+    monkeypatch.setattr(robot, step_name, fail_step)
+    monkeypatch.setattr(robot._state_condition, "wait", observe_wait)
+    first = robot.move_joint_trajectory_async([[1.0]])
+    second = robot.move_joint_trajectory_async([[2.0]])
+    robot.initialize()
+    try:
+        assert entered.wait(1.0)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(robot.wait_move)
+            try:
+                assert waiting.wait(1.0)
+                release.set()
+                assert result.result(timeout=1.0) is False
+            finally:
+                release.set()
+                robot.stop(timeout=1.0)
+        assert {first, second}.issubset(robot.query_state().cancelled_move_ids)
+        assert robot.move_joint_trajectory_async([[3.0]]) == -1
+
+        monkeypatch.setattr(robot, step_name, original_step)
+        robot.initialize()
+        later = robot.move_joint_trajectory_async([[4.0]], interval=0.001)
+        assert later > second
+        assert robot.wait_move(time_out=1.0)
+        assert {first, second}.issubset(robot.query_state().cancelled_move_ids)
+    finally:
+        release.set()
+        robot.stop(timeout=1.0)
+
+
+@pytest.mark.parametrize("observer_fails", [False, True])
+def test_worker_logging_failure_discards_queued_motion_before_restart(
+    robot, monkeypatch, observer_fails
+):
+    simulated = isinstance(robot, SimulatedRobotTask)
+    step_name = "_run_next_trajectory" if simulated else "_process_motion"
+    worker = robot._run if simulated else robot._bg_thread_loop
+
+    def fail_step():
+        raise ValueError("device failure")
+
+    def fail_log(*args, **kwargs):
+        raise RuntimeError("log sink unavailable")
+
+    def fail_observer():
+        raise ValueError("state observer failed")
+
+    first = robot.move_joint_trajectory_async([[1.0]], interval=0.001)
+    second = robot.move_joint_trajectory_async([[2.0]], interval=0.001)
+    if not simulated:
+        submodule_move = robot.move_submodule_trajectory_async(
+            "gripper", [[3.0]], interval=0.001
+        )
+    if observer_fails:
+        robot.set_state_change_callback(fail_observer)
+    with monkeypatch.context() as failure:
+        failure.setattr(robot, step_name, fail_step)
+        failure.setattr(logger, "exception", fail_log)
+        with pytest.raises(RuntimeError, match="log sink unavailable"):
+            worker()
+    assert {first, second}.issubset(robot.query_state().cancelled_move_ids)
+    assert robot.move_joint_trajectory_async([[4.0]]) == -1
+    if not simulated:
+        assert submodule_move in robot.query_submodule_state("gripper").cancelled_move_ids
+
+    observed = []
+    robot.set_state_change_callback(lambda: observed.append(robot.query_state().jps))
+    robot.initialize()
+    try:
+        later = robot.move_joint_trajectory_async([[4.0]], interval=0.001)
+        assert later > second
+        assert robot.wait_move(time_out=1.0)
+        assert all(joints[0] not in {1.0, 2.0} for joints in observed)
+        if not simulated:
+            assert robot.query_submodule_state("gripper").positions == [0.0]
+    finally:
+        robot.stop(timeout=1.0)
+
+
+def test_timed_out_stop_discards_queued_motion_before_restart(robot):
+    entered, release = threading.Event(), threading.Event()
+    simulated = isinstance(robot, SimulatedRobotTask)
+
+    def block_after_first_point():
+        if robot.query_state().jps[0] == 1.0 and not entered.is_set():
+            entered.set()
+            assert release.wait(2.0)
+
+    robot.set_state_change_callback(block_after_first_point)
+    robot.move_joint_trajectory_async([[1.0]], interval=0.001)
+    robot.initialize()
+    worker = robot._thread if simulated else robot._bg_thread
+    try:
+        assert entered.wait(1.0)
+        cancelled = robot.move_joint_trajectory_async([[2.0]], interval=0.001)
+        if not simulated:
+            submodule_move = robot.move_submodule_trajectory_async(
+                "gripper", [[3.0]], interval=0.001
+            )
+        with pytest.raises(TimeoutError):
+            robot.stop(timeout=0.0)
+        assert cancelled in robot.query_state().cancelled_move_ids
+        release.set()
+        worker.join(timeout=1.0)
+        assert not worker.is_alive()
+
+        observed = []
+        robot.set_state_change_callback(lambda: observed.append(robot.query_state().jps))
+        robot.initialize()
+        assert robot.move_joint_trajectory_async([[4.0]], interval=0.001) > cancelled
+        assert robot.wait_move(time_out=1.0)
+        assert all(joints[0] != 2.0 for joints in observed)
+        if not simulated:
+            state = robot.query_submodule_state("gripper")
+            assert submodule_move in state.cancelled_move_ids
+            assert state.positions == [0.0]
+    finally:
+        release.set()
+        robot.set_state_change_callback(None)
+        robot.stop(timeout=1.0)
 
 
 def test_main_move_cancellation_survives_restart(robot):

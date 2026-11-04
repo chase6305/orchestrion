@@ -1,24 +1,21 @@
 """On-demand scheduler diagnostics; no device calls or state transitions."""
 
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from .model import NodeStatus
 
 if TYPE_CHECKING:
-    from .engine import WorkflowEngine, WorkflowRun
+    from .engine import WorkflowEngine, _ReadyEntry
+    from .run import WorkflowRun
 
 
-def _queue_head(engine: "WorkflowEngine", resource: str):
+def _queue_head(engine: "WorkflowEngine", resource: str) -> "Optional[_ReadyEntry]":
     # Reading diagnostics must not compact queues or alter scheduling order.
     waiters = engine._resource_waiters[resource]
     if waiters and engine._is_ready(waiters[0]):
         return waiters[0]
     return min(
-        (
-            entry
-            for entry in waiters
-            if engine._is_ready(entry)
-        ),
+        (entry for entry in waiters if engine._is_ready(entry)),
         default=None,
     )
 
@@ -79,16 +76,16 @@ def explain_node(run: "WorkflowRun", node_id: str) -> Dict[str, Any]:
                     }
                 )
             head = _queue_head(engine, claim.resource)
-            if head is not None and (
-                head[2] is not run or head[3].node.node_id != node_id
-            ):
-                blockers.append(
-                    {
-                        "kind": "resource_queue",
-                        "resource": claim.resource,
-                        "ahead": head[2].operation_id(head[3].node.node_id),
-                    }
-                )
+            if head is not None:
+                _, _, head_run, head_node = head
+                if head_run is not run or head_node.node.node_id != node_id:
+                    blockers.append(
+                        {
+                            "kind": "resource_queue",
+                            "resource": claim.resource,
+                            "ahead": head_run.operation_id(head_node.node.node_id),
+                        }
+                    )
         if not blockers:
             blockers.append({"kind": "dispatch"})
     elif result.status == NodeStatus.CANCELLING:
@@ -124,9 +121,11 @@ def scheduler_snapshot(engine: "WorkflowEngine") -> Dict[str, Any]:
             engine._is_ready(entry) for entry in engine._resource_waiters[name]
         )
         head = _queue_head(engine, name)
-        resource["next_operation"] = (
-            None if head is None else head[2].operation_id(head[3].node.node_id)
-        )
+        if head is None:
+            resource["next_operation"] = None
+        else:
+            _, _, head_run, head_node = head
+            resource["next_operation"] = head_run.operation_id(head_node.node.node_id)
     counts = dict.fromkeys((status.value for status in NodeStatus), 0)
     for run in engine._runs.values():
         for result in run._results.values():

@@ -73,6 +73,43 @@ def test_dataflow_infers_dependencies_and_snapshots_mutable_values():
     asyncio.run(scenario())
 
 
+def test_running_and_completed_snapshots_isolate_outputs_and_checkpoints():
+    async def scenario():
+        checkpointed, release = asyncio.Event(), asyncio.Event()
+        payload = {"ticket": {"parts": [1, 2]}}
+
+        async def device(context, inputs):
+            context.checkpoint(payload)
+            checkpointed.set()
+            await reached(release)
+            return payload
+
+        async with WorkflowEngine([Action("device", device, version="v1")]) as engine:
+            run = engine.submit(Workflow((Node("move", "device"),)))
+            try:
+                await reached(checkpointed)
+                active = run.snapshot()
+                active.nodes["move"].checkpoint["ticket"]["parts"].clear()
+                active.nodes.clear()
+                assert run.snapshot().nodes["move"].checkpoint == payload
+            finally:
+                release.set()
+
+            completed = await run.wait(1)
+            original = run.snapshot().nodes["move"]
+            assert original.action_version == "v1"
+            assert original.started_at is not None
+            assert original.finished_at is not None
+            completed.nodes["move"].output["ticket"]["parts"].append(3)
+            completed.nodes["move"].checkpoint["ticket"]["parts"].clear()
+            payload["ticket"]["parts"].append(4)
+            assert run.snapshot().nodes["move"] == original
+            assert original.output == {"ticket": {"parts": [1, 2]}}
+            assert original.checkpoint == original.output
+
+    asyncio.run(scenario())
+
+
 def test_global_capacity_and_unrelated_devices_run_concurrently():
     async def scenario():
         entered, unrelated, release = asyncio.Event(), asyncio.Event(), asyncio.Event()

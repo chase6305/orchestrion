@@ -1,29 +1,31 @@
-import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from numbers import Real
 from typing import List, Optional
+
+from orchestrion.utils.numeric import is_finite_real
 
 
 class ReducedRobotTaskInterface(ABC):
-
     @dataclass
     class ReducedRobotState:
-        """Joint positions and main-movement completion/cancellation history."""
+        """Joint positions and main-movement completion/cancellation history.
 
-        jps: List[float]  # Joint positions
-        latest_finished_id: int = -1  # Last finished movement ID
-        latest_sent_id: int = -1  # Last sent movement ID
-        cancelled_move_ids: tuple = ()  # Accepted movements discarded on stop
+        Cancelled IDs remain cancelled when later movements finish.
+        """
+
+        jps: List[float]  # Joint positions.
+        latest_finished_id: int = -1  # No completed move when -1.
+        latest_sent_id: int = -1  # No accepted move when -1.
+        cancelled_move_ids: tuple = ()  # Accepted moves discarded before completion.
 
     @dataclass
     class MovementRequest:
         """A joint trajectory split into completion-aware segments."""
 
-        motion_target: List[List[float]]  # List of joint positions for the trajectory
-        interval: float = 0.01  # Time interval between points
-        motion_id_begin: int = 0  # Starting movement ID
-        endpoint_index: Optional[List[int]] = None  # Segment endpoints
+        motion_target: List[List[float]]
+        interval: float = 0.01  # Seconds between trajectory points.
+        motion_id_begin: int = 0  # First segment's move ID.
+        endpoint_index: Optional[List[int]] = None  # Exclusive segment endpoints.
 
     @abstractmethod
     def initialize(self):
@@ -61,37 +63,25 @@ class ReducedRobotTaskInterface(ABC):
         if not isinstance(endpoint_index, (list, tuple)) or not endpoint_index:
             return False
 
-        prev_endpoint = 0
-        for endpoint_i in endpoint_index:
-            if isinstance(endpoint_i, bool) or not isinstance(endpoint_i, int):
+        previous_endpoint = 0
+        for endpoint in endpoint_index:
+            if isinstance(endpoint, bool) or not isinstance(endpoint, int):
                 return False
-            if endpoint_i <= prev_endpoint:
+            if endpoint <= previous_endpoint:
                 return False
-            prev_endpoint = endpoint_i
+            previous_endpoint = endpoint
 
-        return prev_endpoint == len(motion_target)
+        return previous_endpoint == len(motion_target)
 
-    @staticmethod
-    def _is_finite_real(value: object) -> bool:
-        if isinstance(value, bool) or not isinstance(value, Real):
-            return False
-        try:
-            return math.isfinite(value)
-        except OverflowError:
-            return False
+    # Preserve the validator name used by robot subclasses without another call.
+    _is_finite_real = staticmethod(is_finite_real)
 
     @staticmethod
     def _is_finite_trajectory(motion_target: List[List[float]]) -> bool:
-        return (
-            isinstance(motion_target, (list, tuple))
-            and all(
-                isinstance(point, (list, tuple))
-                and all(
-                    ReducedRobotTaskInterface._is_finite_real(value)
-                    for value in point
-                )
-                for point in motion_target
-            )
+        return isinstance(motion_target, (list, tuple)) and all(
+            isinstance(point, (list, tuple))
+            and all(ReducedRobotTaskInterface._is_finite_real(value) for value in point)
+            for point in motion_target
         )
 
     @abstractmethod

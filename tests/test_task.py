@@ -4,6 +4,7 @@ import concurrent.futures
 import threading
 import time
 import weakref
+from fractions import Fraction
 
 import pytest
 
@@ -174,6 +175,25 @@ def test_task_metadata_must_be_json_compatible():
         CallableTask(lambda request_id, content: content, metadata={"bad": {1, 2}})
 
 
+@pytest.mark.parametrize(
+    "copied, error_type, message",
+    [
+        (None, TypeError, "copied metadata must be a dictionary"),
+        ([], TypeError, "copied metadata must be a dictionary"),
+        (object(), TypeError, "copied metadata must be a dictionary"),
+        ({"value": object()}, ValueError, "metadata must be JSON-compatible"),
+        ({"value": float("nan")}, ValueError, "metadata must be JSON-compatible"),
+    ],
+)
+def test_task_metadata_validates_the_stored_copy(copied, error_type, message):
+    class Metadata(dict):
+        def __deepcopy__(self, memo):
+            return copied
+
+    with pytest.raises(error_type, match=message):
+        CallableTask(lambda request_id, content: content, metadata=Metadata(value=1))
+
+
 def test_callable_task_validates_callbacks_and_status_result():
     with pytest.raises(TypeError, match="call must"):
         CallableTask(None)
@@ -236,6 +256,43 @@ def test_callable_task_retries_selected_transient_failures():
     assert attempts == [1, 1, 1]
     assert task.peek_status()["total_retries"] == 2
     assert task.peek_status()["latest_attempts"] == 3
+
+
+@pytest.mark.parametrize(
+    "delay, max_delay",
+    [(Fraction(1, 1000), 1.0), (1.0, Fraction(1, 1000))],
+)
+def test_callable_retries_with_fractional_delays(delay, max_delay):
+    attempts = []
+    completed = threading.Event()
+
+    def call(request_id, content):
+        attempts.append(request_id)
+        if len(attempts) == 1:
+            raise ConnectionError("retry")
+        return content
+
+    task = CallableTask(
+        call, retry_policy=RetryPolicy(max_attempts=2, delay=delay, max_delay=max_delay)
+    )
+
+    def notify_finished():
+        if task.peek_status()["pending"] == 0:
+            completed.set()
+
+    task.set_completion_callback(notify_finished)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        try:
+            assert task.invoke_async(0, {"value": 1})
+            assert completed.wait(1)
+            response = task.peek_response(0)
+            assert response.result_type is PeekResponseResultType.ResponseFound
+            assert response.content == {"value": 1}
+            assert attempts == [0, 0]
+            assert task.peek_status()["total_retries"] == 1
+        finally:
+            task.stop()
 
 
 def test_callable_task_does_not_retry_unselected_failure():
@@ -385,7 +442,17 @@ def test_polling_task_degrades_after_failure_but_keeps_last_sample():
         task.stop()
 
 
-@pytest.mark.parametrize("value", [0, -1, float("nan"), True])
+@pytest.mark.parametrize(
+    "value",
+    [
+        0,
+        -1,
+        float("nan"),
+        True,
+        pytest.param(10**1000, id="huge-int"),
+        pytest.param(Fraction(10**1000, 3), id="huge-fraction"),
+    ],
+)
 def test_polling_task_validates_interval(value):
     with pytest.raises(ValueError, match="interval"):
         PollingTask(lambda: {}, interval=value)

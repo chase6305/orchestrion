@@ -4,6 +4,7 @@ import queue
 import threading
 import time
 import weakref
+from fractions import Fraction
 
 import pytest
 
@@ -366,6 +367,79 @@ def test_cancelled_history_is_independent_per_arm_and_survives_restart():
         assert states["right"].cancelled_move_ids == (second["right"],)
         assert not robot.wait_submodule_move("left", first["left"], timeout=0)
         assert robot.wait_submodule_move("right", first["right"], timeout=0)
+    finally:
+        robot.stop()
+
+
+def test_cancellation_snapshots_follow_single_batch_stop_and_restart():
+    robot = RobotTaskStub(
+        [0.0] * 3,
+        SubModuleTask("torso", 0, 1),
+        [SubModuleTask("left", 1, 1), SubModuleTask("right", 2, 1)],
+        interval=0.001,
+    )
+    try:
+        for _ in range(2):
+            robot.move_joint_trajectory_async([[0.1]], interval=0.001)
+            robot.move_submodules_trajectories_async(
+                {"left": [[0.2]], "right": [[0.3]]}, interval=0.001
+            )
+        initial_main = robot.query_state()
+        initial_submodules = robot.query_submodule_states()
+        assert robot.cancel_submodule_move("left", 0)
+        after_single = robot.query_submodule_states()
+        assert after_single["left"].cancelled_move_ids == (0,)
+        assert robot.cancel_submodule_moves({"left": 1, "right": 0}) == {
+            "left": True,
+            "right": True,
+        }
+        after_batch = robot.query_submodule_states()
+        assert after_batch["left"].cancelled_move_ids == (0, 1)
+        assert after_batch["right"].cancelled_move_ids == (0,)
+        assert after_single["left"].cancelled_move_ids == (0,)
+        assert initial_main.cancelled_move_ids == ()
+        assert all(not state.cancelled_move_ids for state in initial_submodules.values())
+
+        robot.stop()
+        assert robot.query_state().cancelled_move_ids == (0, 1)
+        assert robot.query_submodule_state("right").cancelled_move_ids == (0, 1)
+        assert after_batch["right"].cancelled_move_ids == (0,)
+        robot.initialize()
+        assert robot.move_joint_trajectory_async([[0.4]], interval=0.001) == 2
+        resumed = robot.move_submodules_trajectories_async(
+            {"left": [[0.5]], "right": [[0.6]]}, interval=0.001
+        )
+        assert robot.wait_move(time_out=1.0)
+        assert robot.wait_submodule_moves(resumed, timeout=1.0)
+        assert robot.query_state().cancelled_move_ids == (0, 1)
+        assert all(
+            state.cancelled_move_ids == (0, 1)
+            for state in robot.query_submodule_states().values()
+        )
+    finally:
+        robot.stop()
+
+
+def test_fraction_scheduler_and_submodule_intervals():
+    interval = Fraction(1, 1000)
+    robot = RobotTaskStub(
+        [0.0] * 3,
+        SubModuleTask("torso", 0, 1),
+        [SubModuleTask("left", 1, 1), SubModuleTask("right", 2, 1)],
+        interval=interval,
+    )
+    robot.initialize()
+    try:
+        first = robot.move_submodule_trajectory_async("left", [[0.1]], interval)
+        assert robot.wait_submodule_move("left", first, timeout=Fraction(1))
+        moves = robot.move_submodules_trajectories_async(
+            {"left": [[0.2]], "right": [[0.3]]}, interval
+        )
+        assert robot.wait_submodule_moves(moves, timeout=Fraction(1))
+        states = robot.query_submodule_states()
+        assert states["left"].positions == [0.2]
+        assert states["right"].positions == [0.3]
+        robot.stop(timeout=Fraction(1))
     finally:
         robot.stop()
 
@@ -780,3 +854,76 @@ def test_stopping_robot_cancels_all_unfinished_submodule_moves():
         not robot.wait_submodule_move("gripper", move_id, timeout=0.01)
         for move_id in move_ids
     )
+
+
+@pytest.mark.parametrize("failure_at", ["initial", "main", "submodule"])
+def test_worker_callback_failure_cancels_motion_and_allows_explicit_restart(
+    monkeypatch, failure_at
+):
+    robot = make_robot(interval=0.001)
+    entered, release, waiting = threading.Event(), threading.Event(), threading.Event()
+    callback_name = (
+        "_on_initial_state_bg_thread"
+        if failure_at == "initial"
+        else "_on_robot_state_bg_thread"
+    )
+    original_callback = getattr(robot, callback_name)
+    original_wait = robot._state_condition.wait
+
+    def fail_callback(*args):
+        entered.set()
+        assert release.wait(1.0)
+        raise RuntimeError("device callback failed")
+
+    def observe_wait(timeout=None):
+        waiting.set()
+        return original_wait(timeout)
+
+    monkeypatch.setattr(robot, callback_name, fail_callback)
+    monkeypatch.setattr(robot._state_condition, "wait", observe_wait)
+    is_submodule = failure_at == "submodule"
+    if is_submodule:
+        move_id = robot.move_submodule_trajectory_async("gripper", [[0.5]])
+    else:
+        move_id = robot.move_joint_trajectory_async([[0.1, 0.2, 0.3]])
+    robot.initialize()
+    try:
+        assert entered.wait(1.0)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            if is_submodule:
+                result = executor.submit(robot.wait_submodule_move, "gripper", move_id)
+            else:
+                result = executor.submit(robot.wait_move)
+            try:
+                assert waiting.wait(1.0)
+                release.set()
+                assert result.result(timeout=1.0) is False
+            finally:
+                release.set()
+                robot.stop(timeout=1.0)
+
+        state = (
+            robot.query_submodule_state("gripper")
+            if is_submodule
+            else robot.query_state()
+        )
+        assert move_id in state.cancelled_move_ids
+        assert robot.move_joint_trajectory_async([[0.0, 0.0, 0.0]]) == -1
+        assert robot.move_submodule_trajectory_async("gripper", [[0.0]]) == -1
+
+        monkeypatch.setattr(robot, callback_name, original_callback)
+        robot.initialize()
+        if is_submodule:
+            later_id = robot.move_submodule_trajectory_async("gripper", [[0.8]])
+            assert robot.wait_submodule_move("gripper", later_id, timeout=1.0)
+            state = robot.query_submodule_state("gripper")
+        else:
+            later_id = robot.move_joint_trajectory_async([[0.4, 0.5, 0.6]])
+            assert robot.wait_move(time_out=1.0)
+            state = robot.query_state()
+        assert later_id > move_id
+        assert move_id in state.cancelled_move_ids
+        assert later_id not in state.cancelled_move_ids
+    finally:
+        release.set()
+        robot.stop(timeout=1.0)

@@ -9,7 +9,7 @@ from collections import deque
 from contextvars import ContextVar
 from dataclasses import replace
 from functools import partial
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from orchestrion.schema import CommandValidationError
 
@@ -43,6 +43,9 @@ from .model import (
 )
 from .recovery import restore_journal
 from .run import WorkflowRun
+
+# (-priority, sequence, run, node): descending priority, FIFO for ties.
+_ReadyEntry = Tuple[int, int, WorkflowRun, CompiledNode]
 
 _current_execution: ContextVar = ContextVar(
     "orchestrion_workflow_execution", default=()
@@ -142,9 +145,11 @@ class WorkflowEngine:
         self._workers = set()
         self._running_count = 0
         self._ready_sequence = 0
-        self._ready_heap = []
+        self._ready_heap: List[_ReadyEntry] = []
         self._ready_queued = set()
-        self._resource_waiters = {name: [] for name in self._resources}
+        self._resource_waiters: Dict[str, List[_ReadyEntry]] = {
+            name: [] for name in self._resources
+        }
         self._loop = None
         self._wake = None
         self._idle = None
@@ -650,24 +655,26 @@ class WorkflowEngine:
         self._wake_waiters(claim.resource for claim in claims)
 
     @staticmethod
-    def _is_ready(entry) -> bool:
-        return entry[2]._results[entry[3].node.node_id].status == NodeStatus.READY
+    def _is_ready(entry: _ReadyEntry) -> bool:
+        _, _, run, item = entry
+        return run._results[item.node.node_id].status == NodeStatus.READY
 
-    def _head(self, resource: str):
+    def _head(self, resource: str) -> Optional[_ReadyEntry]:
         waiters = self._resource_waiters[resource]
         while waiters and not self._is_ready(waiters[0]):
             heapq.heappop(waiters)
         return waiters[0] if waiters else None
 
-    def _can_start(self, entry) -> bool:
+    def _can_start(self, entry: _ReadyEntry) -> bool:
+        _, _, _, item = entry
         return all(
             self._head(claim.resource) is entry
             and self._used[claim.resource] + claim.units
             <= self._resources[claim.resource].capacity
-            for claim in entry[3].claims
+            for claim in item.claims
         )
 
-    def _queue_candidate(self, entry) -> None:
+    def _queue_candidate(self, entry: _ReadyEntry) -> None:
         if entry[1] not in self._ready_queued and self._can_start(entry):
             heapq.heappush(self._ready_heap, entry)
             self._ready_queued.add(entry[1])
@@ -907,8 +914,14 @@ class WorkflowEngine:
             if self._max_input_bytes is not None:
                 inputs = _snapshot(inputs, max_bytes=self._max_input_bytes)
             action = self._actions[node.action]
-            if action.input_schema:
+            if action.input_schema is not None:
                 inputs = action.input_schema.validate(inputs)
+                if not isinstance(inputs, dict):
+                    raise CommandValidationError(
+                        "validated action inputs must be a dictionary"
+                    )
+                # Schema copies or overrides can change the prepared payload.
+                inputs = _snapshot(inputs, max_bytes=self._max_input_bytes)
             # Recheck after input preparation: a delayed event-loop timer must
             # not allow a new device command to slip past an expired budget.
             self._check_run_deadline(run)
@@ -917,9 +930,7 @@ class WorkflowEngine:
             context.raise_if_cancelled()
             if self._journal is not None:
                 # Commit intent before effects; recheck the budget after fsync.
-                await self._dispatch_barrier.commit(
-                    run, run._results[node.node_id]
-                )
+                await self._dispatch_barrier.commit(run, run._results[node.node_id])
                 self._check_run_deadline(run)
                 if node_deadline is not None and self._loop.time() >= node_deadline:
                     self._expire_node(run, node.node_id)
@@ -934,9 +945,16 @@ class WorkflowEngine:
                 if not isinstance(output, dict):
                     raise ActionOutputError("action output must be a dictionary")
                 try:
-                    output = action.output_schema.validate(output)
+                    validated_output = action.output_schema.validate(output)
                 except CommandValidationError as exc:
                     raise ActionOutputError(str(exc)) from exc
+                # Retain only the final JSON copy after schema validation succeeds.
+                output = None
+                if not isinstance(validated_output, dict):
+                    raise ActionOutputError("action output must be a dictionary")
+                output = _snapshot(
+                    validated_output, max_bytes=self._max_output_bytes
+                )
         except ActionCancelled as exc:
             status = NodeStatus.CANCELLED
             error = _error_text(exc)
@@ -961,6 +979,13 @@ class WorkflowEngine:
             if timer is not None:
                 timer.cancel()
             _current_execution.reset(execution_token)
+
+        if status != NodeStatus.SUCCEEDED and output is not None:
+            # A failing custom schema can mutate its diagnostic data.
+            try:
+                output = _snapshot(output, max_bytes=self._max_output_bytes)
+            except Exception:
+                output = None
 
         # An adapter that monopolizes the loop can postpone timers; completion
         # still has to respect the elapsed budget. This cannot provide hard stop.

@@ -216,11 +216,15 @@ class SQLiteJournal:
         self._owner = weakref.ref(engine)
         self._bound = True
 
-    def _event(self, db, run_id, node_id, kind, detail=None) -> None:
+    def _event(self, db, run_id, node_id, kind, detail=None, *, trim=True) -> None:
         db.execute(
             "INSERT INTO events(run_id,node_id,kind,timestamp,detail) VALUES(?,?,?,?,?)",
             (run_id, node_id, kind, time.time(), _json(detail)),
         )
+        if trim:
+            self._trim_events(db, run_id)
+
+    def _trim_events(self, db, run_id) -> None:
         # Indexed per-run history, independent of potentially interleaved run IDs.
         db.execute(
             "DELETE FROM events WHERE run_id=? AND sequence <= ("
@@ -266,6 +270,7 @@ class SQLiteJournal:
     def _start_many(self, records) -> None:
         """Commit a dispatch barrier before any of its adapters may enter."""
         with self._transaction() as db:
+            affected_run_ids = set()
             for run_id, result in records:
                 cursor = db.execute(
                     "UPDATE nodes SET status='running', started_at=?, lease_active=1 "
@@ -276,7 +281,12 @@ class SQLiteJournal:
                     raise JournalError(
                         "missing durable operation record before dispatch"
                     )
-                self._event(db, run_id, result.node_id, "dispatch_intent")
+                self._event(db, run_id, result.node_id, "dispatch_intent", trim=False)
+                affected_run_ids.add(run_id)
+            # Readers only see the committed batch, so trim each run once while
+            # preserving both the exact history limit and transaction atomicity.
+            for run_id in affected_run_ids:
+                self._trim_events(db, run_id)
 
     def _settle(self, run_id: str, result: NodeResult) -> None:
         self._settle_many(run_id, (result,))
@@ -303,7 +313,10 @@ class SQLiteJournal:
                 )
                 if cursor.rowcount != 1:
                     raise JournalError("missing durable operation result record")
-                self._event(db, run_id, result.node_id, "settled", result.status.value)
+                self._event(
+                    db, run_id, result.node_id, "settled", result.status.value, trim=False
+                )
+            self._trim_events(db, run_id)
 
     def _finish(self, run_id: str, status: RunStatus) -> None:
         with self._transaction() as db:

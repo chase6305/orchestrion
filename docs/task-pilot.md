@@ -26,6 +26,15 @@ dependent service requests become `CANCELLED`. Completion and cancellation histo
 survive restart. Custom backends can report cancelled main moves through
 `ReducedRobotState.cancelled_move_ids`.
 
+Adapter request IDs and movement counters must be Python integers; boolean and float
+aliases are rejected. The `-1` movement sentinel means no move yet. Invalid
+submission counters reject new requests; invalid completion counters fail waiting
+requests before a peripheral is invoked.
+
+An unexpected built-in motion-worker failure stops local scheduling, cancels
+unfinished move IDs and wakes waiters. Restart explicitly with `initialize()`
+after the worker exits. Device adapters must handle physical stopping themselves.
+
 For modular robots, `move_submodule_trajectory_async()` returns a completion-aware
 move ID. `move_submodule_async()` remains a boolean compatibility wrapper.
 `move_submodules_trajectories_async({name: path, ...})` validates every trajectory
@@ -59,9 +68,11 @@ protocol-level device deduplication after a lost network response. The
 
 Task response caches and pilot history are independent. A positive
 `max_result_count` on a function task bounds completed responses while preserving
-pending work. A response evicted before collection becomes a failed request;
-allow room for completion bursts. Request-ID deduplication metadata remains for
-the task's lifetime, including after response pruning.
+pending work. It keeps the largest request IDs, regardless of completion order;
+a negative limit is unlimited and zero is invalid. A response evicted before
+collection becomes a failed request, so allow room for completion bursts.
+Request-ID deduplication metadata remains for the task's lifetime, including
+after response pruning.
 
 ## Device adapters
 
@@ -84,6 +95,11 @@ callback exposes device facts; metadata and schemas appear in
 `pilot.describe_services()` without device I/O. Run
 `python -m examples.simulated_multi_peripheral` for command, telemetry and health
 adapters.
+
+Threaded tasks report `health="offline"` until bound to an executor and after
+stop. A `CallableTask` status callback may refine device health and availability;
+`initialized` always describes the adapter's executor binding. Device facts cannot
+make a stopped adapter available for new commands.
 
 Use `RequestSchema` and `FieldSpec` to reject malformed commands before device I/O:
 
@@ -112,11 +128,13 @@ best-effort and represents a failing device as `{"available": False, "error": ..
 `query_health()` combines scheduler liveness, robot state, request counts and
 peripheral statuses in a JSON-compatible snapshot.
 
-Every health snapshot has a monotonic `revision`. Use
-`wait_health_change(revision, timeout=...)` to wait for changes without busy
-polling; timeout returns `None`. Adapters use `DeviceHealth` values (`unknown`,
-`connecting`, `online`, `degraded`, `offline`) and wall-clock `observed_at` values.
-`query_health(stale_after=...)` marks stale online observations as degraded.
+The monotonic `revision` advances on pilot state transitions and adapter
+notifications. `wait_health_change(revision, timeout=...)` waits for a newer
+revision; timeout returns `None`. Passive device changes and sample aging do not
+notify: `query_health()` reads current state, and `query_health(stale_after=...)`
+marks stale online observations as degraded. Adapters use `DeviceHealth` values
+(`unknown`, `connecting`, `online`, `degraded`, `offline`) and wall-clock
+`observed_at` values.
 
 Use `with TaskPilot(...) as pilot:` for lexical ownership, or pair `initialize()`
 with `stop()` in `finally`. `is_running`, `service_names` and the defensive-copy
@@ -128,3 +146,9 @@ timeouts and callbacks must exit cooperatively. After a join timeout, another
 `stop()` can wait for the worker. Restart is rejected until old workers exit, and
 an owned executor cannot be reused after shutdown. Built-in robots reject motion
 while stopped; submissions prepared across a stop/restart boundary are rejected.
+
+Configured sampling and scheduler intervals, trajectory point intervals and stop
+timeouts must fit `threading.TIMEOUT_MAX`. Unsupported values are rejected before
+queue or lifecycle changes. Deadline-based request and movement waits retain
+larger total budgets by splitting native waits. `RetryPolicy` can compute larger
+delays, but a callable task rejects an unsupported delay before waiting.

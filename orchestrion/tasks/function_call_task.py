@@ -5,6 +5,7 @@ from abc import abstractmethod
 from functools import partial
 from typing import Callable, Dict, Optional
 
+from orchestrion.health import DeviceHealth
 from orchestrion.retry import RetryPolicy
 from orchestrion.schema import RequestSchema
 from orchestrion.tasks.generic_task import GenericTask
@@ -40,7 +41,10 @@ class InPlaceFunctionCallTask(GenericTask):
     def __init__(
         self, max_result_count: int = -1, metadata: Optional[Dict] = None
     ):
-        """Retain at most max_result_count responses; a negative value is unlimited."""
+        """Retain responses with the largest IDs, up to max_result_count.
+
+        A negative limit retains every response; zero is invalid.
+        """
         super().__init__(metadata=metadata)
         _validate_max_result_count(max_result_count)
         self._result_map: Dict[int, PeekResponseResult] = {}
@@ -87,14 +91,17 @@ class InPlaceFunctionCallTask(GenericTask):
 
     def _store_response(self, response: PeekResponseResult) -> None:
         request_id = response.request_id
+        expired_response = None
         with self._lock:
             self._pending_request_ids.discard(request_id)
             self._result_map[request_id] = response
             if self._retention is not None:
                 expired_id = self._retention.add(request_id)
                 if expired_id is not None:
-                    self._result_map.pop(expired_id, None)
+                    expired_response = self._result_map.pop(expired_id, None)
 
+        # SDK result destructors may query task state; release them without the lock.
+        del expired_response
         self._notify_completion()
 
     def peek_response(self, request_id: int) -> PeekResponseResult:
@@ -133,12 +140,13 @@ class InPlaceFunctionCallTask(GenericTask):
     def forget_response(self, request_id: int) -> bool:
         _validate_request_id(request_id)
         with self._lock:
-            if request_id not in self._result_map:
+            response = self._result_map.pop(request_id, None)
+            if response is None:
                 return False
-            self._result_map.pop(request_id)
             if self._retention is not None:
                 self._retention.discard(request_id)
-            return True
+        del response
+        return True
 
 
 class ThreadedPoolFunctionCallTask(GenericTask):
@@ -152,7 +160,10 @@ class ThreadedPoolFunctionCallTask(GenericTask):
     def __init__(
         self, max_result_count: int = -1, metadata: Optional[Dict] = None
     ):
-        """Bound completed responses while retaining every pending future."""
+        """Retain completed responses with the largest IDs and all pending futures.
+
+        A negative limit retains every response; zero is invalid.
+        """
         super().__init__(metadata=metadata)
         _validate_max_result_count(max_result_count)
         self._borrowed_executor: Optional[concurrent.futures.ThreadPoolExecutor] = (
@@ -225,6 +236,7 @@ class ThreadedPoolFunctionCallTask(GenericTask):
     def _on_future_done(
         self, request_id: int, future: concurrent.futures.Future
     ) -> None:
+        expired_future = None
         with self._lock:
             self._record_outcome_locked(request_id, future)
             failed = self._outcomes.get(request_id) == "failed"
@@ -236,7 +248,9 @@ class ThreadedPoolFunctionCallTask(GenericTask):
                 # never needs to be scanned, sorted, or cancelled to retain K results.
                 expired_id = self._retention.add(request_id)
                 if expired_id is not None:
-                    self._remove_future_locked(expired_id)
+                    expired_future = self._remove_future_locked(expired_id)
+        # Keep evicted results alive until SDK destructors can safely take the lock.
+        del expired_future
         # Logging and SDK exception formatters may call arbitrary application
         # code. Keep them outside the task lock, and always notify observers.
         try:
@@ -264,12 +278,15 @@ class ThreadedPoolFunctionCallTask(GenericTask):
         self._outcomes[request_id] = outcome
         self._outcome_counts[outcome] += 1
 
-    def _remove_future_locked(self, request_id: int) -> None:
-        self._future_map.pop(request_id, None)
+    def _remove_future_locked(
+        self, request_id: int
+    ) -> Optional[concurrent.futures.Future]:
+        future = self._future_map.pop(request_id, None)
         self._pending_futures.pop(request_id, None)
         outcome = self._outcomes.pop(request_id, None)
         if outcome is not None:
             self._outcome_counts[outcome] -= 1
+        return future
 
     def peek_response(self, request_id: int) -> PeekResponseResult:
         """Return a response snapshot or distinguish pending, flushed and unsent IDs."""
@@ -314,16 +331,24 @@ class ThreadedPoolFunctionCallTask(GenericTask):
         return future is not None and future.cancel()
 
     def peek_status(self) -> Dict:
-        """Count retained outcomes without revisiting already completed futures."""
+        """Return executor binding and retained outcome counts."""
         with self._lock:
-            # Future completion precedes callback dispatch. Reconcile only pending
-            # entries so a delayed callback does not make the snapshot stale.
-            for request_id, future in tuple(self._pending_futures.items()):
-                if future.done():
+            # Completion precedes callback dispatch. Collect before changing the
+            # pending map; unfinished entries do not need a temporary copy.
+            if self._pending_futures:
+                completed_requests = [
+                    (request_id, future)
+                    for request_id, future in self._pending_futures.items()
+                    if future.done()
+                ]
+                for request_id, future in completed_requests:
                     self._record_outcome_locked(request_id, future)
+            initialized = self._borrowed_executor is not None
+            health = DeviceHealth.ONLINE if initialized else DeviceHealth.OFFLINE
             return {
                 "execution": "thread_pool",
-                "initialized": self._borrowed_executor is not None,
+                "initialized": initialized,
+                "health": health.value,
                 "latest_request_id": self._latest_request_id,
                 "retained_results": len(self._future_map),
                 "pending": len(self._pending_futures),
@@ -478,14 +503,20 @@ class CallableTask(ThreadedPoolFunctionCallTask):
                     self._total_retries += 1
                 self._notify_completion()
                 delay = self._retry_policy.delay_before(attempt + 1)
-                if stop_event.wait(delay):
+                if delay > threading.TIMEOUT_MAX and not stop_event.is_set():
+                    raise ValueError(
+                        "retry delay must not exceed threading.TIMEOUT_MAX"
+                    )
+                if stop_event.wait(float(delay)):
                     raise concurrent.futures.CancelledError(
                         "Callable task stopped during retry backoff"
                     )
         raise AssertionError("unreachable")
 
     def peek_status(self) -> Dict:
+        """Merge device facts with the adapter's executor binding."""
         snapshot = super().peek_status()
+        initialized = snapshot["initialized"]
         with self._retry_lock:
             snapshot.update(
                 {
@@ -494,14 +525,17 @@ class CallableTask(ThreadedPoolFunctionCallTask):
                     "last_retry_error": self._last_retry_error,
                 }
             )
-        if self._status is None:
-            return snapshot
-        custom = self._status()
-        if custom is not None:
-            if not isinstance(custom, dict):
-                raise TypeError("status callable must return a dictionary or None")
-            custom = copy.deepcopy(custom)
-            if not isinstance(custom, dict):
-                raise TypeError("copied status must be a dictionary")
-            snapshot.update(custom)
+        if self._status is not None:
+            custom = self._status()
+            if custom is not None:
+                if not isinstance(custom, dict):
+                    raise TypeError("status callable must return a dictionary or None")
+                custom = copy.deepcopy(custom)
+                if not isinstance(custom, dict):
+                    raise TypeError("copied status must be a dictionary")
+                snapshot.update(custom)
+        # Device facts cannot make an unbound adapter accept commands.
+        snapshot["initialized"] = initialized
+        if not initialized:
+            snapshot.update(health=DeviceHealth.OFFLINE.value, available=False)
         return snapshot

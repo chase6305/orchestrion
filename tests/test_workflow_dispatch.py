@@ -43,8 +43,8 @@ def test_concurrent_intents_are_committed_atomically_before_any_adapter_entry(tm
             ) as engine:
                 original = journal._event
 
-                def observe(db, run_id, node_id, kind, detail=None):
-                    original(db, run_id, node_id, kind, detail)
+                def observe(db, run_id, node_id, kind, detail=None, *, trim=True):
+                    original(db, run_id, node_id, kind, detail, trim=trim)
                     if kind == "dispatch_intent":
                         with sqlite3.connect(path) as reader:
                             observations.append(
@@ -68,6 +68,55 @@ def test_concurrent_intents_are_committed_atomically_before_any_adapter_entry(tm
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("history_limit", [1, 2, 3])
+def test_interleaved_dispatch_batches_keep_each_runs_event_limit(tmp_path, history_limit):
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls = []
+
+        with SQLiteJournal(
+            tmp_path / "cell.db", max_events_per_run=history_limit
+        ) as journal:
+            async def inspect(context, inputs):
+                events = journal.events(context.run_id)
+                assert len(events) == history_limit
+                assert all(event["run_id"] == context.run_id for event in events)
+                assert all(event["kind"] == "dispatch_intent" for event in events)
+                assert [event["node_id"] for event in events] == [
+                    str(index) for index in range(6 - history_limit, 6)
+                ]
+                calls.append(context.operation_id)
+                if len(calls) == 12:
+                    entered.set()
+                await asyncio.wait_for(release.wait(), 2)
+
+            async with WorkflowEngine(
+                [Action("inspect", inspect)], journal=journal
+            ) as engine:
+                runs = [
+                    engine.submit(
+                        Workflow(tuple(Node(str(index), "inspect") for index in range(6)))
+                    )
+                    for _ in range(2)
+                ]
+                try:
+                    await asyncio.wait_for(entered.wait(), 1)
+                finally:
+                    release.set()
+                results = await asyncio.gather(*(run.wait(2) for run in runs))
+                assert all(result.status == RunStatus.SUCCEEDED for result in results)
+                for run in runs:
+                    events = journal.events(run.run_id)
+                    assert len(events) == history_limit
+                    assert events[-1]["kind"] == "finished"
+                    assert all(
+                        event["kind"] in {"settled", "finished"} for event in events
+                    )
+                    assert journal.events(run.run_id, after=events[-1]["sequence"]) == []
+
+    asyncio.run(scenario())
+
+
 def test_fault_mid_dispatch_barrier_does_not_enter_any_adapter_or_keep_partial_intents(
     tmp_path,
 ):
@@ -86,10 +135,10 @@ def test_fault_mid_dispatch_barrier_does_not_enter_any_adapter_or_keep_partial_i
             ) as engine:
                 original = journal._event
 
-                def fault(db, run_id, node_id, kind, detail=None):
+                def fault(db, run_id, node_id, kind, detail=None, *, trim=True):
                     if kind == "dispatch_intent" and node_id == "3":
                         raise JournalError("disk full during group dispatch")
-                    original(db, run_id, node_id, kind, detail)
+                    original(db, run_id, node_id, kind, detail, trim=trim)
 
                 with patch.object(journal, "_event", side_effect=fault):
                     run = engine.submit(

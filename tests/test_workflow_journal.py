@@ -995,15 +995,15 @@ def test_graph_stop_is_visible_as_one_atomic_durable_transition(tmp_path, stop):
                 for i in range(40)
             )
         )
-        with SQLiteJournal(path) as journal:
+        with SQLiteJournal(path, max_events_per_run=3) as journal:
             async with WorkflowEngine(
                 [Action("fail", fail)], journal=journal
             ) as engine:
                 original = journal._event
                 observations = []
 
-                def inspect(db, run_id, node_id, kind, detail=None):
-                    original(db, run_id, node_id, kind, detail)
+                def inspect(db, run_id, node_id, kind, detail=None, *, trim=True):
+                    original(db, run_id, node_id, kind, detail, trim=trim)
                     if kind == "settled":
                         with sqlite3.connect(path) as reader:
                             observations.append(
@@ -1024,6 +1024,11 @@ def test_graph_stop_is_visible_as_one_atomic_durable_transition(tmp_path, stop):
                     NodeStatus(node["status"]).terminal
                     for node in journal.get_run(run.run_id)["nodes"]
                 )
+                events = journal.events(run.run_id)
+                assert len(events) == 3
+                assert [event["kind"] for event in events] == [
+                    "settled", "settled", "finished"
+                ]
 
     asyncio.run(scenario())
 
@@ -1044,10 +1049,10 @@ def test_fault_mid_graph_stop_rolls_back_entire_durable_transition(tmp_path, sto
             ) as engine:
                 original = journal._event
 
-                def disk_full(db, run_id, node_id, kind, detail=None):
+                def disk_full(db, run_id, node_id, kind, detail=None, *, trim=True):
                     if kind == "settled" and node_id == "5":
                         raise JournalError("disk full mid graph transition")
-                    original(db, run_id, node_id, kind, detail)
+                    original(db, run_id, node_id, kind, detail, trim=trim)
 
                 with patch.object(journal, "_event", side_effect=disk_full):
                     run = engine.submit(

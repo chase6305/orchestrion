@@ -65,6 +65,7 @@ def compile_workflow(
     max_nodes: int,
     max_input_bytes: Optional[int] = None,
 ) -> Tuple[CompiledNode, ...]:
+    """Compile against the validated action registry owned by a WorkflowEngine."""
     if not isinstance(workflow, Workflow):
         raise TypeError("expected a Workflow")
     if len(workflow.nodes) > max_nodes:
@@ -79,23 +80,26 @@ def compile_workflow(
             raise ValueError("duplicate node ID: " + node.node_id)
         if node.action not in actions:
             raise ValueError("unknown action: " + node.action)
+        action = actions[node.action]
         references = tuple(_output_references(node.inputs))
         dependencies = tuple(
             dict.fromkeys(
                 (*node.after, *(reference.node_id for reference in references))
             )
         )
-        claims = merge_claims(actions[node.action].claims, node.claims)
+        # Registered action claims are immutable and already normalized. Only
+        # node-level overrides require merging and allocating new claim objects.
+        claims = (
+            merge_claims(action.claims, node.claims) if node.claims else action.claims
+        )
         check_claims(claims, resources)
-        schema = actions[node.action].input_schema
+        schema = action.input_schema
         if schema is not None:
             if references:
                 schema.validate_template(node.inputs, is_deferred=_is_output_reference)
             else:
                 schema.validate(dict(node.inputs))
-        nodes[node.node_id] = CompiledNode(
-            node, dependencies, claims, actions[node.action].version
-        )
+        nodes[node.node_id] = CompiledNode(node, dependencies, claims, action.version)
 
     successors = {node_id: [] for node_id in nodes}
     indegree = {}
