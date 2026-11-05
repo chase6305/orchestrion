@@ -107,7 +107,7 @@ class ReplayFrame:
 
 
 def replay_frame_index(frames: Sequence[ReplayFrame], elapsed: float) -> int:
-    """Return the last frame at or before a replay timestamp."""
+    """Return the last frame at/before the cursor, clamped to the first frame."""
     if not frames:
         raise ValueError("replay requires at least one frame")
     # Search frames directly; bisect's key argument requires Python 3.10+.

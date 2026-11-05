@@ -461,7 +461,7 @@ class WorkflowEngine:
         return scheduler_snapshot(self)
 
     def resource_snapshot(self) -> Dict[str, Any]:
-        """Expose occupied capacity and unresolved operations, including completed runs."""
+        """Report capacity and unresolved operations, even after runs complete."""
         recovery_pending = self._journal is not None and not self._journal_loaded
         return {
             "recovery_pending": recovery_pending,

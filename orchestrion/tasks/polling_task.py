@@ -116,7 +116,9 @@ class PollingTask(InPlaceFunctionCallTask):
     def _call_fn(self, request_id: int, content: Optional[Dict]) -> Optional[Dict]:
         with self._sample_lock:
             if self._observed_at is None:
-                raise RuntimeError(self._last_error or "No telemetry sample is available")
+                raise RuntimeError(
+                    self._last_error or "No telemetry sample is available"
+                )
             sample = self._latest_sample
             observed_at = self._observed_at
         # Published samples are replaced, never mutated; copying needs no lock.
