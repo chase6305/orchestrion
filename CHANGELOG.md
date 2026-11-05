@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Reuse timing validation in the HTTP demo client, rejecting float overflow and
+  underflow before socket operations while accepting representable fractions.
 - Clean up gripper request state at future completion, making concurrent queued
   cancellation idempotent and preventing late cancellation flags from accumulating.
 - Validate Viser gripper request IDs before sequence reservation or cancellation,
