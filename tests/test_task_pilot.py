@@ -677,6 +677,7 @@ def test_pruned_cancelled_call_releases_its_response_after_cleanup(
     stop_before_completion, failed
 ):
     submitted = threading.Event()
+    call_started = threading.Event()
     release = threading.Event()
     reclaimed = threading.Event()
     handles = []
@@ -687,6 +688,7 @@ def test_pruned_cancelled_call_releases_its_response_after_cleanup(
     def call(request_id, content):
         resource = Payload()
         handles.append(weakref.ref(resource, lambda _: reclaimed.set()))
+        call_started.set()
         assert release.wait(2)
         if failed:
             raise RuntimeError("SDK cleanup failed")
@@ -711,6 +713,7 @@ def test_pruned_cancelled_call_releases_its_response_after_cleanup(
                     "device", sync_option=MoveSyncOption.no_sync()
                 )
                 assert submitted.wait(1)
+                assert call_started.wait(1)
                 assert pilot.cancel_request(request_id)
                 assert pilot.prune_completed_requests(keep_last=0) == 1
                 assert not task.forget_response(request_id)
