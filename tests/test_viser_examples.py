@@ -207,6 +207,48 @@ def test_replay_capture_uses_one_event_snapshot_for_stage_and_payload(owners):
     assert runtime.replay_frames == [frame]
 
 
+def test_concurrent_replay_capture_keeps_timestamps_in_append_order(monkeypatch):
+    reading, release = threading.Event(), threading.Event()
+    event_lock = threading.Lock()
+
+    class Runtime(DualArmViserRuntime):
+        event_reads = 0
+
+        @property
+        def events(self):
+            with event_lock:
+                self.event_reads += 1
+                first_read = self.event_reads == 1
+            if first_read:
+                reading.set()
+                assert release.wait(2)
+            return []
+
+    clock = iter([10.0, 20.0])
+    module = importlib.import_module("examples.dual_arm.viser")
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    runtime = object.__new__(Runtime)
+    runtime._capture_started_at = None
+    runtime._replay_lock = threading.Lock()
+    runtime._replay_frames = []
+    arguments = (
+        {"left": [0.0] * 3, "right": [0.0] * 3},
+        {"left": 0.0, "right": 0.0},
+        None,
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(runtime._capture_frame, *arguments)
+        try:
+            assert reading.wait(1)
+            executor.submit(runtime._capture_frame, *arguments).result(timeout=1)
+        finally:
+            release.set()
+        first.result(timeout=1)
+    frames = runtime.replay_frames
+    assert frames[0].elapsed == 0.0
+    assert frames[1].elapsed >= frames[0].elapsed
+
+
 def test_dual_arm_replay_frame_rejects_invalid_payload_owner():
     with pytest.raises(ValueError, match="invalid state"):
         ReplayFrame.from_dict(

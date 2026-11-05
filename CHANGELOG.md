@@ -6,6 +6,7 @@
   copy on every seek or playback tick while preserving duplicate-time behavior.
 - Capture replay stage and payload ownership from one event snapshot, avoiding
   duplicate history copies and inconsistent frames during concurrent updates.
+  Stamp frames under the append lock so overlapping final capture stays ordered.
 - Vectorize Viser joint interpolation while preserving endpoint weights and
   independent trajectory points.
 - Resolve workflow output references on demand instead of projecting every

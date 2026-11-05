@@ -493,26 +493,27 @@ class DualArmViserRuntime(DualArmRuntime):
         zone_owner: Optional[str],
     ) -> ReplayFrame:
         """Capture stage and payload ownership from one isolated event snapshot."""
-        now = time.monotonic()
-        if self._capture_started_at is None:
-            self._capture_started_at = now
         events = self.events
         payload_owner = "table"
         for event in reversed(events):
             if event["event"] == "payload_owner_changed":
                 payload_owner = event["owner"]
                 break
-        frame = ReplayFrame(
-            elapsed=now - self._capture_started_at,
-            left_arm=tuple(arms["left"]),
-            right_arm=tuple(arms["right"]),
-            left_gripper=grippers["left"],
-            right_gripper=grippers["right"],
-            zone_owner=zone_owner,
-            payload_owner=payload_owner,
-            event=events[-1]["event"] if events else "starting",
-        )
         with self._replay_lock:
+            # Stamp in append order when the monitor and final capture overlap.
+            now = time.monotonic()
+            if self._capture_started_at is None:
+                self._capture_started_at = now
+            frame = ReplayFrame(
+                elapsed=now - self._capture_started_at,
+                left_arm=tuple(arms["left"]),
+                right_arm=tuple(arms["right"]),
+                left_gripper=grippers["left"],
+                right_gripper=grippers["right"],
+                zone_owner=zone_owner,
+                payload_owner=payload_owner,
+                event=events[-1]["event"] if events else "starting",
+            )
             self._replay_frames.append(frame)
         return frame
 
