@@ -7,7 +7,8 @@
 - Reuse terminal counts when pruning request history and retain removed SDK
   payloads until state-lock release, preserving active waiters and newest results.
 - Bound slow gripper animation preparation while preserving nominal travel time;
-  avoid interval underflow for tiny speeds and stationary commands.
+  avoid interval underflow for tiny speeds and stationary commands. Reuse pending
+  futures on gripper shutdown instead of inspecting completed response history.
 - Correct the Viser pick-and-place payload fit, grasp width and approach/lift
   paths; replace the README recording with the corrected runtime sequence.
 - Reduce scheduler and snapshot overhead with linear motion-wait scans, cached

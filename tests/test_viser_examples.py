@@ -673,6 +673,35 @@ def test_cancel_before_gripper_move_id_publication_stops_motion(reentrant):
             task.stop()
 
 
+def test_stopping_gripper_ignores_completed_history_and_cancels_queued_work(
+    monkeypatch,
+):
+    robot = RobotStub()
+    task = ViserGripperTask(robot)
+    completed = threading.Event()
+    release_worker = threading.Event()
+    task.set_completion_callback(completed.set)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        try:
+            assert task.invoke_async(0, {"action": "close"})
+            assert completed.wait(1)
+            finished = task._future_map[0]
+            inspect_finished = Mock(wraps=finished.done)
+            monkeypatch.setattr(finished, "done", inspect_finished)
+            blocker = executor.submit(release_worker.wait, 2.0)
+            assert task.invoke_async(1, {"action": "open"})
+            task.stop()
+            inspect_finished.assert_not_called()
+        finally:
+            release_worker.set()
+            task.stop()
+        blocker.result(timeout=1)
+    assert len(robot.requests) == 1
+    assert task.peek_response(0).result_type is PeekResponseResultType.ResponseFound
+    assert task.peek_response(1).result_type is PeekResponseResultType.ErrorUnknown
+
+
 def test_gripper_task_can_restart_after_stopping_queued_request():
     robot = RobotStub()
     task = ViserGripperTask(robot)

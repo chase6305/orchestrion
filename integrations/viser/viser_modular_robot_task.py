@@ -213,7 +213,7 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
         with self._lock:
             pending_ids = [
                 request_id
-                for request_id, future in self._future_map.items()
+                for request_id, future in self._pending_futures.items()
                 if not future.done()
             ]
         for request_id in pending_ids:
