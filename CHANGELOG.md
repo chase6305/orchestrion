@@ -4,6 +4,8 @@
 
 - Locate replay frames with indexed binary search, avoiding a full timestamp
   copy on every seek or playback tick while preserving duplicate-time behavior.
+- Capture replay stage and payload ownership from one event snapshot, avoiding
+  duplicate history copies and inconsistent frames during concurrent updates.
 - Vectorize Viser joint interpolation while preserving endpoint weights and
   independent trajectory points.
 - Resolve workflow output references on demand instead of projecting every

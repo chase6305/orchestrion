@@ -175,6 +175,38 @@ def test_dual_arm_replay_recording_round_trip(tmp_path):
     assert reader.replay_frames == frames
 
 
+@pytest.mark.parametrize("owners", [[], ["left_arm"], ["left_arm", "right_arm"]])
+def test_replay_capture_uses_one_event_snapshot_for_stage_and_payload(owners):
+    events = [
+        {"event": "payload_owner_changed", "owner": owner} for owner in owners
+    ]
+    events.append({"event": "snapshot-stage"})
+
+    class Runtime(DualArmViserRuntime):
+        event_reads = 0
+
+        @property
+        def events(self):
+            self.event_reads += 1
+            if self.event_reads == 1:
+                return events
+            return [{"event": "payload_owner_changed", "owner": "output_table"}]
+
+    runtime = object.__new__(Runtime)
+    runtime._capture_started_at = None
+    runtime._replay_lock = threading.Lock()
+    runtime._replay_frames = []
+    frame = runtime._capture_frame(
+        {"left": [0.0] * 3, "right": [0.0] * 3},
+        {"left": 0.0, "right": 0.0},
+        None,
+    )
+    assert frame.payload_owner == (owners[-1] if owners else "table")
+    assert frame.event == "snapshot-stage"
+    assert runtime.event_reads == 1
+    assert runtime.replay_frames == [frame]
+
+
 def test_dual_arm_replay_frame_rejects_invalid_payload_owner():
     with pytest.raises(ValueError, match="invalid state"):
         ReplayFrame.from_dict(

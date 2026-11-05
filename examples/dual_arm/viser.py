@@ -486,24 +486,22 @@ class DualArmViserRuntime(DualArmRuntime):
             "duration": frames[-1].elapsed,
         }
 
-    def _payload_owner(self) -> str:
-        owners = [
-            event["owner"]
-            for event in self.events
-            if event["event"] == "payload_owner_changed"
-        ]
-        return owners[-1] if owners else "table"
-
     def _capture_frame(
         self,
         arms: Dict[str, List[float]],
         grippers: Dict[str, float],
         zone_owner: Optional[str],
     ) -> ReplayFrame:
+        """Capture stage and payload ownership from one isolated event snapshot."""
         now = time.monotonic()
         if self._capture_started_at is None:
             self._capture_started_at = now
         events = self.events
+        payload_owner = "table"
+        for event in reversed(events):
+            if event["event"] == "payload_owner_changed":
+                payload_owner = event["owner"]
+                break
         frame = ReplayFrame(
             elapsed=now - self._capture_started_at,
             left_arm=tuple(arms["left"]),
@@ -511,7 +509,7 @@ class DualArmViserRuntime(DualArmRuntime):
             left_gripper=grippers["left"],
             right_gripper=grippers["right"],
             zone_owner=zone_owner,
-            payload_owner=self._payload_owner(),
+            payload_owner=payload_owner,
             event=events[-1]["event"] if events else "starting",
         )
         with self._replay_lock:
