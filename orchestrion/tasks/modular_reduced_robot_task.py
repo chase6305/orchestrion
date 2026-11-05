@@ -62,7 +62,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         interval: float = 0.01,
     ):
         super().__init__()
-        if not self._is_finite_real(interval) or interval <= 0:
+        if not self._is_positive_finite_real(interval):
             raise ValueError("Scheduler interval must be positive and finite")
         if interval > threading.TIMEOUT_MAX:
             raise ValueError("Scheduler interval must not exceed threading.TIMEOUT_MAX")
@@ -237,7 +237,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         endpoint_index: Optional[List[int]] = None,
     ) -> int:
         """Enqueue a trajectory; return its first move ID or -1 on rejection."""
-        if not self._is_finite_real(interval) or interval <= 0:
+        if not self._is_positive_finite_real(interval):
             return -1
         if interval > threading.TIMEOUT_MAX:
             return -1
@@ -294,7 +294,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         motion_target: List[List[float]],
         interval: float = 0.01,
     ) -> int:
-        if not self._is_finite_real(interval) or interval <= 0:
+        if not self._is_positive_finite_real(interval):
             return -1
         if interval > threading.TIMEOUT_MAX:
             return -1
@@ -338,7 +338,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         """Atomically validate and enqueue trajectories for several submodules."""
         if not isinstance(motion_targets, dict) or not motion_targets:
             return {}
-        if not self._is_finite_real(interval) or interval <= 0:
+        if not self._is_positive_finite_real(interval):
             return {}
         if interval > threading.TIMEOUT_MAX:
             return {}
@@ -576,7 +576,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         """Wait for the latest main move; negative time_out means no deadline."""
         if not self._is_finite_real(time_out):
             raise ValueError("time_out must be finite")
-        if not self._is_finite_real(interval) or interval <= 0:
+        if not self._is_positive_finite_real(interval):
             raise ValueError("interval must be positive and finite")
         interval = min(float(interval), threading.TIMEOUT_MAX)
         with self._lock:

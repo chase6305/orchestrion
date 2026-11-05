@@ -12,3 +12,9 @@ def is_finite_real(value: object) -> bool:
         return math.isfinite(value)
     except OverflowError:
         return False
+
+
+def is_positive_finite_real(value: object) -> bool:
+    """Return whether a positive real stays positive as a finite float."""
+    # A positive Fraction can underflow to zero before a native wait starts.
+    return is_finite_real(value) and value > 0 and float(value) > 0

@@ -105,7 +105,7 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
         interval: float = 0.01,
         endpoint_index: Optional[List[int]] = None,
     ) -> int:
-        if not self._is_finite_real(interval) or interval <= 0:
+        if not self._is_positive_finite_real(interval):
             return -1
         if interval > threading.TIMEOUT_MAX:
             return -1
@@ -155,7 +155,7 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
     def wait_move(self, time_out: float = -1, interval: float = 0.05) -> bool:
         if not self._is_finite_real(time_out):
             raise ValueError("time_out must be finite")
-        if not self._is_finite_real(interval) or interval <= 0:
+        if not self._is_positive_finite_real(interval):
             raise ValueError("interval must be positive and finite")
         interval = min(float(interval), threading.TIMEOUT_MAX)
         with self._lock:

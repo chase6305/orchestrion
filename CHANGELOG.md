@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Reject positive timing intervals that become zero as native floats, preserving
+  motion IDs and avoiding zero-cadence polling. Normalize pilot polling intervals.
 - Advertise the actual Viser listening port in browser and SSH instructions when
   the requested port is occupied.
 - Locate replay frames with indexed binary search, avoiding a full timestamp

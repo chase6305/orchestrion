@@ -8,7 +8,7 @@ from typing import Callable, Dict, Optional
 from orchestrion.health import DeviceHealth
 from orchestrion.tasks.function_call_task import InPlaceFunctionCallTask
 from orchestrion.utils.errors import exception_message
-from orchestrion.utils.numeric import is_finite_real
+from orchestrion.utils.numeric import is_positive_finite_real
 
 
 class PollingTask(InPlaceFunctionCallTask):
@@ -26,7 +26,7 @@ class PollingTask(InPlaceFunctionCallTask):
     ):
         if not callable(poll):
             raise TypeError("poll must be callable")
-        if not is_finite_real(interval) or interval <= 0:
+        if not is_positive_finite_real(interval):
             raise ValueError("interval must be positive and finite")
         if interval > threading.TIMEOUT_MAX:
             raise ValueError("interval must not exceed threading.TIMEOUT_MAX")

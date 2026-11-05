@@ -25,7 +25,7 @@ from orchestrion.tasks.generic_task import GenericTask
 from orchestrion.tasks.reduced_robot_task_interface import ReducedRobotTaskInterface
 from orchestrion.utils.errors import exception_message
 from orchestrion.utils.logger import logger
-from orchestrion.utils.numeric import is_finite_real
+from orchestrion.utils.numeric import is_finite_real, is_positive_finite_real
 from orchestrion.utils.types import PeekResponseResult, PeekResponseResultType
 
 # (-priority, request_id, request): higher priorities first, FIFO for ties.
@@ -58,7 +58,7 @@ class TaskPilot:
         poll_interval: float = 0.05,
         timeline_capacity: int = 1000,
     ):
-        if not is_finite_real(poll_interval) or poll_interval <= 0:
+        if not is_positive_finite_real(poll_interval):
             raise ValueError("poll_interval must be positive and finite")
         if poll_interval > threading.TIMEOUT_MAX:
             raise ValueError("poll_interval must not exceed threading.TIMEOUT_MAX")
@@ -80,7 +80,7 @@ class TaskPilot:
             self._service_names_by_task_id.setdefault(id(task), set()).add(name)
         self._executor = executor_owned
         self._executor_shutdown = False
-        self._poll_interval = poll_interval
+        self._poll_interval = float(poll_interval)
         self._lifecycle_lock = threading.RLock()
 
         self._task_queue: queue.PriorityQueue[_QueueEntry] = queue.PriorityQueue()
