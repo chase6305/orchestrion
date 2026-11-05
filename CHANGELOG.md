@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Resolve workflow output references on demand instead of projecting every
+  ordering dependency into a temporary output dictionary.
 - Release pruned, cancelled threaded responses after SDK cleanup finishes,
   including after pilot shutdown, without changing public response-forgetting rules.
 - Reuse terminal counts when pruning request history and retain removed SDK

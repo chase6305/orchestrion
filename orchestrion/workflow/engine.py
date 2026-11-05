@@ -912,7 +912,7 @@ class WorkflowEngine:
             context.raise_if_cancelled()
             inputs = resolve_inputs(
                 node.inputs,
-                {key: run._results[key].output for key in item.dependencies},
+                lambda upstream_node_id: run._results[upstream_node_id].output,
             )
             if self._max_input_bytes is not None:
                 inputs = _snapshot(inputs, max_bytes=self._max_input_bytes)

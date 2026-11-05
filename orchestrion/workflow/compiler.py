@@ -4,7 +4,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from json import dumps
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from orchestrion.schema import CommandValidationError
 
@@ -135,9 +135,10 @@ def compile_workflow(
     return tuple(ordered)
 
 
-def resolve_inputs(value: Any, outputs: Mapping[str, Any]) -> Any:
+def resolve_inputs(value: Any, get_output: Callable[[str], Any]) -> Any:
+    """Copy inputs, looking up upstream output only where a reference needs it."""
     if isinstance(value, OutputRef):
-        result = outputs[value.node_id]
+        result = get_output(value.node_id)
         for index, part in enumerate(value.path):
             try:
                 if isinstance(part, str) and isinstance(result, dict):
@@ -156,9 +157,9 @@ def resolve_inputs(value: Any, outputs: Mapping[str, Any]) -> Any:
                 ) from exc
         return _snapshot(result)
     if isinstance(value, dict):
-        return {key: resolve_inputs(child, outputs) for key, child in value.items()}
+        return {key: resolve_inputs(child, get_output) for key, child in value.items()}
     if isinstance(value, list):
-        return [resolve_inputs(child, outputs) for child in value]
+        return [resolve_inputs(child, get_output) for child in value]
     return value
 
 
