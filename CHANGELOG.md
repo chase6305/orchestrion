@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Include scheduler tick rounding in default gripper timeouts, so slow animations
+  can finish with non-integral sampling intervals; explicit timeouts are unchanged.
 - Release cancelled request inputs after unlocking pilot state, allowing SDK
   finalizers to query health from a cleanup thread.
 - Skip result scans for service notifications with no active requests, using

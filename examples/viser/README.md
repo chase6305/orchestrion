@@ -58,8 +58,9 @@ reversal do not jump back to a hard-coded endpoint.
 
 Animation samples at most 60 updates per second and precomputes at most 4096
 points. Longer motions use a larger interval to preserve nominal travel time.
-The default timeout uses the nominal sampled duration plus two seconds, including
-the hold after the final point. An explicit `timeout` overrides this estimate.
+The default timeout includes each sample's interval, up to one extra scheduler
+tick per sample, and two seconds of margin. This covers the final hold and tick
+rounding; an explicit `timeout` overrides the estimate.
 
 A [runtime recording](../../assets/08-gripper-cancellation.webp) shows a running
 close being cancelled and reversed, followed by a full close/open cycle.

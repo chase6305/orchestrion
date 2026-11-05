@@ -187,8 +187,9 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
             self.MAX_ANIMATION_POINTS,
             max(2, math.ceil(motion_duration / interval) + 1),
         )
-        # Completion includes an interval held at the final sample.
-        timeout = float(content.get("timeout", steps * interval + 2.0))
+        # Each sample, including the final hold, can wait another scheduler tick.
+        estimated_duration = steps * (interval + self._robot_task.scheduler_interval)
+        timeout = float(content.get("timeout", estimated_duration + 2.0))
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Gripper timeout must be positive")
         trajectory = np.linspace(current, target, steps).reshape(-1, 1).tolist()

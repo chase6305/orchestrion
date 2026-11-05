@@ -2,6 +2,7 @@ import concurrent.futures
 import importlib
 import threading
 import time
+from collections import deque
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,6 +44,10 @@ from integrations.viser.viser_modular_robot_task import (
 )
 from orchestrion import MoveSyncOption, RequestStatus, TaskPilot
 from orchestrion.tasks import ModularReducedRobotTask, SubModuleTask
+from orchestrion.tasks.modular_reduced_robot_task import (
+    SubModuleMovementRequest,
+    _SubmoduleSchedule,
+)
 from orchestrion.utils.types import PeekResponseResultType
 
 DEMO_MODULES = [
@@ -690,6 +695,38 @@ def test_gripper_default_timeout_covers_the_final_sample_hold(
     robot.scheduler_interval = scheduler_interval
     result = ViserGripperTask(robot)._execute_call(
         0, {"position": 0.72, "speed": speed}
+    )
+    assert result["position"] == 0.72
+
+
+@pytest.mark.parametrize("speed", [0.02, 0.005])
+def test_gripper_default_timeout_covers_scheduler_tick_rounding(monkeypatch, speed):
+    worker = ModularRobotStub(
+        [0.0, 0.2], SubModuleTask("arm", 0, 1),
+        [SubModuleTask("gripper", 1, 1)], interval=0.01,
+    )
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        "orchestrion.tasks.modular_reduced_robot_task.time",
+        SimpleNamespace(monotonic=lambda: clock.now),
+    )
+
+    class TimedRobot(RobotStub):
+        def wait_submodule_move(self, name, move_id, timeout):
+            _, trajectory, interval = self.requests[-1]
+            schedule = _SubmoduleSchedule(deque([
+                SubModuleMovementRequest(name, trajectory, interval, move_id),
+            ]))
+            # Run production scheduling on virtual ticks, without a wall-clock wait.
+            while clock.now < timeout:
+                worker._advance_submodule_moves({name: schedule}, [0.0, 0.2])
+                if not schedule.moves:
+                    return True
+                clock.now += self.scheduler_interval
+            return False
+
+    result = ViserGripperTask(TimedRobot())._execute_call(
+        0, {"action": "close", "speed": speed}
     )
     assert result["position"] == 0.72
 
