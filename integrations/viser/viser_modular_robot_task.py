@@ -8,6 +8,7 @@ import concurrent.futures
 import logging
 import math
 import threading
+import time
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -208,11 +209,26 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
         if cancel_requested:
             self._robot_task.cancel_submodule_move("gripper", move_id)
             raise concurrent.futures.CancelledError("Gripper request cancelled")
-        if not self._robot_task.wait_submodule_move("gripper", move_id, timeout):
-            self._robot_task.cancel_submodule_move("gripper", move_id)
-            raise concurrent.futures.CancelledError(
-                "Gripper movement was cancelled or timed out"
-            )
+        wait_started = time.monotonic()
+        try:
+            if not self._robot_task.wait_submodule_move("gripper", move_id, timeout):
+                raise concurrent.futures.CancelledError(
+                    "Gripper movement was cancelled or timed out "
+                    "(request_id={}, move_id={}, "
+                    "elapsed={:.6g}s, timeout={:.6g}s)".format(
+                        request_id, move_id, time.monotonic() - wait_started, timeout
+                    )
+                )
+        except BaseException:
+            try:
+                self._robot_task.cancel_submodule_move("gripper", move_id)
+            except Exception:
+                # A cleanup failure must not hide the original wait error.
+                logger.exception(
+                    "Failed to cancel gripper move %s for request %s",
+                    move_id, request_id,
+                )
+            raise
         return {
             "request_id": request_id,
             "action": action or "position",

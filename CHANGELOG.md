@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Cancel accepted gripper motion when waiting raises, preserving the original
+  error if cancellation also fails. Include move IDs and timing in wait failures.
 - Include scheduler tick rounding in default gripper timeouts, so slow animations
   can finish with non-integral sampling intervals; explicit timeouts are unchanged.
 - Release cancelled request inputs outside pilot state locks, including during

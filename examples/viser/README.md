@@ -62,6 +62,9 @@ The default timeout includes each sample's interval, up to one extra scheduler
 tick per sample, and two seconds of margin. This covers the final hold and tick
 rounding; an explicit `timeout` overrides the estimate.
 
+Wait failures attempt local motion cancellation. The original wait error is
+preserved if cleanup fails; timeout messages include IDs, elapsed time and budget.
+
 A [runtime recording](../../assets/08-gripper-cancellation.webp) shows a running
 close being cancelled and reversed, followed by a full close/open cycle.
 

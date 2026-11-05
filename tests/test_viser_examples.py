@@ -1235,6 +1235,47 @@ def test_gripper_timeout_stops_underlying_motion():
         pilot.stop()
 
 
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+@pytest.mark.parametrize("cancel_fails", [False, True])
+def test_gripper_wait_error_cancels_motion_and_preserves_error(
+    monkeypatch, error_type, cancel_fails,
+):
+    robot = RobotStub()
+    wait_error = error_type("controller wait failed")
+    monkeypatch.setattr(robot, "wait_submodule_move", Mock(side_effect=wait_error))
+    cancel = Mock(side_effect=RuntimeError("cancel failed") if cancel_fails else None)
+    monkeypatch.setattr(robot, "cancel_submodule_move", cancel)
+
+    with pytest.raises(error_type, match="controller wait failed") as raised:
+        ViserGripperTask(robot)._execute_call(7, {"action": "close"})
+
+    assert raised.value is wait_error
+    cancel.assert_called_once_with("gripper", 4)
+
+
+@pytest.mark.parametrize("cancel_fails", [False, True])
+def test_gripper_timeout_reports_wait_context_even_when_cancel_fails(
+    monkeypatch, cancel_fails,
+):
+    robot = RobotStub()
+    monkeypatch.setattr(robot, "wait_submodule_move", Mock(return_value=False))
+    cancel = Mock(side_effect=RuntimeError("cancel failed") if cancel_fails else None)
+    monkeypatch.setattr(robot, "cancel_submodule_move", cancel)
+    monkeypatch.setattr(
+        "integrations.viser.viser_modular_robot_task.time",
+        SimpleNamespace(monotonic=Mock(side_effect=[10.0, 12.5])),
+        raising=False,
+    )
+
+    with pytest.raises(concurrent.futures.CancelledError) as raised:
+        ViserGripperTask(robot)._execute_call(7, {"action": "close", "timeout": 0.25})
+
+    message = str(raised.value)
+    assert "request_id=7, move_id=4" in message
+    assert "elapsed=2.5s, timeout=0.25s" in message
+    cancel.assert_called_once_with("gripper", 4)
+
+
 def test_concurrent_executor_preserves_gripper_command_order():
     robot = make_gripper_robot()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
