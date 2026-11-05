@@ -13,7 +13,10 @@ from typing import Dict, List, Optional
 import numpy as np
 from viser.extras import ViserUrdf
 
-from orchestrion.tasks.function_call_task import ThreadedPoolFunctionCallTask
+from orchestrion.tasks.function_call_task import (
+    ThreadedPoolFunctionCallTask,
+    _validate_request_id,
+)
 from orchestrion.tasks.modular_reduced_robot_task import (
     ModularReducedRobotTask,
     SubModuleTask,
@@ -89,6 +92,7 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
         self._finished_sequences = set()
 
     def invoke_async(self, request_id: int, content: Optional[Dict] = None) -> bool:
+        _validate_request_id(request_id)
         # Reserve sequence numbers and submit atomically. Otherwise two concurrent
         # calls (or a duplicate ID) can overwrite a queued request's sequence.
         with self._submission_lock:
@@ -246,6 +250,7 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
         return status
 
     def cancel_request(self, request_id: int) -> bool:
+        _validate_request_id(request_id)
         with self._lock:
             future = self._future_map.get(request_id)
             if future is None or future.done():

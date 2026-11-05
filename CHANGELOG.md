@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Validate Viser gripper request IDs before sequence reservation or cancellation,
+  so boolean/float aliases cannot affect an active integer-ID request.
 - Discover workflow output references once per compilation and reuse them for
   dependency and path checks, including nested references to later definitions.
 - Fast-path native numeric schema values while preserving exact large integers;

@@ -580,6 +580,45 @@ def test_viser_gripper_task_reports_result():
     assert status["succeeded"] == 1
 
 
+@pytest.mark.parametrize("operation", ["invoke_async", "cancel_request"])
+@pytest.mark.parametrize(
+    "request_id, error_type",
+    [(True, TypeError), (1.0, TypeError), (-1, ValueError), ("1", TypeError)],
+)
+def test_gripper_rejects_invalid_ids_before_changing_active_motion(
+    monkeypatch, operation, request_id, error_type,
+):
+    robot = RobotStub()
+    entered, release = threading.Event(), threading.Event()
+    cancel_move = Mock(wraps=robot.cancel_submodule_move)
+    monkeypatch.setattr(robot, "cancel_submodule_move", cancel_move)
+
+    def wait_for_motion(name, move_id, timeout):
+        entered.set()
+        assert release.wait(2)
+        return True
+
+    monkeypatch.setattr(robot, "wait_submodule_move", wait_for_motion)
+    task = ViserGripperTask(robot)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        try:
+            assert task.invoke_async(1, {"action": "close"})
+            assert entered.wait(1)
+            with pytest.raises(error_type, match="request_id"):
+                if operation == "invoke_async":
+                    task.invoke_async(request_id, {"action": "open"})
+                else:
+                    task.cancel_request(request_id)
+            cancel_move.assert_not_called()
+            assert len(robot.requests) == 1
+        finally:
+            release.set()
+            task._future_map[1].result(timeout=1)
+            task.stop()
+    assert task.peek_response(1).result_type is PeekResponseResultType.ResponseFound
+
+
 def test_viser_gripper_caps_animation_update_rate():
     robot = RobotStub()
     robot.scheduler_interval = 0.001
