@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Bound slow gripper animation preparation while preserving nominal travel time;
+  avoid interval underflow for tiny speeds and stationary commands.
 - Correct the Viser pick-and-place payload fit, grasp width and approach/lift
   paths; replace the README recording with the corrected runtime sequence.
 - Reduce scheduler and snapshot overhead with linear motion-wait scans, cached

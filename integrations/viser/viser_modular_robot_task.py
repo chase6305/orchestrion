@@ -39,7 +39,6 @@ class ViserModularReducedRobotTask(ModularReducedRobotTask):
             submodule_tasks=submodule_tasks,
             interval=interval,
         )
-        # Store the Viser handle dictionary
         self._viser_urdf_dict = viser_handle_dict
 
     def _on_robot_state_bg_thread(self, jps: List[float], jps_move_id: int) -> None:
@@ -54,12 +53,7 @@ class ViserModularReducedRobotTask(ModularReducedRobotTask):
                 handle.update_cfg(np.asarray(jps[begin : begin + module.n_dof]))
 
     def _on_initial_state_bg_thread(self, jps: List[float]) -> None:
-        """
-        Update the Viser URDF with the initial joint positions.
-
-        Args:
-            jps (List[float]): Initial joint positions.
-        """
+        """Render the initial pose using the same joint-to-handle mapping."""
         self._on_robot_state_bg_thread(jps, -1)
 
 
@@ -67,6 +61,7 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
     """Animate a Robotiq gripper and report completion at the target position."""
 
     MIN_ANIMATION_INTERVAL = 1.0 / 60.0
+    MAX_ANIMATION_POINTS = 4096
 
     task_kind = "actuator"
 
@@ -169,17 +164,24 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
             raise ValueError("Gripper speed must be positive")
 
         current = self._robot_task.query_submodule_state("gripper").positions[0]
-        timeout = float(content.get("timeout", abs(target - current) / speed + 2.0))
+        motion_duration = abs(target - current) / speed
+        if not math.isfinite(motion_duration):
+            raise ValueError("Gripper motion duration must be finite")
+        timeout = float(content.get("timeout", motion_duration + 2.0))
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Gripper timeout must be positive")
-        # Rendering hundreds of configurations per second only adds WebSocket and
-        # browser overhead. Keep the command speed stable when a demo uses a very
-        # small robot scheduler interval for headless smoke tests.
+        # Bound both update rate and precomputed points. Slower sampling preserves
+        # travel time for long motions instead of allocating every 60 Hz frame.
         interval = max(
-            self._robot_task.scheduler_interval, self.MIN_ANIMATION_INTERVAL
+            self._robot_task.scheduler_interval,
+            self.MIN_ANIMATION_INTERVAL,
+            motion_duration / (self.MAX_ANIMATION_POINTS - 1),
         )
-        steps = max(2, math.ceil(abs(target - current) / (speed * interval)) + 1)
-        trajectory = [[float(value)] for value in np.linspace(current, target, steps)]
+        steps = min(
+            self.MAX_ANIMATION_POINTS,
+            max(2, math.ceil(motion_duration / interval) + 1),
+        )
+        trajectory = np.linspace(current, target, steps).reshape(-1, 1).tolist()
         with self._lock:
             if request_id in self._cancelled_requests:
                 raise concurrent.futures.CancelledError("Gripper request cancelled")

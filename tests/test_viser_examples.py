@@ -469,6 +469,56 @@ def test_viser_gripper_caps_animation_update_rate():
     assert len(trajectory) < 50
 
 
+@pytest.mark.parametrize(
+    "current, target",
+    [(0.2, 0.2), (0.0, 0.0), (0.0, 5e-324)],
+    ids=["stationary", "stationary-zero", "subnormal-move"],
+)
+def test_viser_gripper_handles_tiny_speeds_without_interval_underflow(current, target):
+    class Robot(RobotStub):
+        def query_submodule_state(self, name):
+            return SimpleNamespace(positions=[current])
+
+    robot = Robot()
+    task = ViserGripperTask(robot)
+    completed = threading.Event()
+    task.set_completion_callback(completed.set)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        try:
+            assert task.invoke_async(0, {"position": target, "speed": 5e-324})
+            assert completed.wait(1)
+            response = task.peek_response(0)
+            assert response.result_type is PeekResponseResultType.ResponseFound
+        finally:
+            task.stop()
+    _, trajectory, interval = robot.requests[0]
+    assert trajectory[0] == [current]
+    assert trajectory[-1] == [target]
+    assert (len(trajectory) - 1) * interval == pytest.approx(
+        max(interval, abs(target - current) / 5e-324)
+    )
+
+
+def test_slow_gripper_motion_bounds_precomputed_points_and_preserves_duration():
+    robot = RobotStub()
+    task = ViserGripperTask(robot)
+    task._execute_call(0, {"position": 0.72, "speed": 0.00065})
+    _, trajectory, interval = robot.requests[0]
+    assert len(trajectory) <= 4096
+    assert trajectory[0] == [0.2]
+    assert trajectory[-1] == [0.72]
+    assert (len(trajectory) - 1) * interval == pytest.approx(800.0)
+
+
+def test_unrepresentable_gripper_motion_duration_fails_before_enqueueing():
+    robot = RobotStub()
+    task = ViserGripperTask(robot)
+    with pytest.raises(ValueError, match="duration must be finite"):
+        task._execute_call(0, {"position": 0.72, "speed": 5e-324, "timeout": 1})
+    assert robot.requests == []
+
+
 def test_viser_gripper_discovery_describes_commands_and_range():
     description = ViserGripperTask(RobotStub()).describe()
     assert description["kind"] == "actuator"

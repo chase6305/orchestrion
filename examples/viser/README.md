@@ -56,6 +56,9 @@ Gripper requests complete only after the animated finger joint reaches its targe
 Trajectories always start from the current position, so repeated commands and motion
 reversal do not jump back to a hard-coded endpoint.
 
+Animation samples at most 60 updates per second and precomputes at most 4096
+points. Longer motions use a larger interval to preserve nominal travel time.
+
 ```python
 pilot.call_srv_async("gripper", {"action": "open", "speed": 0.8})
 pilot.call_srv_async("gripper", {"action": "close", "speed": 0.5})
