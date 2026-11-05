@@ -153,7 +153,8 @@ print("pilot finalizer completed")
 """
 
 
-_PILOT_CANCEL_INPUT_FINALIZER_PROBE = """
+_PILOT_INPUT_FINALIZER_PROBE = """
+import sys
 import threading
 
 from orchestrion import MoveSyncOption, SimulatedRobotTask, TaskPilot
@@ -206,21 +207,27 @@ with TaskPilot(
     request_id = pilot.call_srv_async(
         'pending', Input(value=1), MoveSyncOption.no_sync()
     )
+    if sys.argv[1] == 'stop':
+        pilot.call_srv_async('pending', Input(value=2), MoveSyncOption.no_sync())
     # Dispatch another call so scheduler snapshots no longer retain the input.
     pilot.call_srv_async('blocking', sync_option=MoveSyncOption.no_sync())
     assert started.wait(1)
     armed.set()
     try:
-        assert pilot.cancel_request(request_id)
+        if sys.argv[1] == 'cancel':
+            assert pilot.cancel_request(request_id)
+        else:
+            release.set()
+            pilot.stop()
     finally:
         armed.clear()
         release.set()
         for thread in threads:
             thread.join(timeout=1)
-    assert threads, 'Input was not released during cancellation'
+    assert threads, 'Input was not released'
     assert not any(thread.is_alive() for thread in threads)
     assert not blocked, 'Input finalizer ran with pilot state lock held'
-print('cancel input finalizer completed')
+print('pilot input finalizer completed')
 """
 
 
@@ -262,12 +269,13 @@ def test_pruned_pilot_results_can_observe_health_from_a_cleanup_thread(backend):
     assert completed.stdout.strip() == "pilot finalizer completed"
 
 
-def test_cancelled_pilot_input_can_observe_health_from_a_cleanup_thread():
+@pytest.mark.parametrize("removal", ["cancel", "stop"])
+def test_removed_pilot_input_can_observe_health_from_a_cleanup_thread(removal):
     completed = subprocess.run(
-        [sys.executable, "-c", _PILOT_CANCEL_INPUT_FINALIZER_PROBE],
+        [sys.executable, "-c", _PILOT_INPUT_FINALIZER_PROBE, removal],
         capture_output=True,
         text=True,
         timeout=5,
     )
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "cancel input finalizer completed"
+    assert completed.stdout.strip() == "pilot input finalizer completed"

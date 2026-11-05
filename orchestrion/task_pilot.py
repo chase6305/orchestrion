@@ -1073,6 +1073,8 @@ class TaskPilot:
                     except Exception:
                         logger.exception("Failed to cancel request %s", request_id)
             self._transition(request_id, RequestStatus.CANCELLED, error=reason)
+            # Release SDK input before the next iteration acquires the state lock.
+            del request
 
     def _admit_queued_requests(
         self,
