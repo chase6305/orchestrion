@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Check native numeric types before the Real ABC during trajectory validation,
+  reducing per-joint overhead while preserving finite-float range checks.
 - Reuse timing validation in the HTTP demo client, rejecting float overflow and
   underflow before socket operations while accepting representable fractions.
 - Clean up gripper request state at future completion, making concurrent queued
