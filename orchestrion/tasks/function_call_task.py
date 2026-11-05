@@ -414,12 +414,13 @@ class CallableTask(ThreadedPoolFunctionCallTask):
 
     def describe(self) -> Dict:
         description = super().describe()
+        # Discovery is JSON; exact policy values remain available for delay checks.
         description["retry"] = {
             "enabled": self._retry_policy.max_attempts > 1,
             "max_attempts": self._retry_policy.max_attempts,
-            "delay": self._retry_policy.delay,
-            "backoff": self._retry_policy.backoff,
-            "max_delay": self._retry_policy.max_delay,
+            "delay": float(self._retry_policy.delay),
+            "backoff": float(self._retry_policy.backoff),
+            "max_delay": float(self._retry_policy.max_delay),
             "exception_types": [
                 exception.__name__
                 for exception in self._retry_policy.retry_exceptions

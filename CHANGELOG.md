@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Reject underflowing retry settings during policy validation and expose fractional
+  retry values as JSON numbers in service descriptions, preserving exact policies.
 - Reject positive timing intervals that become zero as native floats, preserving
   motion IDs and avoiding zero-cadence polling. Normalize pilot polling intervals.
 - Advertise the actual Viser listening port in browser and SSH instructions when
