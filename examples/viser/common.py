@@ -368,14 +368,15 @@ def run_demo(
         port=args.port,
         scheduler_interval=args.interval,
     ) as runtime:
+        server_port = runtime.server.get_port()
         print(
-            "Open http://localhost:{} in your browser.".format(args.port),
+            "Open http://localhost:{} in your browser.".format(server_port),
             flush=True,
         )
         if args.host == "0.0.0.0":
             print(
                 "Remote session? Use: ssh -L {0}:localhost:{0} user@host".format(
-                    args.port
+                    server_port
                 ),
                 flush=True,
             )

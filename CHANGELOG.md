@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Advertise the actual Viser listening port in browser and SSH instructions when
+  the requested port is occupied.
 - Locate replay frames with indexed binary search, avoiding a full timestamp
   copy on every seek or playback tick while preserving duplicate-time behavior.
 - Capture replay stage and payload ownership from one event snapshot, avoiding

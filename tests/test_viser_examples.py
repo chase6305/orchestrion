@@ -2,6 +2,7 @@ import concurrent.futures
 import importlib
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -77,6 +78,25 @@ def test_viser_launcher_forwards_help_to_selected_demo(capsys):
     output = capsys.readouterr().out
     assert "02 · Pick and Place" in output
     assert "--no-wait-for-client" in output
+
+
+def test_viser_startup_advertises_the_actual_bound_port(monkeypatch, capsys):
+    runtime = SimpleNamespace(
+        server=SimpleNamespace(get_port=lambda: 8081),
+        set_status=Mock(),
+        hold=Mock(),
+    )
+    factory = Mock(return_value=nullcontext(runtime))
+    module = importlib.import_module("examples.viser.common")
+    monkeypatch.setattr(module, "ViserDemoRuntime", factory)
+    module.run_demo(
+        "demo", Mock(),
+        argv=["--port", "8080", "--duration", "0", "--startup-delay", "0"],
+    )
+    output = capsys.readouterr().out
+    assert "Open http://localhost:8081" in output
+    assert "ssh -L 8081:localhost:8081" in output
+    assert factory.call_args.kwargs["port"] == 8080
 
 
 def test_dual_arm_visual_configuration_adds_stable_wrist_pose():
