@@ -95,6 +95,86 @@ def test_numeric_subclass_hooks_do_not_affect_json_budget(base, value):
         _snapshot(payload, max_bytes=size - 1)
 
 
+@pytest.mark.parametrize("text", ["plain ASCII", 'quote"', "slash\\", "中😀", "\x00\x7f"])
+def test_string_subclass_hooks_do_not_affect_json_budget(text):
+    class Text(str):
+        def __len__(self):
+            raise AssertionError("custom length must not be used")
+
+        def __str__(self):
+            raise AssertionError("custom string conversion must not be used")
+
+    payload = {Text("key"): Text(text)}
+    size = len(json.dumps({"key": text}, ensure_ascii=True, separators=(",", ":")))
+    assert _snapshot(payload, max_bytes=size) == payload
+    with pytest.raises(PayloadLimitError):
+        _snapshot(payload, max_bytes=size - 1)
+
+
+def test_string_budget_matches_json_for_every_ascii_character():
+    for text in [chr(code) for code in range(128)] + ["\ud800", "\u0080", "\u2028"]:
+        size = len(json.dumps(text, ensure_ascii=True))
+        assert _snapshot(text, max_bytes=size) == text
+        with pytest.raises(PayloadLimitError):
+            _snapshot(text, max_bytes=size - 1)
+
+
+@pytest.mark.parametrize("base", [list, tuple, dict])
+@pytest.mark.parametrize("declared_length", [0, 1000])
+def test_container_subclass_budget_matches_copied_entries(base, declared_length):
+    class Container(base):
+        def __len__(self):
+            return declared_length
+
+    value = Container({"a": 0, "b": 0}) if base is dict else Container([0, 0])
+    expected = _snapshot(value)
+    size = len(json.dumps(expected, ensure_ascii=True, separators=(",", ":")))
+    assert _snapshot(value, max_bytes=size) == expected
+    with pytest.raises(PayloadLimitError):
+        _snapshot(value, max_bytes=size - 1)
+
+
+def test_container_budget_counts_actual_iteration_instead_of_storage():
+    class Sequence(list):
+        def __iter__(self):
+            return iter((0, 0, 0))
+
+    class Mapping(dict):
+        def items(self):
+            return (("a", 0), ("b", 0), ("c", 0))
+
+    for value in (Sequence([0]), Mapping(a=0)):
+        expected = _snapshot(value)
+        size = len(json.dumps(expected, separators=(",", ":")))
+        assert _snapshot(value, max_bytes=size) == expected
+        with pytest.raises(PayloadLimitError):
+            _snapshot(value, max_bytes=size - 1)
+
+
+@pytest.mark.parametrize("max_bytes", [None, 100])
+def test_snapshot_validates_keys_from_the_actual_dictionary_items(max_bytes):
+    class Mapping(dict):
+        def items(self):
+            return ((1, "invalid key"),)
+
+    with pytest.raises(TypeError, match="string dictionary keys"):
+        _snapshot(Mapping(valid="unused"), max_bytes=max_bytes)
+
+
+def test_oversized_iterated_container_stops_before_consuming_all_items():
+    visited = []
+
+    class Sequence(list):
+        def __iter__(self):
+            for value in range(1000):
+                visited.append(value)
+                yield value
+
+    with pytest.raises(PayloadLimitError):
+        _snapshot(Sequence(), max_bytes=16)
+    assert 0 < len(visited) < 20
+
+
 def test_output_reference_budget_matches_its_json_preview():
     reference = OutputRef('vision/中"', ("poses", 0, "x"))
     preview = {
