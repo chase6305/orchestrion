@@ -843,9 +843,10 @@ class TaskPilot:
                 self._mark_health_changed_locked()
 
         for result in pruned:
-            forget = getattr(
-                self._task_map[result.service_name], "forget_response", None
-            )
+            task = self._task_map[result.service_name]
+            forget = getattr(task, "_forget_response_when_done", None)
+            if not callable(forget):
+                forget = getattr(task, "forget_response", None)
             if callable(forget):
                 try:
                     forget(result.request_id)

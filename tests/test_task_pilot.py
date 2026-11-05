@@ -671,6 +671,64 @@ def test_pruning_keeps_newest_eligible_results_beside_group_waiters(monkeypatch)
         assert pilot.query_request(ids[-1]).status is RequestStatus.SUCCEEDED
 
 
+@pytest.mark.parametrize("stop_before_completion", [False, True])
+@pytest.mark.parametrize("failed", [False, True], ids=["success", "sdk-error"])
+def test_pruned_cancelled_call_releases_its_response_after_cleanup(
+    stop_before_completion, failed
+):
+    submitted = threading.Event()
+    release = threading.Event()
+    reclaimed = threading.Event()
+    handles = []
+
+    class Payload:
+        pass
+
+    def call(request_id, content):
+        resource = Payload()
+        handles.append(weakref.ref(resource, lambda _: reclaimed.set()))
+        assert release.wait(2)
+        if failed:
+            raise RuntimeError("SDK cleanup failed")
+        return {"resource": resource}
+
+    class Task(CallableTask):
+        def invoke_async(self, request_id, content=None):
+            accepted = super().invoke_async(request_id, content)
+            submitted.set()
+            return accepted
+
+        def cancel_request(self, request_id):
+            return True
+
+    task = Task(call)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        with TaskPilot(
+            SimulatedRobotTask([0.0]), {"device": task}, executor_owned=executor
+        ) as pilot:
+            try:
+                request_id = pilot.call_srv_async(
+                    "device", sync_option=MoveSyncOption.no_sync()
+                )
+                assert submitted.wait(1)
+                assert pilot.cancel_request(request_id)
+                assert pilot.prune_completed_requests(keep_last=0) == 1
+                assert not task.forget_response(request_id)
+                if stop_before_completion:
+                    pilot.stop()
+                release.set()
+                executor.shutdown(wait=True, cancel_futures=True)
+                assert task.peek_status()["retained_results"] == 0
+                assert task.peek_status()["pending"] == 0
+                assert task.peek_response(request_id).result_type is (
+                    PeekResponseResultType.ResponseReceivedButFlushed
+                )
+                assert reclaimed.wait(1)
+                assert handles[0]() is None
+            finally:
+                release.set()
+
+
 def test_flushed_backend_response_is_a_terminal_failure():
     class FlushedTask(RecordingTask):
         def peek_response(self, request_id):

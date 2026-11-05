@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Release pruned, cancelled threaded responses after SDK cleanup finishes,
+  including after pilot shutdown, without changing public response-forgetting rules.
 - Reuse terminal counts when pruning request history and retain removed SDK
   payloads until state-lock release, preserving active waiters and newest results.
 - Bound slow gripper animation preparation while preserving nominal travel time;

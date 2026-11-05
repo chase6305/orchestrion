@@ -95,10 +95,12 @@ print("sample finalizer completed")
 """
 
 _PILOT_PRUNE_FINALIZER_PROBE = """
+import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from orchestrion import MoveSyncOption, SimulatedRobotTask, TaskPilot
-from orchestrion.tasks import InPlaceFunctionCallTask
+from orchestrion.tasks import CallableTask, InPlaceFunctionCallTask
 
 armed = threading.Event()
 blocked, threads = [], []
@@ -124,7 +126,13 @@ class Task(InPlaceFunctionCallTask):
     def _call_fn(self, request_id, content):
         return {"resource": DeviceResult()}
 
-with TaskPilot(SimulatedRobotTask([0.0]), {"device": Task()}) as pilot:
+task = (
+    Task() if sys.argv[1] == "inline"
+    else CallableTask(lambda request_id, content: {"resource": DeviceResult()})
+)
+with ThreadPoolExecutor(max_workers=1) as executor, TaskPilot(
+    SimulatedRobotTask([0.0]), {"device": task}, executor_owned=executor
+) as pilot:
     for _ in range(3):
         request_id = pilot.call_srv_async("device", sync_option=MoveSyncOption.no_sync())
         result = pilot.wait_request(request_id, timeout=1)
@@ -169,9 +177,10 @@ def test_replaced_poll_samples_can_query_status_without_deadlocking():
     assert completed.stdout.strip() == "sample finalizer completed"
 
 
-def test_pruned_pilot_results_can_observe_health_from_a_cleanup_thread():
+@pytest.mark.parametrize("backend", ["inline", "threaded"])
+def test_pruned_pilot_results_can_observe_health_from_a_cleanup_thread(backend):
     completed = subprocess.run(
-        [sys.executable, "-c", _PILOT_PRUNE_FINALIZER_PROBE],
+        [sys.executable, "-c", _PILOT_PRUNE_FINALIZER_PROBE, backend],
         capture_output=True,
         text=True,
         timeout=5,

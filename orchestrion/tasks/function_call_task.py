@@ -366,6 +366,16 @@ class ThreadedPoolFunctionCallTask(GenericTask):
                 self._retention.discard(request_id)
             return True
 
+    def _forget_response_when_done(self, request_id: int) -> None:
+        """Discard now, or after the retained future finishes draining."""
+        if self.forget_response(request_id):
+            return
+        with self._lock:
+            future = self._future_map.get(request_id)
+        if future is not None:
+            # A completed future invokes this callback immediately, without our lock.
+            future.add_done_callback(lambda _future: self.forget_response(request_id))
+
 
 class CallableTask(ThreadedPoolFunctionCallTask):
     """Adapt ordinary callables into an asynchronous peripheral service."""

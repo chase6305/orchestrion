@@ -74,6 +74,9 @@ collection becomes a failed request, so allow room for completion bursts.
 Request-ID deduplication metadata remains for the task's lifetime, including
 after response pruning.
 
+Pruning a cancelled request also arranges response cleanup in built-in threaded
+tasks once the SDK call finishes, even if the pilot has already stopped.
+
 ## Device adapters
 
 | Adapter | Use |

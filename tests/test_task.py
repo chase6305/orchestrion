@@ -767,6 +767,31 @@ def test_inline_response_reports_pending_until_call_finishes():
     assert task.peek_response(0).content == {"value": 1}
 
 
+def test_forgetting_pending_threaded_response_keeps_its_later_result():
+    started = threading.Event()
+    release = threading.Event()
+
+    def call(request_id, content):
+        started.set()
+        assert release.wait(2.0)
+        return content
+
+    task = CallableTask(call)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        try:
+            assert task.invoke_async(0, {"value": 1})
+            assert started.wait(1.0)
+            assert not task.forget_response(0)
+        finally:
+            release.set()
+            task.stop()
+
+    response = task.peek_response(0)
+    assert response.result_type is PeekResponseResultType.ResponseFound
+    assert response.content == {"value": 1}
+
+
 def test_inline_failure_is_retained_and_notified():
     class FailingTask(InPlaceFunctionCallTask):
         def _call_fn(self, request_id, content):

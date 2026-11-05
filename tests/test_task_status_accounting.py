@@ -3,6 +3,7 @@
 import concurrent.futures
 
 from orchestrion.tasks import ThreadedPoolFunctionCallTask
+from orchestrion.utils.types import PeekResponseResultType
 
 
 class Task(ThreadedPoolFunctionCallTask):
@@ -105,6 +106,33 @@ def test_delayed_callbacks_do_not_leave_stale_or_duplicate_counts():
         future.callback(future)
         future.callback(future)
         assert counts(task) == (0, 0, 1, 0)
+    finally:
+        task.stop()
+
+
+def test_deferred_forgetting_handles_completion_during_callback_registration():
+    class CompletingFuture(concurrent.futures.Future):
+        registrations = 0
+
+        def add_done_callback(self, callback):
+            self.registrations += 1
+            if self.registrations == 2:
+                assert task._lock.acquire(timeout=0.1)
+                task._lock.release()
+                self.set_result({})
+            super().add_done_callback(callback)
+
+    executor = Executor(CompletingFuture)
+    task = Task(max_result_count=1)
+    task.initialize(executor=executor)
+    try:
+        assert task.invoke_async(0)
+        task._forget_response_when_done(0)
+        assert counts(task) == (0, 0, 0, 0)
+        assert (
+            task.peek_response(0).result_type
+            is PeekResponseResultType.ResponseReceivedButFlushed
+        )
     finally:
         task.stop()
 
