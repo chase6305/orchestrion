@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Reduce JSON snapshot overhead with direct string encoding and one-pass
+  dictionary copying. Count actual copied entries and ignore custom string lengths
+  when enforcing workflow payload budgets.
 - Correct the Viser pick-and-place payload fit, grasp width and approach/lift
   paths; replace the README recording with the corrected runtime sequence.
 - Reduce scheduler and snapshot overhead with linear motion-wait scans, cached

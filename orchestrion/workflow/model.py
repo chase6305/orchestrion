@@ -3,7 +3,7 @@
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from json import dumps
+from json.encoder import encode_basestring_ascii
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 from urllib.parse import quote
 
@@ -100,8 +100,9 @@ def _snapshot(
         def scalar(item: Any) -> None:
             if isinstance(item, str):
                 # Reject huge strings before allocating their escaped representation.
-                charge(len(item) + 2)
-                charge(len(dumps(item, ensure_ascii=True)) - len(item) - 2)
+                text_length = str.__len__(item)
+                charge(text_length + 2)
+                charge(len(encode_basestring_ascii(item)) - text_length - 2)
             elif item is None or item is True:
                 charge(4)  # null / true
             elif item is False:
@@ -140,19 +141,24 @@ def _snapshot(
             ancestors.add(id(item))
             try:
                 if remaining is not None:
-                    charge(2 + max(0, len(item) - 1))
+                    charge(2)
                 if isinstance(item, dict):
-                    if any(not isinstance(key, str) for key in item):
-                        raise TypeError("workflow data requires string dictionary keys")
-                    if remaining is None:
-                        return {key: visit(child) for key, child in item.items()}
                     result = {}
                     for key, child in item.items():
-                        scalar(key)
-                        charge(1)
+                        if not isinstance(key, str):
+                            raise TypeError(
+                                "workflow data requires string dictionary keys"
+                            )
+                        if remaining is not None:
+                            scalar(key)
+                            charge(1)
                         result[key] = visit(child)
-                    return result
-                return [visit(child) for child in item]
+                else:
+                    result = [visit(child) for child in item]
+                if remaining is not None:
+                    # Count separators from copied entries, not subclass lengths.
+                    charge(max(0, len(result) - 1))
+                return result
             finally:
                 ancestors.remove(id(item))
         raise TypeError("workflow data must be finite JSON values or input OutputRefs")
