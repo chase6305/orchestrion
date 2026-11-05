@@ -810,17 +810,20 @@ class WorkflowEngine:
             if not self._is_ready(entry) or not self._can_start(entry):
                 continue
             node_id = item.node.node_id
+            # Bind this dispatch before the loop advances to another node.
             context = ActionContext(
                 run.run_id,
                 node_id,
-                lambda data, r=run, n=node_id: r._emit(n, "feedback", data),
+                lambda data, run=run, node_id=node_id: run._emit(
+                    node_id, "feedback", data
+                ),
                 max_pending_feedback=self._max_pending_feedback,
                 max_feedback_bytes=self._max_feedback_bytes,
-                checkpoint=lambda data, r=run, n=node_id: self._checkpoint_node(
-                    r, n, data
+                checkpoint=lambda data, run=run, node_id=node_id: self._checkpoint_node(
+                    run, node_id, data
                 ),
-                feedback_overflow=lambda count, r=run, n=node_id: r._emit(
-                    n, "feedback_overflow", {"dropped": count}
+                feedback_overflow=lambda count, run=run, node_id=node_id: run._emit(
+                    node_id, "feedback_overflow", {"dropped": count}
                 ),
             )
             run._contexts[node_id] = context

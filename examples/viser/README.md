@@ -59,6 +59,9 @@ reversal do not jump back to a hard-coded endpoint.
 Animation samples at most 60 updates per second and precomputes at most 4096
 points. Longer motions use a larger interval to preserve nominal travel time.
 
+A [runtime recording](../../assets/08-gripper-cancellation.webp) shows a running
+close being cancelled and reversed, followed by a full close/open cycle.
+
 ```python
 pilot.call_srv_async("gripper", {"action": "open", "speed": 0.8})
 pilot.call_srv_async("gripper", {"action": "close", "speed": 0.5})
