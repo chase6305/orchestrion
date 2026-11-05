@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Release cancelled request inputs after unlocking pilot state, allowing SDK
+  finalizers to query health from a cleanup thread.
 - Skip result scans for service notifications with no active requests, using
   per-service running counts while preserving callback aliases and fallback polls.
 - Roll back viewer startup failures, closing the Viser transport and owned

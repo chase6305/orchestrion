@@ -1,4 +1,4 @@
-"""Result cleanup may reenter task status through SDK object destructors."""
+"""SDK payload cleanup may reenter task status through object destructors."""
 
 import subprocess
 import sys
@@ -153,6 +153,77 @@ print("pilot finalizer completed")
 """
 
 
+_PILOT_CANCEL_INPUT_FINALIZER_PROBE = """
+import threading
+
+from orchestrion import MoveSyncOption, SimulatedRobotTask, TaskPilot
+from orchestrion.tasks import GenericTask, InPlaceFunctionCallTask
+from orchestrion.utils.types import PeekResponseResult, PeekResponseResultType
+
+armed = threading.Event()
+started = threading.Event()
+release = threading.Event()
+blocked = []
+threads = []
+
+class Input(dict):
+    def __deepcopy__(self, memo):
+        return type(self)(self)
+
+    def __del__(self):
+        if not armed.is_set():
+            return
+        observed = threading.Event()
+        def query():
+            pilot.query_health()
+            observed.set()
+        thread = threading.Thread(target=query)
+        threads.append(thread)
+        thread.start()
+        if not observed.wait(0.25):
+            blocked.append(True)
+
+class Pending(GenericTask):
+    def invoke_async(self, request_id, content=None):
+        return True
+
+    def peek_response(self, request_id):
+        return PeekResponseResult(
+            PeekResponseResultType.RequestSentNoResponse, request_id
+        )
+
+    def cancel_request(self, request_id):
+        return True
+
+class Blocking(InPlaceFunctionCallTask):
+    def _call_fn(self, request_id, content):
+        started.set()
+        assert release.wait(2)
+
+with TaskPilot(
+    SimulatedRobotTask([0.0]), {'pending': Pending(), 'blocking': Blocking()}
+) as pilot:
+    request_id = pilot.call_srv_async(
+        'pending', Input(value=1), MoveSyncOption.no_sync()
+    )
+    # Dispatch another call so scheduler snapshots no longer retain the input.
+    pilot.call_srv_async('blocking', sync_option=MoveSyncOption.no_sync())
+    assert started.wait(1)
+    armed.set()
+    try:
+        assert pilot.cancel_request(request_id)
+    finally:
+        armed.clear()
+        release.set()
+        for thread in threads:
+            thread.join(timeout=1)
+    assert threads, 'Input was not released during cancellation'
+    assert not any(thread.is_alive() for thread in threads)
+    assert not blocked, 'Input finalizer ran with pilot state lock held'
+print('cancel input finalizer completed')
+"""
+
+
 @pytest.mark.parametrize("backend", ["inline", "threaded"])
 @pytest.mark.parametrize("removal", ["evict", "forget"])
 def test_released_results_can_query_status_without_deadlocking(backend, removal):
@@ -189,3 +260,14 @@ def test_pruned_pilot_results_can_observe_health_from_a_cleanup_thread(backend):
     )
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "pilot finalizer completed"
+
+
+def test_cancelled_pilot_input_can_observe_health_from_a_cleanup_thread():
+    completed = subprocess.run(
+        [sys.executable, "-c", _PILOT_CANCEL_INPUT_FINALIZER_PROBE],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "cancel input finalizer completed"

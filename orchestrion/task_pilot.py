@@ -728,8 +728,9 @@ class TaskPilot:
                 raise KeyError("Unknown request: {}".format(request_id))
             if result.status.terminal or request_id in self._cancelling_requests:
                 return False
-            running = request_id in self._running_requests
-            if not running:
+            # Keep SDK input alive until cancellation releases the state lock.
+            running_request = self._running_requests.get(request_id)
+            if running_request is None:
                 self._transition(
                     request_id, RequestStatus.CANCELLED, error="Cancelled by user"
                 )
