@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fast-path native numeric schema values while preserving exact large integers;
+  report overflowing real values as validation errors before command dispatch.
 - Reuse each arm's latest rendered pose and kinematics while updating progress,
   grippers and ownership every frame. Serialize complete live/replay frame updates
   and retry pose updates after renderer or kinematics failures.
