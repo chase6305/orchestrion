@@ -189,7 +189,10 @@ def test_nested_forward_references_validate_every_path_before_dispatch(last_fiel
             return inputs
 
         async with WorkflowEngine(
-            [Action("detect", record, output_schema=pose_schema()), Action("use", record)]
+            [
+                Action("detect", record, output_schema=pose_schema()),
+                Action("use", record),
+            ]
         ) as engine:
             workflow = Workflow(
                 (
@@ -268,7 +271,9 @@ def test_references_changed_by_schema_hooks_are_rechecked_before_dispatch(
             workflow = Workflow((
                 Node("use", "use", {"values": [reference]}),
                 Node("source", "source", {"value": 1, "other": 2}),
-                Node("replacement", "source", {"value": 3, "other": 4}, after=("gate",)),
+                Node(
+                    "replacement", "source", {"value": 3, "other": 4}, after=("gate",)
+                ),
                 Node("gate", "source", {"value": 0, "other": 0}),
             ))
             if error is not None:

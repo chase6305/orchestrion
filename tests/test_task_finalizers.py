@@ -134,7 +134,9 @@ with ThreadPoolExecutor(max_workers=1) as executor, TaskPilot(
     SimulatedRobotTask([0.0]), {"device": task}, executor_owned=executor
 ) as pilot:
     for _ in range(3):
-        request_id = pilot.call_srv_async("device", sync_option=MoveSyncOption.no_sync())
+        request_id = pilot.call_srv_async(
+            "device", sync_option=MoveSyncOption.no_sync()
+        )
         result = pilot.wait_request(request_id, timeout=1)
         del result
     armed.set()

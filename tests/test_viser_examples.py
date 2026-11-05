@@ -678,7 +678,9 @@ def test_slow_gripper_motion_bounds_precomputed_points_and_preserves_duration():
 
 
 @pytest.mark.parametrize("scheduler_interval, speed", [(0.01, 0.00005), (3.0, 1.0)])
-def test_gripper_default_timeout_covers_the_final_sample_hold(scheduler_interval, speed):
+def test_gripper_default_timeout_covers_the_final_sample_hold(
+    scheduler_interval, speed,
+):
     class TimedRobot(RobotStub):
         def wait_submodule_move(self, name, move_id, timeout):
             _, trajectory, interval = self.requests[-1]
@@ -886,7 +888,9 @@ def test_concurrent_gripper_cancellations_release_queued_sequence_once():
 
 
 def test_gripper_completion_clears_cancellation_after_handler_returns():
-    returned, release, completed = threading.Event(), threading.Event(), threading.Event()
+    returned, release, completed = (
+        threading.Event(), threading.Event(), threading.Event()
+    )
 
     class PausedTask(ViserGripperTask):
         def _call_fn(self, request_id, content=None):
