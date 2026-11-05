@@ -157,7 +157,7 @@ def world_ee_position(
     side: str,
     local_offset: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Compute an arm end-effector position in the shared Viser world frame."""
+    """Return a tool-frame point in the shared Viser world frame."""
     if side not in _ROOT_POSITIONS:
         raise ValueError("side must be left or right")
     urdf.update_cfg(np.asarray(configuration, dtype=float))
@@ -407,6 +407,10 @@ class DualArmViserRuntime(DualArmRuntime):
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
+        # Finish live updates before publishing the final frame.
+        self._visual_stop.set()
+        if self._visual_thread is not None:
+            self._visual_thread.join(timeout=1.0)
         try:
             arms = self.arm_positions()
             grippers = {
@@ -415,13 +419,13 @@ class DualArmViserRuntime(DualArmRuntime):
                 ).positions[0]
                 for side in ("left", "right")
             }
-            frame = self._capture_frame(arms, grippers, self.zone.status()["owner"])
-            self._render_frame(frame)
+            with self._render_lock:
+                frame = self._capture_frame(
+                    arms, grippers, self.zone.status()["owner"]
+                )
+                self._render_frame_locked(frame, replaying=False)
         except Exception:
             pass
-        self._visual_stop.set()
-        if self._visual_thread is not None:
-            self._visual_thread.join(timeout=1.0)
         super().__exit__(exc_type, exc, traceback)
 
     def close_server(self) -> None:
@@ -525,24 +529,24 @@ class DualArmViserRuntime(DualArmRuntime):
             self._render_frame_locked(frame, replaying)
 
     def _render_frame_locked(self, frame: ReplayFrame, replaying: bool) -> None:
-        ee_positions = {}
+        payload_positions = {}
         for side, positions in (
             ("left", frame.left_arm),
             ("right", frame.right_arm),
         ):
             pose = tuple(positions)
-            cached = self._rendered_arm_poses.get(side)
-            if cached is None or cached[0] != pose:
+            rendered_arm = self._rendered_arm_poses.get(side)
+            if rendered_arm is None or rendered_arm[0] != pose:
                 # A partial renderer/FK failure must force the next pose update.
                 self._rendered_arm_poses.pop(side, None)
                 configuration = visual_arm_configuration(pose, side)
                 self._arm_handles[side].update_cfg(configuration)
-                cached = (
+                rendered_arm = (
                     pose,
                     self._ee_position(side, configuration, _PAYLOAD_LOCAL_OFFSET),
                 )
-                self._rendered_arm_poses[side] = cached
-            ee_positions[side] = cached[1]
+                self._rendered_arm_poses[side] = rendered_arm
+            payload_positions[side] = rendered_arm[1]
             grip = getattr(frame, "{}_gripper".format(side))
             self._gripper_indicators[side].color = (
                 (230, 145, 55) if grip >= 0.5 else (70, 190, 110)
@@ -566,7 +570,7 @@ class DualArmViserRuntime(DualArmRuntime):
         for payload, visible in visibility.items():
             self._payloads[payload].visible = visible
         self._payloads["both"].position = 0.5 * (
-            ee_positions["left"] + ee_positions["right"]
+            payload_positions["left"] + payload_positions["right"]
         )
         mode = "Replay" if replaying else "Live"
         self._state_status.content = (
@@ -594,17 +598,23 @@ class DualArmViserRuntime(DualArmRuntime):
                     for side in ("left", "right")
                 }
                 zone = self.zone.status()
-                frame = self._capture_frame(arms, grippers, zone["owner"])
-                self._render_frame(frame)
+                with self._render_lock:
+                    # A slow read may return after shutdown's bounded join.
+                    if self._visual_stop.is_set():
+                        return
+                    frame = self._capture_frame(arms, grippers, zone["owner"])
+                    self._render_frame_locked(frame, replaying=False)
                 recent = self.events[-6:]
                 self._event_status.content = "## Recent events\n{}".format(
                     "\n".join("- `{}`".format(event["event"]) for event in recent)
                     or "—"
                 )
             except Exception as exc:
-                self._state_status.content = "**Robot state:** unavailable (`{}`)".format(
-                    exc
-                )
+                with self._render_lock:
+                    if not self._visual_stop.is_set():
+                        self._state_status.content = (
+                            "**Robot state:** unavailable (`{}`)".format(exc)
+                        )
 
     def enable_replay(
         self,

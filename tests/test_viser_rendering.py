@@ -14,6 +14,7 @@ pytest.importorskip("viser")
 
 import numpy as np
 
+from examples.dual_arm.common import DualArmRuntime
 from examples.dual_arm.viser import DualArmViserRuntime, ReplayFrame
 
 
@@ -130,3 +131,79 @@ def test_concurrent_renderers_do_not_interleave_frame_updates(render_runtime):
     assert "next" in runtime._state_status.content
 
 
+@pytest.fixture
+def final_render_runtime(render_runtime, monkeypatch):
+    runtime = render_runtime
+    runtime._visual_stop = threading.Event()
+    old = ReplayFrame(0.0, (0.0,) * 3, (0.0,) * 3, 0, 0, None, "table", "old")
+    final = replace(old, elapsed=1.0, left_arm=(0.1, 0.2, 0.3), event="final")
+    runtime.arm_positions = Mock(
+        return_value={"left": final.left_arm, "right": final.right_arm}
+    )
+    runtime.robot = SimpleNamespace(
+        query_submodule_state=lambda name: SimpleNamespace(positions=[0])
+    )
+    runtime.zone = SimpleNamespace(status=lambda: {"owner": None})
+    runtime._capture_frame = Mock(return_value=final)
+    monkeypatch.setattr(DualArmRuntime, "__exit__", Mock())
+    return runtime, old, final
+
+
+def test_final_frame_is_rendered_after_live_monitor_finishes(final_render_runtime):
+    runtime, old, final = final_render_runtime
+    captured = threading.Event()
+
+    def monitor():
+        captured.set()
+        assert runtime._visual_stop.wait(2)
+        runtime._render_frame(old)
+
+    runtime._visual_thread = threading.Thread(target=monitor)
+    runtime._visual_thread.start()
+    try:
+        assert captured.wait(1)
+        runtime.__exit__(None, None, None)
+        assert "final" in runtime._state_status.content
+        assert runtime._rendered_arm_poses["left"][0] == final.left_arm
+    finally:
+        runtime._visual_stop.set()
+        runtime._visual_thread.join(timeout=2)
+    assert not runtime._visual_thread.is_alive()
+
+
+@pytest.mark.parametrize("query_fails", [False, True])
+def test_late_monitor_reads_cannot_replace_final_frame(
+    final_render_runtime, query_fails,
+):
+    runtime, old, final = final_render_runtime
+    entered, release = threading.Event(), threading.Event()
+    captured = []
+
+    def arm_positions():
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(3)
+            if query_fails:
+                raise RuntimeError("late monitor read failed")
+            return {"left": old.left_arm, "right": old.right_arm}
+        return {"left": final.left_arm, "right": final.right_arm}
+
+    def capture(arms, grippers, owner):
+        frame = final if arms["left"] == final.left_arm else old
+        captured.append(frame)
+        return frame
+
+    runtime.arm_positions = arm_positions
+    runtime._capture_frame.side_effect = capture
+    runtime._visual_thread = threading.Thread(target=runtime._monitor_scene)
+    runtime._visual_thread.start()
+    try:
+        assert entered.wait(1)
+        runtime.__exit__(None, None, None)
+    finally:
+        release.set()
+        runtime._visual_stop.set()
+        runtime._visual_thread.join(timeout=2)
+    assert not runtime._visual_thread.is_alive()
+    assert "final" in runtime._state_status.content
+    assert captured == [final]

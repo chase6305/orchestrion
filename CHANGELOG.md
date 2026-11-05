@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Finish dual-arm monitor updates before publishing the final frame, preventing
+  late monitor samples or errors from replacing it, even after the join times out.
+  Clarify payload-center coordinate names.
 - Check native numeric types before the Real ABC during trajectory validation,
   reducing per-joint overhead while preserving finite-float range checks.
 - Reuse timing validation in the HTTP demo client, rejecting float overflow and
