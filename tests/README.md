@@ -44,6 +44,7 @@ Keep integration scenarios alongside the corresponding example or public API.
 | `test_network_demo.py` | Network command validation, service lifecycle and demo integration |
 | `test_simulated_demo.py` | Pick/place command order and observed motion completion |
 | `test_viser_examples.py` | Optional visualization, gripper behavior and example launchers |
+| `test_viser_rendering.py` | Reused arm kinematics, render-failure recovery and concurrent frame updates |
 
 Run related groups with:
 

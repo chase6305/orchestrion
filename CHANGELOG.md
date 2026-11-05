@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Reuse each arm's latest rendered pose and kinematics while updating progress,
+  grippers and ownership every frame. Serialize complete live/replay frame updates
+  and retry pose updates after renderer or kinematics failures.
 - Reject underflowing retry settings during policy validation and expose fractional
   retry values as JSON numbers in service descriptions, preserving exact policies.
 - Reject positive timing intervals that become zero as native floats, preserving

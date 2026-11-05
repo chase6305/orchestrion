@@ -6,7 +6,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import viser
@@ -122,7 +122,7 @@ def replay_frame_index(frames: Sequence[ReplayFrame], elapsed: float) -> int:
 
 
 def visual_arm_configuration(
-    positions: List[float], side: str = "left"
+    positions: Sequence[float], side: str = "left"
 ) -> np.ndarray:
     """Map an abstract arm state onto the closest smooth UR5 pose segment."""
     configuration = np.asarray(positions, dtype=float)
@@ -328,6 +328,8 @@ class DualArmViserRuntime(DualArmRuntime):
         self._event_status = self.server.gui.add_markdown("## Recent events\n—")
         self._visual_stop = threading.Event()
         self._visual_thread = None
+        self._render_lock = threading.Lock()
+        self._rendered_arm_poses: Dict[str, Tuple[tuple, np.ndarray]] = {}
         self._capture_started_at = None
         self._replay_frames: List[ReplayFrame] = []
         self._replay_lock = threading.Lock()
@@ -518,16 +520,29 @@ class DualArmViserRuntime(DualArmRuntime):
         return frame
 
     def _render_frame(self, frame: ReplayFrame, replaying: bool = False) -> None:
+        # Live monitoring, final capture and replay share mutable URDF instances.
+        with self._render_lock:
+            self._render_frame_locked(frame, replaying)
+
+    def _render_frame_locked(self, frame: ReplayFrame, replaying: bool) -> None:
         ee_positions = {}
         for side, positions in (
             ("left", frame.left_arm),
             ("right", frame.right_arm),
         ):
-            configuration = visual_arm_configuration(list(positions), side)
-            self._arm_handles[side].update_cfg(configuration)
-            ee_positions[side] = self._ee_position(
-                side, configuration, _PAYLOAD_LOCAL_OFFSET
-            )
+            pose = tuple(positions)
+            cached = self._rendered_arm_poses.get(side)
+            if cached is None or cached[0] != pose:
+                # A partial renderer/FK failure must force the next pose update.
+                self._rendered_arm_poses.pop(side, None)
+                configuration = visual_arm_configuration(pose, side)
+                self._arm_handles[side].update_cfg(configuration)
+                cached = (
+                    pose,
+                    self._ee_position(side, configuration, _PAYLOAD_LOCAL_OFFSET),
+                )
+                self._rendered_arm_poses[side] = cached
+            ee_positions[side] = cached[1]
             grip = getattr(frame, "{}_gripper".format(side))
             self._gripper_indicators[side].color = (
                 (230, 145, 55) if grip >= 0.5 else (70, 190, 110)
