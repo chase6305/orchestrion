@@ -183,14 +183,23 @@ class ViserDemoRuntime:
         self.set_status("client connected; preparing workflow")
 
     def __enter__(self) -> "ViserDemoRuntime":
-        self.pilot.initialize()
-        self._monitor_stop.clear()
-        self._monitor_thread = threading.Thread(
-            target=self._monitor_gripper,
-            name="viser-gripper-monitor",
-            daemon=True,
-        )
-        self._monitor_thread.start()
+        try:
+            self.pilot.initialize()
+            self._monitor_stop.clear()
+            self._monitor_thread = threading.Thread(
+                target=self._monitor_gripper,
+                name="viser-gripper-monitor",
+                daemon=True,
+            )
+            self._monitor_thread.start()
+        except Exception as error:
+            # An unstarted monitor cannot be joined by __exit__ during rollback.
+            self._monitor_thread = None
+            try:
+                self.__exit__(type(error), error, error.__traceback__)
+            finally:
+                self.executor.shutdown(wait=False, cancel_futures=True)
+            raise
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:

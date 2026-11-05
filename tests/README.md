@@ -45,6 +45,7 @@ Keep integration scenarios alongside the corresponding example or public API.
 | `test_simulated_demo.py` | Pick/place command order and observed motion completion |
 | `test_viser_examples.py` | Optional visualization, gripper behavior and example launchers |
 | `test_viser_rendering.py` | Reused arm kinematics, render-failure recovery and concurrent frame updates |
+| `test_viser_runtime_lifecycle.py` | Viewer initialization and monitor-start failure rollback |
 
 Run related groups with:
 

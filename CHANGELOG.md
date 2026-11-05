@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Roll back viewer startup failures, closing the Viser transport and owned
+  executor/controller resources when initialization or monitor startup fails.
 - Finish dual-arm monitor updates before publishing the final frame, preventing
   late monitor samples or errors from replacing it, even after the join times out.
   Clarify payload-center coordinate names.

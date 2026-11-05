@@ -397,13 +397,22 @@ class DualArmViserRuntime(DualArmRuntime):
         except Exception:
             self.server.stop()
             raise
-        self._visual_stop.clear()
-        self._visual_thread = threading.Thread(
-            target=self._monitor_scene,
-            name="dual-arm-viser-monitor",
-            daemon=True,
-        )
-        self._visual_thread.start()
+        try:
+            self._visual_stop.clear()
+            self._visual_thread = threading.Thread(
+                target=self._monitor_scene,
+                name="dual-arm-viser-monitor",
+                daemon=True,
+            )
+            self._visual_thread.start()
+        except Exception as error:
+            self._visual_stop.set()
+            self._visual_thread = None
+            try:
+                super().__exit__(type(error), error, error.__traceback__)
+            finally:
+                self.server.stop()
+            raise
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
