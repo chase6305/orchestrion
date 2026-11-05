@@ -639,6 +639,38 @@ def test_group_wait_protects_all_results_from_concurrent_pruning(monkeypatch):
         assert pilot.prune_completed_requests(keep_last=0) == 2
 
 
+def test_pruning_keeps_newest_eligible_results_beside_group_waiters(monkeypatch):
+    pilot = TaskPilot(SimulatedRobotTask([0.0]), {"device": RecordingTask()})
+    waiting, resume = threading.Event(), threading.Event()
+    original_wait = pilot.wait_request
+
+    def paused_wait(request_id, timeout=None):
+        if request_id == 0:
+            waiting.set()
+            assert resume.wait(2)
+        return original_wait(request_id, timeout)
+
+    with pilot, concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        ids = [pilot.call_srv_async("device") for _ in range(5)]
+        pilot.wait_requests(ids, timeout=1)
+        monkeypatch.setattr(pilot, "wait_request", paused_wait)
+        selected = [ids[0], ids[-1]]
+        future = executor.submit(pilot.wait_requests, selected, timeout=1)
+        try:
+            assert waiting.wait(1)
+            assert pilot.prune_completed_requests(keep_last=1) == 2
+            for request_id in (ids[1], ids[2]):
+                with pytest.raises(KeyError):
+                    pilot.query_request(request_id)
+            for request_id in (ids[0], ids[3], ids[4]):
+                assert pilot.query_request(request_id).status is RequestStatus.SUCCEEDED
+        finally:
+            resume.set()
+        assert [result.request_id for result in future.result(1)] == selected
+        assert pilot.prune_completed_requests(keep_last=1) == 2
+        assert pilot.query_request(ids[-1]).status is RequestStatus.SUCCEEDED
+
+
 def test_flushed_backend_response_is_a_terminal_failure():
     class FlushedTask(RecordingTask):
         def peek_response(self, request_id):

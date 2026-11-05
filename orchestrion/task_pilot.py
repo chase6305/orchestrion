@@ -10,11 +10,17 @@ import time
 from collections import Counter, deque
 from dataclasses import dataclass, replace
 from functools import partial
+from itertools import islice
 from typing import Any, Container, Dict, List, Optional, Set, Tuple
 
 from orchestrion.health import DeviceHealth
 from orchestrion.move_sync_option import MoveSyncOption
-from orchestrion.request import RequestResult, RequestStatus, TimelineEvent
+from orchestrion.request import (
+    _TERMINAL_STATUSES,
+    RequestResult,
+    RequestStatus,
+    TimelineEvent,
+)
 from orchestrion.tasks.generic_task import GenericTask
 from orchestrion.tasks.reduced_robot_task_interface import ReducedRobotTaskInterface
 from orchestrion.utils.errors import exception_message
@@ -793,8 +799,9 @@ class TaskPilot:
         return [event for event in events if event.request_id == request_id]
 
     def prune_completed_requests(self, keep_last: int = 1000) -> int:
-        """Forget old terminal requests while preserving active requests.
+        """Forget old terminal requests while preserving active requests and waiters.
 
+        keep_last counts eligible terminal records in request-ID order.
         Timeline storage remains independently bounded by ``timeline_capacity``.
         Returns the number of request records removed from this pilot.
         """
@@ -803,19 +810,30 @@ class TaskPilot:
         if keep_last < 0:
             raise ValueError("keep_last must be non-negative")
         with self._state_condition:
-            terminal_ids = [
-                request_id
-                for request_id, result in self._requests.items()
+            if len(self._requests) <= keep_last:
+                return 0
+            terminal_count = sum(
+                self._request_counts[status.value] for status in _TERMINAL_STATUSES
+            )
+            if terminal_count <= keep_last:
+                return 0
+            protected_count = sum(
+                self._requests[request_id].status.terminal
+                for request_id in self._request_waiters
+            )
+            prune_count = terminal_count - protected_count - keep_last
+            if prune_count <= 0:
+                return 0
+            candidates = (
+                result
+                for result in self._requests.values()
                 if result.status.terminal
-                and self._request_waiters.get(request_id, 0) == 0
-            ]
-            prune_ids = terminal_ids if keep_last == 0 else terminal_ids[:-keep_last]
-            pruned = [
-                (request_id, self._requests[request_id].service_name)
-                for request_id in prune_ids
-            ]
-            for request_id, _ in pruned:
-                result = self._requests.pop(request_id)
+                and result.request_id not in self._request_waiters
+            )
+            pruned = list(islice(candidates, prune_count))
+            # Hold removed SDK payloads until cleanup can run without the state lock.
+            for result in pruned:
+                self._requests.pop(result.request_id)
                 self._request_counts[result.status.value] -= 1
                 if result.idempotency_key is not None:
                     self._idempotency_requests.pop(
@@ -824,13 +842,15 @@ class TaskPilot:
             if pruned:
                 self._mark_health_changed_locked()
 
-        for request_id, service_name in pruned:
-            forget = getattr(self._task_map[service_name], "forget_response", None)
+        for result in pruned:
+            forget = getattr(
+                self._task_map[result.service_name], "forget_response", None
+            )
             if callable(forget):
                 try:
-                    forget(request_id)
+                    forget(result.request_id)
                 except Exception:
-                    logger.exception("Failed to forget response %s", request_id)
+                    logger.exception("Failed to forget response %s", result.request_id)
         return len(pruned)
 
     def move_joint_trajectory_async(

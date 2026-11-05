@@ -94,6 +94,54 @@ finally:
 print("sample finalizer completed")
 """
 
+_PILOT_PRUNE_FINALIZER_PROBE = """
+import threading
+
+from orchestrion import MoveSyncOption, SimulatedRobotTask, TaskPilot
+from orchestrion.tasks import InPlaceFunctionCallTask
+
+armed = threading.Event()
+blocked, threads = [], []
+
+class DeviceResult:
+    def __deepcopy__(self, memo):
+        return DeviceResult()
+
+    def __del__(self):
+        if not armed.is_set():
+            return
+        observed = threading.Event()
+        def query():
+            pilot.query_health()
+            observed.set()
+        thread = threading.Thread(target=query)
+        threads.append(thread)
+        thread.start()
+        if not observed.wait(0.25):
+            blocked.append(True)
+
+class Task(InPlaceFunctionCallTask):
+    def _call_fn(self, request_id, content):
+        return {"resource": DeviceResult()}
+
+with TaskPilot(SimulatedRobotTask([0.0]), {"device": Task()}) as pilot:
+    for _ in range(3):
+        request_id = pilot.call_srv_async("device", sync_option=MoveSyncOption.no_sync())
+        result = pilot.wait_request(request_id, timeout=1)
+        del result
+    armed.set()
+    try:
+        assert pilot.prune_completed_requests(keep_last=0) == 3
+    finally:
+        armed.clear()
+        for thread in threads:
+            thread.join(timeout=1)
+    assert threads
+    assert not any(thread.is_alive() for thread in threads)
+    assert not blocked, "SDK finalizer could not observe pilot health during pruning"
+print("pilot finalizer completed")
+"""
+
 
 @pytest.mark.parametrize("backend", ["inline", "threaded"])
 @pytest.mark.parametrize("removal", ["evict", "forget"])
@@ -119,3 +167,14 @@ def test_replaced_poll_samples_can_query_status_without_deadlocking():
     )
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "sample finalizer completed"
+
+
+def test_pruned_pilot_results_can_observe_health_from_a_cleanup_thread():
+    completed = subprocess.run(
+        [sys.executable, "-c", _PILOT_PRUNE_FINALIZER_PROBE],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "pilot finalizer completed"
