@@ -151,7 +151,8 @@ an owned executor cannot be reused after shutdown. Built-in robots reject motion
 while stopped; submissions prepared across a stop/restart boundary are rejected.
 
 Configured sampling and scheduler intervals, trajectory point intervals and stop
-timeouts must fit `threading.TIMEOUT_MAX`. Unsupported values are rejected before
-queue or lifecycle changes. Deadline-based request and movement waits retain
-larger total budgets by splitting native waits. `RetryPolicy` can compute larger
+timeouts must fit `threading.TIMEOUT_MAX`; positive intervals must also remain
+nonzero as native floats. Unsupported values are rejected before queue or lifecycle
+changes. Deadline-based request and movement waits split native waits to preserve
+larger total budgets. `RetryPolicy` can compute larger
 delays, but a callable task rejects an unsupported delay before waiting.
