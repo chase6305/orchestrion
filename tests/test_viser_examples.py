@@ -854,6 +854,64 @@ def test_cancel_before_gripper_move_id_publication_stops_motion(reentrant):
             task.stop()
 
 
+def test_concurrent_gripper_cancellations_release_queued_sequence_once():
+    rendezvous = threading.Barrier(2)
+
+    class QueuedFuture(concurrent.futures.Future):
+        def cancel(self):
+            rendezvous.wait(timeout=1)
+            return super().cancel()
+
+    future = QueuedFuture()
+    executor = SimpleNamespace(submit=lambda *args: future)
+    robot = RobotStub()
+    task = ViserGripperTask(robot)
+    task.initialize(executor=executor)
+    try:
+        assert task.invoke_async(0, {"action": "close"})
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as callers:
+            cancellations = [callers.submit(task.cancel_request, 0) for _ in range(2)]
+            assert all(cancellation.result(timeout=2) for cancellation in cancellations)
+        assert not robot.requests
+        assert not task._request_sequences
+        assert not task._cancelled_requests
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as workers:
+            task.initialize(executor=workers)
+            assert task.invoke_async(1, {"action": "open"})
+            task._future_map[1].result(timeout=1)
+        assert len(robot.requests) == 1
+    finally:
+        concurrent.futures.Future.cancel(future)
+        task.stop()
+
+
+def test_gripper_completion_clears_cancellation_after_handler_returns():
+    returned, release, completed = threading.Event(), threading.Event(), threading.Event()
+
+    class PausedTask(ViserGripperTask):
+        def _call_fn(self, request_id, content=None):
+            result = super()._call_fn(request_id, content)
+            returned.set()
+            assert release.wait(2)
+            return result
+
+    task = PausedTask(RobotStub())
+    task.set_completion_callback(completed.set)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        try:
+            assert task.invoke_async(0, {"action": "close"})
+            assert returned.wait(1)
+            assert task.cancel_request(0)
+            release.set()
+            assert completed.wait(1)
+            assert not task._cancelled_requests
+            assert not task._request_sequences
+        finally:
+            release.set()
+            task.stop()
+
+
 def test_stopping_gripper_ignores_completed_history_and_cancels_queued_work(
     monkeypatch,
 ):

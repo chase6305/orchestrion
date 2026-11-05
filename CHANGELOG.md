@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Clean up gripper request state at future completion, making concurrent queued
+  cancellation idempotent and preventing late cancellation flags from accumulating.
 - Validate Viser gripper request IDs before sequence reservation or cancellation,
   so boolean/float aliases cannot affect an active integer-ID request.
 - Discover workflow output references once per compilation and reuse them for

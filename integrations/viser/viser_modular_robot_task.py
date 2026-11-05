@@ -123,18 +123,23 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
                 lambda: sequence == self._next_running_sequence
                 or request_id in self._cancelled_requests
             )
-        try:
-            with self._lock:
-                if request_id in self._cancelled_requests:
-                    raise concurrent.futures.CancelledError("Gripper request cancelled")
-            return self._execute_call(request_id, content)
-        finally:
-            with self._order_condition:
+        with self._lock:
+            if request_id in self._cancelled_requests:
+                raise concurrent.futures.CancelledError("Gripper request cancelled")
+        return self._execute_call(request_id, content)
+
+    def _on_future_done(
+        self, request_id: int, future: concurrent.futures.Future
+    ) -> None:
+        """Release queued or running requests once, before notifying observers."""
+        with self._order_condition:
+            sequence = self._request_sequences.pop(request_id, None)
+            if sequence is not None:
                 self._finish_sequence_locked(sequence)
-                self._request_sequences.pop(request_id, None)
-            with self._lock:
-                self._request_move_ids.pop(request_id, None)
-                self._cancelled_requests.discard(request_id)
+        with self._lock:
+            self._request_move_ids.pop(request_id, None)
+            self._cancelled_requests.discard(request_id)
+        super()._on_future_done(request_id, future)
 
     def _finish_sequence_locked(self, sequence: int) -> None:
         self._finished_sequences.add(sequence)
@@ -261,12 +266,5 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
             self._order_condition.notify_all()
         if move_id is not None:
             self._robot_task.cancel_submodule_move("gripper", move_id)
-        future_cancelled = super().cancel_request(request_id)
-        if future_cancelled:
-            with self._order_condition:
-                sequence = self._request_sequences.pop(request_id)
-                self._finish_sequence_locked(sequence)
-            with self._lock:
-                self._request_move_ids.pop(request_id, None)
-                self._cancelled_requests.discard(request_id)
+        super().cancel_request(request_id)
         return True
