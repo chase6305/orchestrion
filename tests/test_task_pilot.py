@@ -1251,17 +1251,21 @@ def test_pending_backlog_does_not_poll_every_request_after_each_submission():
         assert task.polls <= count * 2
 
 
-def test_shared_task_aliases_all_receive_completion_notifications():
-    release = threading.Event()
-    started = threading.Event()
+@pytest.mark.parametrize(
+    "services", [("first_alias", "second_alias"), ("second_alias", "first_alias")]
+)
+def test_shared_task_aliases_all_receive_completion_notifications(services):
+    release = [threading.Event(), threading.Event()]
+    started = [threading.Event(), threading.Event()]
 
     def call(request_id, content):
-        started.set()
-        assert release.wait(2.0)
+        index = content["value"]
+        started[index].set()
+        assert release[index].wait(2.0)
         return content
 
     task = CallableTask(call)
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
     with TaskPilot(
         SimulatedRobotTask([0.0]),
         {"first_alias": task, "second_alias": task},
@@ -1269,13 +1273,19 @@ def test_shared_task_aliases_all_receive_completion_notifications():
         poll_interval=5.0,
     ) as pilot:
         try:
-            request_id = pilot.call_srv_async("first_alias", {"value": 1})
-            assert started.wait(1.0)
-            release.set()
-            result = pilot.wait_request(request_id, timeout=1.0)
-            assert result.status is RequestStatus.SUCCEEDED
+            request_ids = [
+                pilot.call_srv_async(service, {"value": index})
+                for index, service in enumerate(services)
+            ]
+            assert all(event.wait(1) for event in started)
+            for index, request_id in enumerate(request_ids):
+                release[index].set()
+                result = pilot.wait_request(request_id, timeout=1)
+                assert result.status is RequestStatus.SUCCEEDED
+                assert result.content == {"value": index}
         finally:
-            release.set()
+            for event in release:
+                event.set()
 
 
 def test_inline_task_can_stop_its_pilot_without_joining_itself():

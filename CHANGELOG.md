@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Skip result scans for service notifications with no active requests, using
+  per-service running counts while preserving callback aliases and fallback polls.
 - Roll back viewer startup failures, closing the Viser transport and owned
   executor/controller resources when initialization or monitor startup fails.
 - Finish dual-arm monitor updates before publishing the final frame, preventing
