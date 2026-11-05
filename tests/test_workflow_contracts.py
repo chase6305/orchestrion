@@ -179,6 +179,50 @@ def test_known_invalid_output_reference_is_rejected_before_any_device_io(path):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("last_field", ["frame", "missing"])
+def test_nested_forward_references_validate_every_path_before_dispatch(last_field):
+    async def scenario():
+        calls = []
+
+        async def record(context, inputs):
+            calls.append(context.node_id)
+            return inputs
+
+        async with WorkflowEngine(
+            [Action("detect", record, output_schema=pose_schema()), Action("use", record)]
+        ) as engine:
+            workflow = Workflow(
+                (
+                    Node(
+                        "use",
+                        "use",
+                        {
+                            "nested": [
+                                {
+                                    "first": OutputRef("detect", ("pose", 0)),
+                                    "last": OutputRef("detect", (last_field,)),
+                                }
+                            ]
+                        },
+                    ),
+                    Node("detect", "detect", {"pose": [1, 2, 3], "frame": "workcell"}),
+                )
+            )
+            if last_field == "missing":
+                with pytest.raises(ValueError, match="invalid output reference"):
+                    engine.submit(workflow)
+                assert not calls
+            else:
+                result = await engine.submit(workflow).wait(1)
+                assert result.status == RunStatus.SUCCEEDED
+                assert result.nodes["use"].output == {
+                    "nested": [{"first": 1, "last": "workcell"}]
+                }
+                assert calls == ["detect", "use"]
+
+    asyncio.run(scenario())
+
+
 def test_optional_output_fields_remain_a_runtime_check():
     async def scenario():
         async with WorkflowEngine(

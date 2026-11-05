@@ -71,6 +71,7 @@ def compile_workflow(
     if len(workflow.nodes) > max_nodes:
         raise ValueError("workflow exceeds max_nodes_per_run")
     nodes: Dict[str, CompiledNode] = {}
+    references_by_node = {}
     for original in workflow.nodes:
         # Re-snapshot even frozen definitions: nested dictionaries are mutable.
         node = replace(original)
@@ -82,6 +83,8 @@ def compile_workflow(
             raise ValueError("unknown action: " + node.action)
         action = actions[node.action]
         references = tuple(_output_references(node.inputs))
+        if references:
+            references_by_node[node.node_id] = references
         dependencies = tuple(
             dict.fromkeys(
                 (*node.after, *(reference.node_id for reference in references))
@@ -109,7 +112,8 @@ def compile_workflow(
             if dependency not in nodes:
                 raise ValueError("unknown dependency: " + dependency)
             successors[dependency].append(node_id)
-        for reference in _output_references(compiled.node.inputs):
+        # Reuse discovery after all nodes exist, including forward references.
+        for reference in references_by_node.get(node_id, ()):
             schema = actions[nodes[reference.node_id].node.action].output_schema
             if schema is not None:
                 try:

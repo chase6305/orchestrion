@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Discover workflow output references once per compilation and reuse them for
+  dependency and path checks, including nested references to later definitions.
 - Fast-path native numeric schema values while preserving exact large integers;
   report overflowing real values as validation errors before command dispatch.
 - Reuse each arm's latest rendered pose and kinematics while updating progress,
