@@ -18,7 +18,7 @@ Keep integration scenarios alongside the corresponding example or public API.
 | File | Responsibility |
 | --- | --- |
 | `test_task.py` | Inline and threaded calls, retries, telemetry, result retention, task lifecycle |
-| `test_task_finalizers.py` | SDK result cleanup that reenters task status during eviction or replacement |
+| `test_task_finalizers.py` | SDK input/result cleanup during cancellation, shutdown, pruning and eviction |
 | `test_thread_wait_limits.py` | Native wait limits, atomic rejection and larger deadline budgets |
 | `test_task_pilot.py` | Motion synchronization, dispatch, scheduler lifecycle and cancellation races |
 | `test_legacy_api.py` | Public request, health, lifecycle and simulated-motion compatibility |
