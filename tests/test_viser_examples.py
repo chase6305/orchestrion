@@ -576,6 +576,21 @@ def test_slow_gripper_motion_bounds_precomputed_points_and_preserves_duration():
     assert (len(trajectory) - 1) * interval == pytest.approx(800.0)
 
 
+@pytest.mark.parametrize("scheduler_interval, speed", [(0.01, 0.00005), (3.0, 1.0)])
+def test_gripper_default_timeout_covers_the_final_sample_hold(scheduler_interval, speed):
+    class TimedRobot(RobotStub):
+        def wait_submodule_move(self, name, move_id, timeout):
+            _, trajectory, interval = self.requests[-1]
+            return timeout > len(trajectory) * interval
+
+    robot = TimedRobot()
+    robot.scheduler_interval = scheduler_interval
+    result = ViserGripperTask(robot)._execute_call(
+        0, {"position": 0.72, "speed": speed}
+    )
+    assert result["position"] == 0.72
+
+
 def test_unrepresentable_gripper_motion_duration_fails_before_enqueueing():
     robot = RobotStub()
     task = ViserGripperTask(robot)

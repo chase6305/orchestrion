@@ -167,9 +167,6 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
         motion_duration = abs(target - current) / speed
         if not math.isfinite(motion_duration):
             raise ValueError("Gripper motion duration must be finite")
-        timeout = float(content.get("timeout", motion_duration + 2.0))
-        if not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError("Gripper timeout must be positive")
         # Bound both update rate and precomputed points. Slower sampling preserves
         # travel time for long motions instead of allocating every 60 Hz frame.
         interval = max(
@@ -181,6 +178,10 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
             self.MAX_ANIMATION_POINTS,
             max(2, math.ceil(motion_duration / interval) + 1),
         )
+        # Completion includes an interval held at the final sample.
+        timeout = float(content.get("timeout", steps * interval + 2.0))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Gripper timeout must be positive")
         trajectory = np.linspace(current, target, steps).reshape(-1, 1).tolist()
         with self._lock:
             if request_id in self._cancelled_requests:
