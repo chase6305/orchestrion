@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Vectorize Viser joint interpolation while preserving endpoint weights and
+  independent trajectory points.
 - Resolve workflow output references on demand instead of projecting every
   ordering dependency into a temporary output dictionary.
 - Release pruned, cancelled threaded responses after SDK cleanup finishes,

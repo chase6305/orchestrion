@@ -171,6 +171,19 @@ def test_dual_arm_replay_frame_rejects_invalid_payload_owner():
         )
 
 
+def test_viser_interpolation_keeps_finite_endpoints_and_independent_points():
+    start = np.array([1e308, -1e308])
+    end = -start
+    trajectory = interpolate(start, end, 5)
+    assert trajectory[0] == start.tolist()
+    assert trajectory[-1] == end.tolist()
+    assert trajectory[2] == [0.0, 0.0]
+    assert np.isfinite(trajectory).all()
+    trajectory[0][0] = 0.0
+    assert start[0] == 1e308
+    assert trajectory[1][0] != 0.0
+
+
 def test_viser_robot_accepts_configurable_scheduler_interval():
     robot = ViserModularReducedRobotTask(
         [0.0, 0.0],

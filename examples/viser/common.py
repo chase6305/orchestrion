@@ -38,7 +38,9 @@ PAYLOAD_GRASP_POSITION = 0.37
 def interpolate(start: np.ndarray, end: np.ndarray, steps: int) -> List[List[float]]:
     if steps < 2:
         raise ValueError("steps must be at least 2")
-    return [((1.0 - t) * start + t * end).tolist() for t in np.linspace(0, 1, steps)]
+    # One weight per point broadcasts across all joints.
+    progress = np.linspace(0, 1, steps)[:, None]
+    return ((1.0 - progress) * start + progress * end).tolist()
 
 
 def add_common_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
