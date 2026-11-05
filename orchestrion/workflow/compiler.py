@@ -83,13 +83,6 @@ def compile_workflow(
             raise ValueError("unknown action: " + node.action)
         action = actions[node.action]
         references = tuple(_output_references(node.inputs))
-        if references:
-            references_by_node[node.node_id] = references
-        dependencies = tuple(
-            dict.fromkeys(
-                (*node.after, *(reference.node_id for reference in references))
-            )
-        )
         # Registered action claims are immutable and already normalized. Only
         # node-level overrides require merging and allocating new claim objects.
         claims = (
@@ -102,6 +95,15 @@ def compile_workflow(
                 schema.validate_template(node.inputs, is_deferred=_is_output_reference)
             else:
                 schema.validate(dict(node.inputs))
+            # Schema overrides may replace nested references during validation.
+            references = tuple(_output_references(node.inputs))
+        if references:
+            references_by_node[node.node_id] = references
+        dependencies = tuple(
+            dict.fromkeys(
+                (*node.after, *(reference.node_id for reference in references))
+            )
+        )
         nodes[node.node_id] = CompiledNode(node, dependencies, claims, action.version)
 
     successors = {node_id: [] for node_id in nodes}
