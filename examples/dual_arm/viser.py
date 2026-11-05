@@ -1,13 +1,12 @@
 """Render any hardware-free dual-arm workflow as a two-UR5 Viser scene."""
 
 import argparse
-import bisect
 import json
 import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 import viser
@@ -107,12 +106,19 @@ class ReplayFrame:
         return frame
 
 
-def replay_frame_index(frames: List[ReplayFrame], elapsed: float) -> int:
+def replay_frame_index(frames: Sequence[ReplayFrame], elapsed: float) -> int:
     """Return the last frame at or before a replay timestamp."""
     if not frames:
         raise ValueError("replay requires at least one frame")
-    timestamps = [frame.elapsed for frame in frames]
-    return max(0, min(len(frames) - 1, bisect.bisect_right(timestamps, elapsed) - 1))
+    # Search frames directly; bisect's key argument requires Python 3.10+.
+    lower, upper = 0, len(frames)
+    while lower < upper:
+        middle = (lower + upper) // 2
+        if elapsed < frames[middle].elapsed:
+            upper = middle
+        else:
+            lower = middle + 1
+    return max(0, lower - 1)
 
 
 def visual_arm_configuration(

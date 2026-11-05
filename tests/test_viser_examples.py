@@ -123,12 +123,32 @@ def test_dual_arm_visual_configuration_rejects_unknown_side():
 def test_dual_arm_replay_selects_frame_at_or_before_cursor():
     frames = [
         ReplayFrame(value, (), (), 0.0, 0.0, None, "table", "move")
-        for value in (0.0, 0.2, 0.7)
+        for value in (0.0, 0.2, 0.2, 0.7)
     ]
     assert replay_frame_index(frames, -1.0) == 0
     assert replay_frame_index(frames, 0.19) == 0
-    assert replay_frame_index(frames, 0.2) == 1
-    assert replay_frame_index(frames, 99.0) == 2
+    assert replay_frame_index(frames, 0.2) == 2
+    assert replay_frame_index(frames, 99.0) == 3
+
+
+def test_replay_cursor_uses_bounded_indexed_reads_for_long_recordings():
+    class IndexedFrames:
+        reads = 0
+
+        def __len__(self):
+            return 1000000
+
+        def __getitem__(self, index):
+            assert 0 <= index < len(self)
+            self.reads += 1
+            return SimpleNamespace(elapsed=index * 0.01)
+
+        def __iter__(self):
+            raise AssertionError("replay lookup must not scan every frame")
+
+    frames = IndexedFrames()
+    assert replay_frame_index(frames, 1234.565) == 123456
+    assert frames.reads <= 21
 
 
 def test_dual_arm_replay_rejects_empty_recording():

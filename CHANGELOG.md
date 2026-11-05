@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Locate replay frames with indexed binary search, avoiding a full timestamp
+  copy on every seek or playback tick while preserving duplicate-time behavior.
 - Vectorize Viser joint interpolation while preserving endpoint weights and
   independent trajectory points.
 - Resolve workflow output references on demand instead of projecting every
