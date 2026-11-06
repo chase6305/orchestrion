@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Clear ready queues once when closing all workflows, while retaining active
+  workers and their resource ownership until they finish.
 - Avoid building unrelated resource-owner lists during node wait diagnostics.
 - Return immediately when workflow event cursors are already current.
 - Avoid copying the final SDK feedback batch while preserving bounded queues,

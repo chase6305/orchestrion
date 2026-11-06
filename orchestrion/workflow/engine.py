@@ -213,6 +213,7 @@ class WorkflowEngine:
     def _stop_after_journal_failure(self) -> None:
         for run in tuple(self._runs.values()):
             self._stop_run(run, "journal_failed")
+        self._clear_ready_queues()
         self._wake.set()
 
     def _checkpoint_node(self, run: WorkflowRun, node_id: str, data: Any) -> None:
@@ -274,6 +275,7 @@ class WorkflowEngine:
                     )
             if not run.done and run._unfinished == 0:
                 self._finish_run(run)
+        self._clear_ready_queues()
 
     def _check_driver(self) -> None:
         # Eager factories can enter adapters before the new driver is assigned.
@@ -518,6 +520,7 @@ class WorkflowEngine:
         self._closed = True
         for run in tuple(self._runs.values()):
             run.cancel()
+        self._clear_ready_queues()
 
         # Only this notification wait is cancelled on timeout or caller exit.
         # Workers can still drain after an interrupted scheduler has terminated.
@@ -606,6 +609,10 @@ class WorkflowEngine:
             self._stop_node(run, node_id, reason, settlements=settlements)
         if settlements:
             self._record_settlements(run, settlements)
+        if self._closed:
+            # Shutdown callers clear shared queues after stopping every run.
+            self._wake.set()
+            return
         # Cancelled entries behind a blocked device must not retain old runs
         # forever. Batch compaction is off the normal completion path.
         self._ready_heap = [
@@ -785,6 +792,10 @@ class WorkflowEngine:
             self._advance_scheduler()
             if self._runs:
                 await self._wake.wait()
+        self._clear_ready_queues()
+
+    def _clear_ready_queues(self) -> None:
+        """Release ready definitions without changing active workers or leases."""
         self._ready_heap.clear()
         self._ready_queued.clear()
         for waiters in self._resource_waiters.values():
