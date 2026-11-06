@@ -662,6 +662,8 @@ def test_events_are_bounded_and_defensive_with_monotonic_sequences():
             assert events[0].sequence > 1
             assert events[-1].status == NodeStatus.SUCCEEDED
             assert run.events(after=events[-2].sequence) == events[-1:]
+            assert run.events(after=events[-1].sequence) == ()
+            assert run.events(after=events[-1].sequence + 100) == ()
             events[0].detail["progress"].clear()
             assert run.events()[0].detail["progress"]
             checkpoint_event = next(

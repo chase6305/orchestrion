@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Return immediately when workflow event cursors are already current.
 - Avoid copying the final SDK feedback batch while preserving bounded queues,
   drop counts and event-loop yielding.
 - Reduce JSON snapshot overhead with direct string encoding and one-pass
