@@ -483,7 +483,8 @@ def test_continuous_sdk_feedback_accounts_for_every_delivered_or_dropped_sample(
     asyncio.run(scenario())
 
 
-def test_feedback_drains_in_batches_and_wakes_again_after_becoming_empty():
+@pytest.mark.parametrize("initial_count", [1, 32, 100])
+def test_feedback_drains_in_batches_and_wakes_again_after_becoming_empty(initial_count):
     async def scenario():
         delivered = []
         turns = []
@@ -498,21 +499,21 @@ def test_feedback_drains_in_batches_and_wakes_again_after_becoming_empty():
                 errors.append(exc)
 
         try:
-            thread = threading.Thread(target=produce, args=(0, 100))
+            thread = threading.Thread(target=produce, args=(0, initial_count))
             thread.start()
             thread.join(1)
             assert not thread.is_alive()
             asyncio.get_running_loop().call_soon(lambda: turns.append(len(delivered)))
             for _ in range(5):
                 await asyncio.sleep(0)
-            assert delivered == list(range(100))
-            assert turns == [32]
-            thread = threading.Thread(target=produce, args=(100, 2))
+            assert delivered == list(range(initial_count))
+            assert turns == [min(32, initial_count)]
+            thread = threading.Thread(target=produce, args=(initial_count, 2))
             thread.start()
             thread.join(1)
             assert not thread.is_alive()
             await asyncio.sleep(0)
-            assert delivered == list(range(102))
+            assert delivered == list(range(initial_count + 2))
             assert not errors
         finally:
             context._finish()
