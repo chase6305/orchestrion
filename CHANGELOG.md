@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Limit cancelled workflow queue compaction to its declared resources.
 - Skip workflow key-retention scans when the total is already within the limit.
 - Clear ready queues once when closing all workflows, while retaining active
   workers and their resource ownership until they finish.

@@ -622,12 +622,16 @@ class WorkflowEngine:
         ]
         heapq.heapify(self._ready_heap)
         self._ready_queued = {entry[1] for entry in self._ready_heap}
-        for name, waiters in self._resource_waiters.items():
+        resources = {
+            claim.resource for item in run._by_id.values() for claim in item.claims
+        }
+        for name in resources:
+            waiters = self._resource_waiters[name]
             self._resource_waiters[name] = [
                 entry for entry in waiters if self._is_ready(entry)
             ]
             heapq.heapify(self._resource_waiters[name])
-        self._wake_waiters(self._resources)
+        self._wake_waiters(resources)
         self._wake.set()
 
     def _expire_run(self, run: WorkflowRun) -> None:
