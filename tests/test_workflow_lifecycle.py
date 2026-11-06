@@ -26,6 +26,36 @@ async def echo(context, inputs):
     return inputs
 
 
+@pytest.mark.parametrize("timeout", [None, 1e-9, 1.0])
+def test_completed_wait_preserves_isolated_results_and_loop_checks_after_close(timeout):
+    async def scenario():
+        async def finish(context, inputs):
+            context.checkpoint({"ticket": [1]})
+            return {"applied": [True]}
+
+        async with WorkflowEngine([Action("finish", finish)]) as engine:
+            run = engine.submit(Workflow((Node("finish", "finish"),)))
+            await run.wait(1)
+        result = await run.wait(timeout)
+        assert result.status == RunStatus.SUCCEEDED
+        result.nodes["finish"].output["applied"].clear()
+        result.nodes["finish"].checkpoint["ticket"].clear()
+        fresh = await run.wait(timeout)
+        assert fresh.nodes["finish"].output == {"applied": [True]}
+        assert fresh.nodes["finish"].checkpoint == {"ticket": [1]}
+        with pytest.raises(ValueError):
+            await run.wait(0)
+        return run
+
+    run = asyncio.run(scenario())
+
+    async def foreign_loop():
+        with pytest.raises(RuntimeError, match="original event loop"):
+            await run.wait(timeout)
+
+    asyncio.run(foreign_loop())
+
+
 def test_late_cancel_does_not_rewrite_a_completed_success():
     async def scenario():
         cancellations = []

@@ -5,7 +5,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple
 
 from .actions import ActionContext
 from .compiler import CompiledNode
@@ -159,10 +159,17 @@ class WorkflowRun:
             raise ValueError("after must be a nonnegative integer")
         if after >= self._sequence:
             return ()
+        selected_events: Iterable[WorkflowEvent] = self._events
+        if after >= self._events[0].sequence:
+            # Sequences increase; stop the backward scan once the cursor is reached.
+            recent_events = []
+            for event in reversed(self._events):
+                if event.sequence <= after:
+                    break
+                recent_events.append(event)
+            selected_events = reversed(recent_events)
         return tuple(
-            replace(event, detail=_snapshot(event.detail))
-            for event in self._events
-            if event.sequence > after
+            replace(event, detail=_snapshot(event.detail)) for event in selected_events
         )
 
     def cancel(self) -> bool:
@@ -176,10 +183,12 @@ class WorkflowRun:
         return True
 
     async def wait(self, timeout: Optional[float] = None) -> RunResult:
+        """Return an isolated result; caller timeouts never cancel device work."""
         self._engine._check_loop()
         _timeout(timeout)
-        if not self.done:
-            self._engine._check_external_wait()
+        if self.done:
+            return self.snapshot()
+        self._engine._check_external_wait()
         waiter = asyncio.shield(self._done)
         if timeout is None:
             await waiter
