@@ -496,7 +496,10 @@ def test_deep_workflows_execute_and_propagate_failure_without_recursion():
     asyncio.run(scenario())
 
 
-def test_cancelled_waiters_do_not_stall_resource_queue_or_retain_old_runs():
+@pytest.mark.parametrize("unrelated_resources", [0, 64])
+def test_cancelled_waiters_do_not_stall_resource_queue_or_retain_old_runs(
+    unrelated_resources,
+):
     async def scenario():
         entered, release = asyncio.Event(), asyncio.Event()
 
@@ -509,7 +512,8 @@ def test_cancelled_waiters_do_not_stall_resource_queue_or_retain_old_runs():
                 Action("hold", hold, (ResourceClaim("arm"),)),
                 Action("echo", echo, (ResourceClaim("arm"),)),
             ],
-            [Resource("arm")],
+            [Resource("arm")]
+            + [Resource("unused-" + str(i)) for i in range(unrelated_resources)],
         ) as engine:
             first = engine.submit(Workflow((Node("hold", "hold"),)))
             await reached(entered)
@@ -523,6 +527,58 @@ def test_cancelled_waiters_do_not_stall_resource_queue_or_retain_old_runs():
             release.set()
             await first.wait(1)
             assert (await next_run.wait(1)).status == RunStatus.SUCCEEDED
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("unrelated_resources", [0, 64])
+def test_cancelling_multi_resource_head_wakes_follower_before_owner_finishes(
+    unrelated_resources,
+):
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls = []
+
+        async def hold(context, inputs):
+            entered.set()
+            await reached(release)
+
+        async def record(context, inputs):
+            calls.append(context.node_id)
+
+        async with WorkflowEngine(
+            [Action("hold", hold, (ResourceClaim("arm"),)), Action("record", record)],
+            [Resource("arm"), Resource("tool")]
+            + [Resource("unused-" + str(i)) for i in range(unrelated_resources)],
+            max_concurrency=2,
+        ) as engine:
+            owner = engine.submit(Workflow((Node("owner", "hold"),)))
+            try:
+                await reached(entered)
+                blocked = engine.submit(
+                    Workflow(
+                        (
+                            Node(
+                                "both",
+                                "record",
+                                claims=(ResourceClaim("arm"), ResourceClaim("tool")),
+                            ),
+                        )
+                    )
+                )
+                follower = engine.submit(
+                    Workflow(
+                        (Node("follower", "record", claims=(ResourceClaim("tool"),)),)
+                    )
+                )
+                assert blocked.cancel()
+                assert (await blocked.wait(1)).status == RunStatus.CANCELLED
+                assert (await follower.wait(1)).status == RunStatus.SUCCEEDED
+                assert calls == ["follower"]
+                assert engine.resource_snapshot()["resources"]["arm"]["used"] == 1
+            finally:
+                release.set()
+            await owner.wait(1)
 
     asyncio.run(scenario())
 

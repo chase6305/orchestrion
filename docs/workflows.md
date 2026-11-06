@@ -70,11 +70,11 @@ Oversized outputs fail before retention or downstream dispatch. Keep images and
 point clouds in artifact storage and pass references; these limits do not bound
 total process memory.
 
-`context.report()` accepts JSON progress, including from SDK threads. Each action
-has a bounded queue (`max_pending_feedback_per_action=128` by default); overflow
-drops the oldest pending report and increments `NodeResult.feedback_dropped`.
-Late reports are dropped. Required results belong in final outputs or the device
-protocol.
+`context.report()` accepts JSON progress. Reports on the owning event loop are
+delivered immediately; SDK-thread reports use a per-action bounded queue
+(`max_pending_feedback_per_action=128` by default). Overflow drops the oldest
+pending report and increments `NodeResult.feedback_dropped`. Late reports are
+dropped. Required results belong in final outputs or the device protocol.
 
 ## Cancellation and diagnostics
 
@@ -93,7 +93,9 @@ historical result remains `UNKNOWN`.
 precedence, and `None` inherits the engine default (unbounded). Expiry marks the
 node `UNKNOWN` without cancelling its adapter or releasing resources. A draining
 adapter keeps its concurrency slot and must exit before reconciliation.
-`aclose(timeout=...)` shares one shutdown budget and can be called again.
+`aclose(timeout=...)` bounds the combined wait for runs and draining adapters after
+issuing stop requests. A timeout keeps active claims held; call it again to await
+cleanup.
 
 Use `run.explain(node_id)` for dependency, concurrency, resource, queue, stop or
 quarantine blockers. `engine.scheduler_snapshot()` shows counts, owners, queue

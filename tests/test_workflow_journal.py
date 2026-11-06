@@ -266,7 +266,10 @@ def test_journal_failure_closes_admission_and_preserves_conservative_recovery(
     asyncio.run(restart())
 
 
-def test_failed_intent_stops_other_active_adapters_before_queued_device_io(tmp_path):
+@pytest.mark.parametrize("queued_count", [0, 16])
+def test_failed_intent_stops_other_active_adapters_before_queued_device_io(
+    tmp_path, queued_count
+):
     async def scenario():
         entered = asyncio.Event()
         stopped = asyncio.Event()
@@ -283,7 +286,13 @@ def test_failed_intent_stops_other_active_adapters_before_queued_device_io(tmp_p
 
         with SQLiteJournal(tmp_path / "cell.db") as journal:
             async with WorkflowEngine(
-                [Action("hold", hold), Action("never", never)], journal=journal
+                [
+                    Action("hold", hold, (ResourceClaim("arm"),)),
+                    Action("never", never),
+                ],
+                [Resource("arm")],
+                max_concurrency=2,
+                journal=journal,
             ) as engine:
                 holder = engine.submit(Workflow((Node("hold", "hold"),)))
                 await asyncio.wait_for(entered.wait(), 1)
@@ -291,9 +300,30 @@ def test_failed_intent_stops_other_active_adapters_before_queued_device_io(tmp_p
                     journal, "_start", side_effect=JournalError("offline")
                 ):
                     blocked = engine.submit(Workflow((Node("blocked", "never"),)))
+                    queued = [
+                        engine.submit(
+                            Workflow(
+                                (
+                                    Node(
+                                        "queued",
+                                        "never",
+                                        claims=(
+                                            (ResourceClaim("arm"),) if index % 2 else ()
+                                        ),
+                                    ),
+                                )
+                            )
+                        )
+                        for index in range(queued_count)
+                    ]
                     assert (await blocked.wait(1)).status == RunStatus.FAILED
+                    for pending in queued:
+                        result = await pending.wait(1)
+                        assert result.status == RunStatus.FAILED
+                        assert result.nodes["queued"].started_at is None
                     assert (await holder.wait(1)).status == RunStatus.FAILED
                 assert stopped.is_set() and calls == []
+                assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
 
     asyncio.run(scenario())
 

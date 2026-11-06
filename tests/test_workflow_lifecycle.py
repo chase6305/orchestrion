@@ -567,7 +567,10 @@ def test_driver_cancelled_before_start_finishes_run_and_retains_keyed_result():
 
 
 @pytest.mark.parametrize("uncertain", [False, True])
-def test_driver_failure_drains_active_actions_and_never_starts_queued_work(uncertain):
+@pytest.mark.parametrize("queued_count", [0, 8])
+def test_driver_failure_drains_active_actions_and_never_starts_queued_work(
+    uncertain, queued_count
+):
     async def scenario():
         entered, stopping, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
         calls = []
@@ -583,7 +586,11 @@ def test_driver_failure_drains_active_actions_and_never_starts_queued_work(uncer
             context.raise_if_cancelled()
 
         engine = WorkflowEngine(
-            [Action("move", move, (ResourceClaim("arm"),)), Action("echo", echo)],
+            [
+                Action("move", move, (ResourceClaim("arm"),)),
+                Action("echo", echo),
+                Action("claimed", echo, (ResourceClaim("arm"),)),
+            ],
             [Resource("arm")],
             max_concurrency=1,
         )
@@ -598,8 +605,17 @@ def test_driver_failure_drains_active_actions_and_never_starts_queued_work(uncer
         )
         try:
             await asyncio.wait_for(entered.wait(), 1)
+            queued = [
+                engine.submit(
+                    Workflow((Node("queued", "claimed" if index % 2 else "echo"),))
+                )
+                for index in range(queued_count)
+            ]
             engine._driver.cancel()
             await asyncio.wait_for(stopping.wait(), 1)
+            for pending in queued:
+                assert (await pending.wait(1)).status == RunStatus.FAILED
+                assert pending.snapshot().nodes["queued"].started_at is None
             assert run.snapshot().nodes["move"].status == NodeStatus.CANCELLING
             assert run.snapshot().nodes["queued"].status == NodeStatus.FAILED
             assert run.snapshot().nodes["dependent"].status == NodeStatus.FAILED

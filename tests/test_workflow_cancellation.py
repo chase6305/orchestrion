@@ -355,22 +355,43 @@ def test_cancel_before_dispatch_never_calls_adapter_and_engine_releases_runs():
     asyncio.run(scenario())
 
 
-def test_close_timeout_preserves_ownership_and_can_be_awaited_again():
+@pytest.mark.parametrize("queued_count", [0, 32])
+def test_close_timeout_preserves_ownership_and_can_be_awaited_again(queued_count):
     async def scenario():
         entered, release = asyncio.Event(), asyncio.Event()
+        calls = []
 
         async def move(context, inputs):
             entered.set()
             await reached(release)
 
+        async def record(context, inputs):
+            calls.append(context.node_id)
+
         engine = WorkflowEngine(
-            [Action("move", move, (ResourceClaim("arm"),))], [Resource("arm")]
+            [
+                Action("move", move, (ResourceClaim("arm"),)),
+                Action("claimed", record, (ResourceClaim("arm"),)),
+                Action("free", record),
+            ],
+            [Resource("arm")],
+            max_concurrency=1,
         )
         run = engine.submit(Workflow((Node("move", "move"),)))
         try:
             await reached(entered)
+            queued = [
+                engine.submit(
+                    Workflow((Node("queued", "claimed" if index % 2 else "free"),))
+                )
+                for index in range(queued_count)
+            ]
             with pytest.raises(asyncio.TimeoutError):
                 await engine.aclose(0.01)
+            for pending in queued:
+                assert (await pending.wait(1)).status == RunStatus.CANCELLED
+                assert pending.snapshot().nodes["queued"].started_at is None
+            assert calls == []
             assert not run.done
             assert engine.resource_snapshot()["resources"]["arm"]["used"] == 1
             with pytest.raises(RuntimeError, match="closed"):

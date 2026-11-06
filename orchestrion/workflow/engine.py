@@ -213,6 +213,7 @@ class WorkflowEngine:
     def _stop_after_journal_failure(self) -> None:
         for run in tuple(self._runs.values()):
             self._stop_run(run, "journal_failed")
+        self._clear_ready_queues()
         self._wake.set()
 
     def _checkpoint_node(self, run: WorkflowRun, node_id: str, data: Any) -> None:
@@ -274,6 +275,7 @@ class WorkflowEngine:
                     )
             if not run.done and run._unfinished == 0:
                 self._finish_run(run)
+        self._clear_ready_queues()
 
     def _check_driver(self) -> None:
         # Eager factories can enter adapters before the new driver is assigned.
@@ -438,6 +440,8 @@ class WorkflowEngine:
             or keep_last < 0
         ):
             raise ValueError("keep_last must be a nonnegative integer")
+        if len(self._submissions) <= keep_last:
+            return 0
         uncertain = {run.run_id for run, _ in self._quarantined.values()}
         eligible = [
             key
@@ -508,6 +512,7 @@ class WorkflowEngine:
     async def aclose(self, timeout: Optional[float] = None) -> None:
         """Stop admission and drain actions; timeout does not release active claims.
 
+        The timeout bounds the wait after stop requests have been issued.
         May be called again after timeout. Uncertain operations remain quarantined
         and must be reconciled externally even after this method returns.
         """
@@ -518,6 +523,7 @@ class WorkflowEngine:
         self._closed = True
         for run in tuple(self._runs.values()):
             run.cancel()
+        self._clear_ready_queues()
 
         # Only this notification wait is cancelled on timeout or caller exit.
         # Workers can still drain after an interrupted scheduler has terminated.
@@ -606,6 +612,10 @@ class WorkflowEngine:
             self._stop_node(run, node_id, reason, settlements=settlements)
         if settlements:
             self._record_settlements(run, settlements)
+        if self._closed:
+            # Shutdown callers clear shared queues after stopping every run.
+            self._wake.set()
+            return
         # Cancelled entries behind a blocked device must not retain old runs
         # forever. Batch compaction is off the normal completion path.
         self._ready_heap = [
@@ -613,12 +623,19 @@ class WorkflowEngine:
         ]
         heapq.heapify(self._ready_heap)
         self._ready_queued = {entry[1] for entry in self._ready_heap}
-        for name, waiters in self._resource_waiters.items():
+        # Scanning a large graph can cost more than compacting all resource queues.
+        resource_names: Iterable[str] = self._resources
+        if len(self._resources) > len(run._by_id):
+            resource_names = {
+                claim.resource for item in run._by_id.values() for claim in item.claims
+            }
+        for name in resource_names:
+            waiters = self._resource_waiters[name]
             self._resource_waiters[name] = [
                 entry for entry in waiters if self._is_ready(entry)
             ]
             heapq.heapify(self._resource_waiters[name])
-        self._wake_waiters(self._resources)
+        self._wake_waiters(resource_names)
         self._wake.set()
 
     def _expire_run(self, run: WorkflowRun) -> None:
@@ -785,6 +802,10 @@ class WorkflowEngine:
             self._advance_scheduler()
             if self._runs:
                 await self._wake.wait()
+        self._clear_ready_queues()
+
+    def _clear_ready_queues(self) -> None:
+        """Release ready definitions without changing active workers or leases."""
         self._ready_heap.clear()
         self._ready_queued.clear()
         for waiters in self._resource_waiters.values():

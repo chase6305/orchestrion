@@ -50,9 +50,13 @@ class FeedbackChannel:
         with self._lock:
             if not self._open:
                 return
-            batch = [
-                self._pending.popleft() for _ in range(min(32, len(self._pending)))
-            ]
+            pending = self._pending
+            if len(pending) <= 32:
+                # Detach the final batch so producers cannot mutate it during delivery.
+                batch = pending
+                self._pending = None
+            else:
+                batch = [pending.popleft() for _ in range(32)]
             dropped = self._unreported_drops
             self._unreported_drops = 0
         try:

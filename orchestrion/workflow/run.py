@@ -157,6 +157,8 @@ class WorkflowRun:
         """Read bounded history; a sequence gap indicates evicted events."""
         if isinstance(after, bool) or not isinstance(after, int) or after < 0:
             raise ValueError("after must be a nonnegative integer")
+        if after >= self._sequence:
+            return ()
         return tuple(
             replace(event, detail=_snapshot(event.detail))
             for event in self._events

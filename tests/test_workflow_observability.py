@@ -164,6 +164,69 @@ def test_explain_atomic_queue_head_even_when_requested_resource_is_free():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("unrelated_resources", [0, 64])
+def test_explain_preserves_each_owner_for_multiple_blocked_claims(unrelated_resources):
+    async def scenario():
+        names = ("arm", "tool", "camera")
+        entered = {name: asyncio.Event() for name in names}
+        release = asyncio.Event()
+
+        async def hold(context, inputs):
+            entered[context.node_id].set()
+            await asyncio.wait_for(release.wait(), 2)
+
+        resources = [Resource(name) for name in names] + [
+            Resource("unused-" + str(index)) for index in range(unrelated_resources)
+        ]
+        async with WorkflowEngine(
+            [Action("hold", hold), Action("echo", echo)],
+            resources,
+            max_concurrency=3,
+        ) as engine:
+            owner_nodes = tuple(
+                Node(name, "hold", claims=(ResourceClaim(name),)) for name in names
+            )
+            owner = engine.submit(Workflow(owner_nodes))
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*(event.wait() for event in entered.values())), 1
+                )
+                blocked_node = Node(
+                    "both", "echo", claims=(ResourceClaim("arm"), ResourceClaim("tool"))
+                )
+                waiter = engine.submit(Workflow((blocked_node,)))
+                expected = waiter.explain("both")
+                diagnostic = waiter.explain("both")
+                capacity_blockers = [
+                    blocker
+                    for blocker in diagnostic["blockers"]
+                    if blocker["kind"] == "resource_capacity"
+                ]
+                assert [blocker["resource"] for blocker in capacity_blockers] == [
+                    "arm",
+                    "tool",
+                ]
+                for blocker in capacity_blockers:
+                    assert blocker["owners"] == [
+                        {
+                            "operation_id": owner.operation_id(blocker["resource"]),
+                            "units": 1,
+                            "quarantined": False,
+                        }
+                    ]
+                snapshot = engine.scheduler_snapshot()
+                assert snapshot["resources"]["camera"]["owners"][0]["operation_id"] == (
+                    owner.operation_id("camera")
+                )
+                capacity_blockers[0]["owners"][0]["units"] = 99
+                assert waiter.explain("both") == expected
+            finally:
+                release.set()
+            await asyncio.gather(owner.wait(1), waiter.wait(1))
+
+    asyncio.run(scenario())
+
+
 def test_explain_uses_the_ready_heap_head_without_scanning_the_backlog(monkeypatch):
     async def scenario():
         entered, release = asyncio.Event(), asyncio.Event()
@@ -483,7 +546,8 @@ def test_continuous_sdk_feedback_accounts_for_every_delivered_or_dropped_sample(
     asyncio.run(scenario())
 
 
-def test_feedback_drains_in_batches_and_wakes_again_after_becoming_empty():
+@pytest.mark.parametrize("initial_count", [1, 32, 100])
+def test_feedback_drains_in_batches_and_wakes_again_after_becoming_empty(initial_count):
     async def scenario():
         delivered = []
         turns = []
@@ -498,21 +562,21 @@ def test_feedback_drains_in_batches_and_wakes_again_after_becoming_empty():
                 errors.append(exc)
 
         try:
-            thread = threading.Thread(target=produce, args=(0, 100))
+            thread = threading.Thread(target=produce, args=(0, initial_count))
             thread.start()
             thread.join(1)
             assert not thread.is_alive()
             asyncio.get_running_loop().call_soon(lambda: turns.append(len(delivered)))
             for _ in range(5):
                 await asyncio.sleep(0)
-            assert delivered == list(range(100))
-            assert turns == [32]
-            thread = threading.Thread(target=produce, args=(100, 2))
+            assert delivered == list(range(initial_count))
+            assert turns == [min(32, initial_count)]
+            thread = threading.Thread(target=produce, args=(initial_count, 2))
             thread.start()
             thread.join(1)
             assert not thread.is_alive()
             await asyncio.sleep(0)
-            assert delivered == list(range(102))
+            assert delivered == list(range(initial_count + 2))
             assert not errors
         finally:
             context._finish()
@@ -661,6 +725,8 @@ def test_events_are_bounded_and_defensive_with_monotonic_sequences():
             assert events[0].sequence > 1
             assert events[-1].status == NodeStatus.SUCCEEDED
             assert run.events(after=events[-2].sequence) == events[-1:]
+            assert run.events(after=events[-1].sequence) == ()
+            assert run.events(after=events[-1].sequence + 100) == ()
             events[0].detail["progress"].clear()
             assert run.events()[0].detail["progress"]
             checkpoint_event = next(
