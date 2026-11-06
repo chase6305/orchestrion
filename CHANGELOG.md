@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Avoid building unrelated resource-owner lists during node wait diagnostics.
 - Return immediately when workflow event cursors are already current.
 - Avoid copying the final SDK feedback batch while preserving bounded queues,
   drop counts and event-loop yielding.

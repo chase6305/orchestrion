@@ -1,8 +1,8 @@
 """On-demand scheduler diagnostics; no device calls or state transitions."""
 
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
-from .model import NodeStatus
+from .model import NodeStatus, ResourceClaim
 
 if TYPE_CHECKING:
     from .engine import WorkflowEngine, _ReadyEntry
@@ -20,17 +20,26 @@ def _queue_head(engine: "WorkflowEngine", resource: str) -> "Optional[_ReadyEntr
     )
 
 
-def _owners(engine: "WorkflowEngine") -> Dict[str, list]:
-    owners = {name: [] for name in engine._resources}
-    for operation_id, claims in engine._leases.items():
-        for claim in claims:
-            owners[claim.resource].append(
-                {
-                    "operation_id": operation_id,
-                    "units": claim.units,
-                    "quarantined": operation_id in engine._quarantined,
-                }
-            )
+def _owners(
+    engine: "WorkflowEngine",
+    requested_claims: Optional[Tuple[ResourceClaim, ...]] = None,
+) -> Dict[str, list]:
+    owners = (
+        {name: [] for name in engine._resources}
+        if requested_claims is None
+        else {claim.resource: [] for claim in requested_claims}
+    )
+    for operation_id, lease_claims in engine._leases.items():
+        for claim in lease_claims:
+            resource_owners = owners.get(claim.resource)
+            if resource_owners is not None:
+                resource_owners.append(
+                    {
+                        "operation_id": operation_id,
+                        "units": claim.units,
+                        "quarantined": operation_id in engine._quarantined,
+                    }
+                )
     return owners
 
 
@@ -59,13 +68,16 @@ def explain_node(run: "WorkflowRun", node_id: str) -> Dict[str, Any]:
                     "limit": engine._max_concurrency,
                 }
             )
-        owners = _owners(engine)
-        for claim in run._by_id[node_id].claims:
+        claims = run._by_id[node_id].claims
+        owners = None
+        for claim in claims:
             available = (
                 engine._resources[claim.resource].capacity
                 - engine._used[claim.resource]
             )
             if available < claim.units:
+                if owners is None:
+                    owners = _owners(engine, claims)
                 blockers.append(
                     {
                         "kind": "resource_capacity",

@@ -164,6 +164,57 @@ def test_explain_atomic_queue_head_even_when_requested_resource_is_free():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("unrelated_resources", [0, 64])
+def test_explain_preserves_each_owner_for_multiple_blocked_claims(unrelated_resources):
+    async def scenario():
+        names = ("arm", "tool", "camera")
+        entered = {name: asyncio.Event() for name in names}
+        release = asyncio.Event()
+
+        async def hold(context, inputs):
+            entered[context.node_id].set()
+            await asyncio.wait_for(release.wait(), 2)
+
+        resources = [Resource(name) for name in names] + [
+            Resource("unused-" + str(index)) for index in range(unrelated_resources)
+        ]
+        async with WorkflowEngine(
+            [Action("hold", hold), Action("echo", echo)],
+            resources, max_concurrency=3,
+        ) as engine:
+            owner = engine.submit(Workflow(tuple(
+                Node(name, "hold", claims=(ResourceClaim(name),)) for name in names
+            )))
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*(event.wait() for event in entered.values())), 1
+                )
+                waiter = engine.submit(Workflow((Node(
+                    "both", "echo", claims=(ResourceClaim("arm"), ResourceClaim("tool")),
+                ),)))
+                capacity = [
+                    blocker for blocker in waiter.explain("both")["blockers"]
+                    if blocker["kind"] == "resource_capacity"
+                ]
+                assert [blocker["resource"] for blocker in capacity] == ["arm", "tool"]
+                for blocker in capacity:
+                    assert blocker["owners"] == [{
+                        "operation_id": owner.operation_id(blocker["resource"]),
+                        "units": 1, "quarantined": False,
+                    }]
+                snapshot = engine.scheduler_snapshot()
+                assert snapshot["resources"]["camera"]["owners"][0]["operation_id"] == (
+                    owner.operation_id("camera")
+                )
+                capacity[0]["owners"][0]["units"] = 99
+                assert waiter.explain("both")["blockers"][1]["owners"][0]["units"] == 1
+            finally:
+                release.set()
+            await asyncio.gather(owner.wait(1), waiter.wait(1))
+
+    asyncio.run(scenario())
+
+
 def test_explain_uses_the_ready_heap_head_without_scanning_the_backlog(monkeypatch):
     async def scenario():
         entered, release = asyncio.Event(), asyncio.Event()
