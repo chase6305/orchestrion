@@ -465,7 +465,7 @@ class WorkflowEngine:
         return scheduler_snapshot(self)
 
     def resource_snapshot(self) -> Dict[str, Any]:
-        """Expose occupied capacity and unresolved operations, including completed runs."""
+        """Report capacity and unresolved operations, even after runs complete."""
         recovery_pending = self._journal is not None and not self._journal_loaded
         return {
             "recovery_pending": recovery_pending,
@@ -831,17 +831,20 @@ class WorkflowEngine:
             if not self._is_ready(entry) or not self._can_start(entry):
                 continue
             node_id = item.node.node_id
+            # Bind this dispatch before the loop advances to another node.
             context = ActionContext(
                 run.run_id,
                 node_id,
-                lambda data, r=run, n=node_id: r._emit(n, "feedback", data),
+                lambda data, run=run, node_id=node_id: run._emit(
+                    node_id, "feedback", data
+                ),
                 max_pending_feedback=self._max_pending_feedback,
                 max_feedback_bytes=self._max_feedback_bytes,
-                checkpoint=lambda data, r=run, n=node_id: self._checkpoint_node(
-                    r, n, data
+                checkpoint=lambda data, run=run, node_id=node_id: self._checkpoint_node(
+                    run, node_id, data
                 ),
-                feedback_overflow=lambda count, r=run, n=node_id: r._emit(
-                    n, "feedback_overflow", {"dropped": count}
+                feedback_overflow=lambda count, run=run, node_id=node_id: run._emit(
+                    node_id, "feedback_overflow", {"dropped": count}
                 ),
             )
             run._contexts[node_id] = context
@@ -930,7 +933,7 @@ class WorkflowEngine:
             context.raise_if_cancelled()
             inputs = resolve_inputs(
                 node.inputs,
-                {key: run._results[key].output for key in item.dependencies},
+                lambda upstream_node_id: run._results[upstream_node_id].output,
             )
             if self._max_input_bytes is not None:
                 inputs = _snapshot(inputs, max_bytes=self._max_input_bytes)

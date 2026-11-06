@@ -4,7 +4,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from json import dumps
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from orchestrion.schema import CommandValidationError
 
@@ -71,6 +71,7 @@ def compile_workflow(
     if len(workflow.nodes) > max_nodes:
         raise ValueError("workflow exceeds max_nodes_per_run")
     nodes: Dict[str, CompiledNode] = {}
+    references_by_node = {}
     for original in workflow.nodes:
         # Re-snapshot even frozen definitions: nested dictionaries are mutable.
         node = replace(original)
@@ -82,11 +83,6 @@ def compile_workflow(
             raise ValueError("unknown action: " + node.action)
         action = actions[node.action]
         references = tuple(_output_references(node.inputs))
-        dependencies = tuple(
-            dict.fromkeys(
-                (*node.after, *(reference.node_id for reference in references))
-            )
-        )
         # Registered action claims are immutable and already normalized. Only
         # node-level overrides require merging and allocating new claim objects.
         claims = (
@@ -99,6 +95,15 @@ def compile_workflow(
                 schema.validate_template(node.inputs, is_deferred=_is_output_reference)
             else:
                 schema.validate(dict(node.inputs))
+            # Schema overrides may replace nested references during validation.
+            references = tuple(_output_references(node.inputs))
+        if references:
+            references_by_node[node.node_id] = references
+        dependencies = tuple(
+            dict.fromkeys(
+                (*node.after, *(reference.node_id for reference in references))
+            )
+        )
         nodes[node.node_id] = CompiledNode(node, dependencies, claims, action.version)
 
     successors = {node_id: [] for node_id in nodes}
@@ -109,7 +114,8 @@ def compile_workflow(
             if dependency not in nodes:
                 raise ValueError("unknown dependency: " + dependency)
             successors[dependency].append(node_id)
-        for reference in _output_references(compiled.node.inputs):
+        # Reuse discovery after all nodes exist, including forward references.
+        for reference in references_by_node.get(node_id, ()):
             schema = actions[nodes[reference.node_id].node.action].output_schema
             if schema is not None:
                 try:
@@ -135,9 +141,10 @@ def compile_workflow(
     return tuple(ordered)
 
 
-def resolve_inputs(value: Any, outputs: Mapping[str, Any]) -> Any:
+def resolve_inputs(value: Any, get_output: Callable[[str], Any]) -> Any:
+    """Copy inputs, looking up upstream output only where a reference needs it."""
     if isinstance(value, OutputRef):
-        result = outputs[value.node_id]
+        result = get_output(value.node_id)
         for index, part in enumerate(value.path):
             try:
                 if isinstance(part, str) and isinstance(result, dict):
@@ -156,9 +163,9 @@ def resolve_inputs(value: Any, outputs: Mapping[str, Any]) -> Any:
                 ) from exc
         return _snapshot(result)
     if isinstance(value, dict):
-        return {key: resolve_inputs(child, outputs) for key, child in value.items()}
+        return {key: resolve_inputs(child, get_output) for key, child in value.items()}
     if isinstance(value, list):
-        return [resolve_inputs(child, outputs) for child in value]
+        return [resolve_inputs(child, get_output) for child in value]
     return value
 
 

@@ -18,7 +18,7 @@ Keep integration scenarios alongside the corresponding example or public API.
 | File | Responsibility |
 | --- | --- |
 | `test_task.py` | Inline and threaded calls, retries, telemetry, result retention, task lifecycle |
-| `test_task_finalizers.py` | SDK result cleanup that reenters task status during eviction or replacement |
+| `test_task_finalizers.py` | SDK input/result cleanup during cancellation, shutdown, pruning and eviction |
 | `test_thread_wait_limits.py` | Native wait limits, atomic rejection and larger deadline budgets |
 | `test_task_pilot.py` | Motion synchronization, dispatch, scheduler lifecycle and cancellation races |
 | `test_legacy_api.py` | Public request, health, lifecycle and simulated-motion compatibility |
@@ -44,6 +44,8 @@ Keep integration scenarios alongside the corresponding example or public API.
 | `test_network_demo.py` | Network command validation, service lifecycle and demo integration |
 | `test_simulated_demo.py` | Pick/place command order and observed motion completion |
 | `test_viser_examples.py` | Optional visualization, gripper behavior and example launchers |
+| `test_viser_rendering.py` | Reused arm kinematics, render-failure recovery and concurrent frame updates |
+| `test_viser_runtime_lifecycle.py` | Viewer initialization and monitor-start failure rollback |
 
 Run related groups with:
 

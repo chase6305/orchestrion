@@ -4,12 +4,12 @@ import math
 from dataclasses import dataclass
 from typing import Tuple, Type
 
-from orchestrion.utils.numeric import is_finite_real
+from orchestrion.utils.numeric import is_finite_real, is_positive_finite_real
 
 
 @dataclass(frozen=True)
 class RetryPolicy:
-    """Describe bounded exponential retry behavior for a callable task."""
+    """Describe bounded exponential retries with representable float timing."""
 
     max_attempts: int = 1
     delay: float = 0.0
@@ -29,10 +29,16 @@ class RetryPolicy:
             ("backoff", self.backoff, False),
             ("max_delay", self.max_delay, True),
         ):
-            valid = is_finite_real(value) and value >= 0 and (allow_zero or value != 0)
+            valid = is_positive_finite_real(value) or (
+                allow_zero and is_finite_real(value) and value == 0
+            )
             if not valid:
                 qualifier = "non-negative" if allow_zero else "positive"
-                raise ValueError("{} must be {} and finite".format(name, qualifier))
+                raise ValueError(
+                    "{} must be {} and finite without float underflow".format(
+                        name, qualifier
+                    )
+                )
         if not isinstance(self.retry_exceptions, tuple) or not all(
             isinstance(exc, type) and issubclass(exc, Exception)
             for exc in self.retry_exceptions

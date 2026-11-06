@@ -1,4 +1,4 @@
-"""Single thread waits reject overflow without changing pending work or cadence."""
+"""Native wait bounds preserve pending work and representable positive cadence."""
 
 import threading
 from concurrent.futures import CancelledError, ThreadPoolExecutor
@@ -22,6 +22,7 @@ from orchestrion.tasks import (
 from orchestrion.utils.types import PeekResponseResultType
 
 _ROUNDS_TO_LIMIT = Fraction(threading.TIMEOUT_MAX) + Fraction(1, 2**100)
+_ROUNDS_TO_ZERO = Fraction(1, 10**400)
 _EXCESSIVE_WAITS = [
     pytest.param(1e300, id="large-float"),
     pytest.param(_ROUNDS_TO_LIMIT, id="fraction-rounds-to-limit"),
@@ -56,7 +57,9 @@ def robot(request):
         instance.stop(timeout=1)
 
 
-@pytest.mark.parametrize("interval", _EXCESSIVE_WAITS)
+@pytest.mark.parametrize(
+    "interval", _EXCESSIVE_WAITS + [pytest.param(_ROUNDS_TO_ZERO, id="underflow")]
+)
 @pytest.mark.parametrize(
     "factory",
     [
@@ -66,12 +69,23 @@ def robot(request):
     ],
     ids=["polling-task", "task-pilot", "robot-scheduler"],
 )
-def test_background_cadence_rejects_single_wait_overflow(factory, interval):
-    assert interval > threading.TIMEOUT_MAX
-    if isinstance(interval, Fraction):
+def test_background_cadence_rejects_unrepresentable_waits(factory, interval):
+    if interval > threading.TIMEOUT_MAX and isinstance(interval, Fraction):
         assert float(interval) == threading.TIMEOUT_MAX
-    with pytest.raises(ValueError, match="TIMEOUT_MAX"):
+    message = "TIMEOUT_MAX" if interval > threading.TIMEOUT_MAX else "positive"
+    with pytest.raises(ValueError, match=message):
         factory(interval)
+
+
+def test_wait_move_rejects_intervals_that_round_to_zero(robot):
+    with pytest.raises(ValueError, match="positive"):
+        robot.wait_move(time_out=0, interval=_ROUNDS_TO_ZERO)
+
+
+@pytest.mark.parametrize("interval", [Fraction(1, 1000), 5e-324])
+def test_representable_positive_trajectory_intervals_still_queue(robot, interval):
+    assert robot.move_joint_trajectory_async([[0.1]], interval=interval) == 0
+    assert robot.query_state().latest_sent_id == 0
 
 
 @pytest.mark.parametrize("timeout", _EXCESSIVE_WAITS)
@@ -106,7 +120,9 @@ def test_invalid_pilot_stop_preserves_pending_requests_and_admission(timeout):
         assert not pilot.query_request(pending).status.terminal
 
 
-@pytest.mark.parametrize("interval", _EXCESSIVE_WAITS)
+@pytest.mark.parametrize(
+    "interval", _EXCESSIVE_WAITS + [pytest.param(_ROUNDS_TO_ZERO, id="underflow")]
+)
 def test_invalid_trajectory_does_not_consume_id_and_exact_limit_can_queue(
     robot, interval
 ):
@@ -120,8 +136,10 @@ def test_invalid_trajectory_does_not_consume_id_and_exact_limit_can_queue(
     assert robot.query_state().cancelled_move_ids == (0,)
 
 
-@pytest.mark.parametrize("interval", _EXCESSIVE_WAITS)
-def test_submodule_overflow_rejects_single_and_atomic_batch_without_consuming_ids(
+@pytest.mark.parametrize(
+    "interval", _EXCESSIVE_WAITS + [pytest.param(_ROUNDS_TO_ZERO, id="underflow")]
+)
+def test_submodule_cadence_rejection_preserves_single_and_batch_ids(
     interval,
 ):
     robot = _modular_robot()

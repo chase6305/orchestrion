@@ -179,6 +179,118 @@ def test_known_invalid_output_reference_is_rejected_before_any_device_io(path):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("last_field", ["frame", "missing"])
+def test_nested_forward_references_validate_every_path_before_dispatch(last_field):
+    async def scenario():
+        calls = []
+
+        async def record(context, inputs):
+            calls.append(context.node_id)
+            return inputs
+
+        async with WorkflowEngine(
+            [
+                Action("detect", record, output_schema=pose_schema()),
+                Action("use", record),
+            ]
+        ) as engine:
+            workflow = Workflow(
+                (
+                    Node(
+                        "use",
+                        "use",
+                        {
+                            "nested": [
+                                {
+                                    "first": OutputRef("detect", ("pose", 0)),
+                                    "last": OutputRef("detect", (last_field,)),
+                                }
+                            ]
+                        },
+                    ),
+                    Node("detect", "detect", {"pose": [1, 2, 3], "frame": "workcell"}),
+                )
+            )
+            if last_field == "missing":
+                with pytest.raises(ValueError, match="invalid output reference"):
+                    engine.submit(workflow)
+                assert not calls
+            else:
+                result = await engine.submit(workflow).wait(1)
+                assert result.status == RunStatus.SUCCEEDED
+                assert result.nodes["use"].output == {
+                    "nested": [{"first": 1, "last": "workcell"}]
+                }
+                assert calls == ["detect", "use"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "target, field, error",
+    [
+        ("source", "other", None),
+        ("source", "missing", "invalid output reference"),
+        ("replacement", "other", None),
+        ("absent", "other", "unknown dependency"),
+    ],
+)
+def test_references_changed_by_schema_hooks_are_rechecked_before_dispatch(
+    target, field, error,
+):
+    class ChangedTemplate(RequestSchema):
+        def validate_template(self, content, *, is_deferred):
+            content["values"][0] = OutputRef(target, (field,))
+            super().validate_template(content, is_deferred=is_deferred)
+
+    async def scenario():
+        calls = []
+
+        async def record(context, inputs):
+            calls.append(context.node_id)
+            return inputs
+
+        async with WorkflowEngine(
+            [
+                Action(
+                    "source", record,
+                    output_schema=RequestSchema({
+                        "value": FieldSpec("number"), "other": FieldSpec("number"),
+                    }),
+                ),
+                Action(
+                    "use", record,
+                    input_schema=ChangedTemplate({
+                        "values": FieldSpec("array", items=FieldSpec("number")),
+                    }),
+                ),
+            ],
+            max_concurrency=1,
+        ) as engine:
+            reference = OutputRef("source", ("value",))
+            workflow = Workflow((
+                Node("use", "use", {"values": [reference]}),
+                Node("source", "source", {"value": 1, "other": 2}),
+                Node(
+                    "replacement", "source", {"value": 3, "other": 4}, after=("gate",)
+                ),
+                Node("gate", "source", {"value": 0, "other": 0}),
+            ))
+            if error is not None:
+                with pytest.raises(ValueError, match=error):
+                    engine.submit(workflow)
+                assert not calls
+            else:
+                result = await engine.submit(workflow).wait(1)
+                assert result.status == RunStatus.SUCCEEDED
+                expected = 4 if target == "replacement" else 2
+                assert result.nodes["use"].output == {"values": [expected]}
+                assert calls.index(target) < calls.index("use")
+            assert workflow.nodes[0].inputs == {"values": [reference]}
+
+    asyncio.run(scenario())
+
+
 def test_optional_output_fields_remain_a_runtime_check():
     async def scenario():
         async with WorkflowEngine(

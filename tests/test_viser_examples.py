@@ -2,6 +2,8 @@ import concurrent.futures
 import importlib
 import threading
 import time
+from collections import deque
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -42,6 +44,10 @@ from integrations.viser.viser_modular_robot_task import (
 )
 from orchestrion import MoveSyncOption, RequestStatus, TaskPilot
 from orchestrion.tasks import ModularReducedRobotTask, SubModuleTask
+from orchestrion.tasks.modular_reduced_robot_task import (
+    SubModuleMovementRequest,
+    _SubmoduleSchedule,
+)
 from orchestrion.utils.types import PeekResponseResultType
 
 DEMO_MODULES = [
@@ -77,6 +83,25 @@ def test_viser_launcher_forwards_help_to_selected_demo(capsys):
     output = capsys.readouterr().out
     assert "02 · Pick and Place" in output
     assert "--no-wait-for-client" in output
+
+
+def test_viser_startup_advertises_the_actual_bound_port(monkeypatch, capsys):
+    runtime = SimpleNamespace(
+        server=SimpleNamespace(get_port=lambda: 8081),
+        set_status=Mock(),
+        hold=Mock(),
+    )
+    factory = Mock(return_value=nullcontext(runtime))
+    module = importlib.import_module("examples.viser.common")
+    monkeypatch.setattr(module, "ViserDemoRuntime", factory)
+    module.run_demo(
+        "demo", Mock(),
+        argv=["--port", "8080", "--duration", "0", "--startup-delay", "0"],
+    )
+    output = capsys.readouterr().out
+    assert "Open http://localhost:8081" in output
+    assert "ssh -L 8081:localhost:8081" in output
+    assert factory.call_args.kwargs["port"] == 8080
 
 
 def test_dual_arm_visual_configuration_adds_stable_wrist_pose():
@@ -123,12 +148,32 @@ def test_dual_arm_visual_configuration_rejects_unknown_side():
 def test_dual_arm_replay_selects_frame_at_or_before_cursor():
     frames = [
         ReplayFrame(value, (), (), 0.0, 0.0, None, "table", "move")
-        for value in (0.0, 0.2, 0.7)
+        for value in (0.0, 0.2, 0.2, 0.7)
     ]
     assert replay_frame_index(frames, -1.0) == 0
     assert replay_frame_index(frames, 0.19) == 0
-    assert replay_frame_index(frames, 0.2) == 1
-    assert replay_frame_index(frames, 99.0) == 2
+    assert replay_frame_index(frames, 0.2) == 2
+    assert replay_frame_index(frames, 99.0) == 3
+
+
+def test_replay_cursor_uses_bounded_indexed_reads_for_long_recordings():
+    class IndexedFrames:
+        reads = 0
+
+        def __len__(self):
+            return 1000000
+
+        def __getitem__(self, index):
+            assert 0 <= index < len(self)
+            self.reads += 1
+            return SimpleNamespace(elapsed=index * 0.01)
+
+        def __iter__(self):
+            raise AssertionError("replay lookup must not scan every frame")
+
+    frames = IndexedFrames()
+    assert replay_frame_index(frames, 1234.565) == 123456
+    assert frames.reads <= 21
 
 
 def test_dual_arm_replay_rejects_empty_recording():
@@ -155,6 +200,80 @@ def test_dual_arm_replay_recording_round_trip(tmp_path):
     assert reader.replay_frames == frames
 
 
+@pytest.mark.parametrize("owners", [[], ["left_arm"], ["left_arm", "right_arm"]])
+def test_replay_capture_uses_one_event_snapshot_for_stage_and_payload(owners):
+    events = [
+        {"event": "payload_owner_changed", "owner": owner} for owner in owners
+    ]
+    events.append({"event": "snapshot-stage"})
+
+    class Runtime(DualArmViserRuntime):
+        event_reads = 0
+
+        @property
+        def events(self):
+            self.event_reads += 1
+            if self.event_reads == 1:
+                return events
+            return [{"event": "payload_owner_changed", "owner": "output_table"}]
+
+    runtime = object.__new__(Runtime)
+    runtime._capture_started_at = None
+    runtime._replay_lock = threading.Lock()
+    runtime._replay_frames = []
+    frame = runtime._capture_frame(
+        {"left": [0.0] * 3, "right": [0.0] * 3},
+        {"left": 0.0, "right": 0.0},
+        None,
+    )
+    assert frame.payload_owner == (owners[-1] if owners else "table")
+    assert frame.event == "snapshot-stage"
+    assert runtime.event_reads == 1
+    assert runtime.replay_frames == [frame]
+
+
+def test_concurrent_replay_capture_keeps_timestamps_in_append_order(monkeypatch):
+    reading, release = threading.Event(), threading.Event()
+    event_lock = threading.Lock()
+
+    class Runtime(DualArmViserRuntime):
+        event_reads = 0
+
+        @property
+        def events(self):
+            with event_lock:
+                self.event_reads += 1
+                first_read = self.event_reads == 1
+            if first_read:
+                reading.set()
+                assert release.wait(2)
+            return []
+
+    clock = iter([10.0, 20.0])
+    module = importlib.import_module("examples.dual_arm.viser")
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    runtime = object.__new__(Runtime)
+    runtime._capture_started_at = None
+    runtime._replay_lock = threading.Lock()
+    runtime._replay_frames = []
+    arguments = (
+        {"left": [0.0] * 3, "right": [0.0] * 3},
+        {"left": 0.0, "right": 0.0},
+        None,
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(runtime._capture_frame, *arguments)
+        try:
+            assert reading.wait(1)
+            executor.submit(runtime._capture_frame, *arguments).result(timeout=1)
+        finally:
+            release.set()
+        first.result(timeout=1)
+    frames = runtime.replay_frames
+    assert frames[0].elapsed == 0.0
+    assert frames[1].elapsed >= frames[0].elapsed
+
+
 def test_dual_arm_replay_frame_rejects_invalid_payload_owner():
     with pytest.raises(ValueError, match="invalid state"):
         ReplayFrame.from_dict(
@@ -169,6 +288,19 @@ def test_dual_arm_replay_frame_rejects_invalid_payload_owner():
                 "event": "start",
             }
         )
+
+
+def test_viser_interpolation_keeps_finite_endpoints_and_independent_points():
+    start = np.array([1e308, -1e308])
+    end = -start
+    trajectory = interpolate(start, end, 5)
+    assert trajectory[0] == start.tolist()
+    assert trajectory[-1] == end.tolist()
+    assert trajectory[2] == [0.0, 0.0]
+    assert np.isfinite(trajectory).all()
+    trajectory[0][0] = 0.0
+    assert start[0] == 1e308
+    assert trajectory[1][0] != 0.0
 
 
 def test_viser_robot_accepts_configurable_scheduler_interval():
@@ -453,6 +585,45 @@ def test_viser_gripper_task_reports_result():
     assert status["succeeded"] == 1
 
 
+@pytest.mark.parametrize("operation", ["invoke_async", "cancel_request"])
+@pytest.mark.parametrize(
+    "request_id, error_type",
+    [(True, TypeError), (1.0, TypeError), (-1, ValueError), ("1", TypeError)],
+)
+def test_gripper_rejects_invalid_ids_before_changing_active_motion(
+    monkeypatch, operation, request_id, error_type,
+):
+    robot = RobotStub()
+    entered, release = threading.Event(), threading.Event()
+    cancel_move = Mock(wraps=robot.cancel_submodule_move)
+    monkeypatch.setattr(robot, "cancel_submodule_move", cancel_move)
+
+    def wait_for_motion(name, move_id, timeout):
+        entered.set()
+        assert release.wait(2)
+        return True
+
+    monkeypatch.setattr(robot, "wait_submodule_move", wait_for_motion)
+    task = ViserGripperTask(robot)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        try:
+            assert task.invoke_async(1, {"action": "close"})
+            assert entered.wait(1)
+            with pytest.raises(error_type, match="request_id"):
+                if operation == "invoke_async":
+                    task.invoke_async(request_id, {"action": "open"})
+                else:
+                    task.cancel_request(request_id)
+            cancel_move.assert_not_called()
+            assert len(robot.requests) == 1
+        finally:
+            release.set()
+            task._future_map[1].result(timeout=1)
+            task.stop()
+    assert task.peek_response(1).result_type is PeekResponseResultType.ResponseFound
+
+
 def test_viser_gripper_caps_animation_update_rate():
     robot = RobotStub()
     robot.scheduler_interval = 0.001
@@ -467,6 +638,105 @@ def test_viser_gripper_caps_animation_update_rate():
     _, trajectory, interval = robot.requests[0]
     assert interval == pytest.approx(1.0 / 60.0)
     assert len(trajectory) < 50
+
+
+@pytest.mark.parametrize(
+    "current, target",
+    [(0.2, 0.2), (0.0, 0.0), (0.0, 5e-324)],
+    ids=["stationary", "stationary-zero", "subnormal-move"],
+)
+def test_viser_gripper_handles_tiny_speeds_without_interval_underflow(current, target):
+    class Robot(RobotStub):
+        def query_submodule_state(self, name):
+            return SimpleNamespace(positions=[current])
+
+    robot = Robot()
+    task = ViserGripperTask(robot)
+    completed = threading.Event()
+    task.set_completion_callback(completed.set)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        try:
+            assert task.invoke_async(0, {"position": target, "speed": 5e-324})
+            assert completed.wait(1)
+            response = task.peek_response(0)
+            assert response.result_type is PeekResponseResultType.ResponseFound
+        finally:
+            task.stop()
+    _, trajectory, interval = robot.requests[0]
+    assert trajectory[0] == [current]
+    assert trajectory[-1] == [target]
+    assert (len(trajectory) - 1) * interval == pytest.approx(
+        max(interval, abs(target - current) / 5e-324)
+    )
+
+
+def test_slow_gripper_motion_bounds_precomputed_points_and_preserves_duration():
+    robot = RobotStub()
+    task = ViserGripperTask(robot)
+    task._execute_call(0, {"position": 0.72, "speed": 0.00065})
+    _, trajectory, interval = robot.requests[0]
+    assert len(trajectory) <= 4096
+    assert trajectory[0] == [0.2]
+    assert trajectory[-1] == [0.72]
+    assert (len(trajectory) - 1) * interval == pytest.approx(800.0)
+
+
+@pytest.mark.parametrize("scheduler_interval, speed", [(0.01, 0.00005), (3.0, 1.0)])
+def test_gripper_default_timeout_covers_the_final_sample_hold(
+    scheduler_interval, speed,
+):
+    class TimedRobot(RobotStub):
+        def wait_submodule_move(self, name, move_id, timeout):
+            _, trajectory, interval = self.requests[-1]
+            return timeout > len(trajectory) * interval
+
+    robot = TimedRobot()
+    robot.scheduler_interval = scheduler_interval
+    result = ViserGripperTask(robot)._execute_call(
+        0, {"position": 0.72, "speed": speed}
+    )
+    assert result["position"] == 0.72
+
+
+@pytest.mark.parametrize("speed", [0.02, 0.005])
+def test_gripper_default_timeout_covers_scheduler_tick_rounding(monkeypatch, speed):
+    worker = ModularRobotStub(
+        [0.0, 0.2], SubModuleTask("arm", 0, 1),
+        [SubModuleTask("gripper", 1, 1)], interval=0.01,
+    )
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        "orchestrion.tasks.modular_reduced_robot_task.time",
+        SimpleNamespace(monotonic=lambda: clock.now),
+    )
+
+    class TimedRobot(RobotStub):
+        def wait_submodule_move(self, name, move_id, timeout):
+            _, trajectory, interval = self.requests[-1]
+            schedule = _SubmoduleSchedule(deque([
+                SubModuleMovementRequest(name, trajectory, interval, move_id),
+            ]))
+            # Run production scheduling on virtual ticks, without a wall-clock wait.
+            while clock.now < timeout:
+                worker._advance_submodule_moves({name: schedule}, [0.0, 0.2])
+                if not schedule.moves:
+                    return True
+                clock.now += self.scheduler_interval
+            return False
+
+    result = ViserGripperTask(TimedRobot())._execute_call(
+        0, {"action": "close", "speed": speed}
+    )
+    assert result["position"] == 0.72
+
+
+def test_unrepresentable_gripper_motion_duration_fails_before_enqueueing():
+    robot = RobotStub()
+    task = ViserGripperTask(robot)
+    with pytest.raises(ValueError, match="duration must be finite"):
+        task._execute_call(0, {"position": 0.72, "speed": 5e-324, "timeout": 1})
+    assert robot.requests == []
 
 
 def test_viser_gripper_discovery_describes_commands_and_range():
@@ -621,6 +891,95 @@ def test_cancel_before_gripper_move_id_publication_stops_motion(reentrant):
         finally:
             release.set()
             task.stop()
+
+
+def test_concurrent_gripper_cancellations_release_queued_sequence_once():
+    rendezvous = threading.Barrier(2)
+
+    class QueuedFuture(concurrent.futures.Future):
+        def cancel(self):
+            rendezvous.wait(timeout=1)
+            return super().cancel()
+
+    future = QueuedFuture()
+    executor = SimpleNamespace(submit=lambda *args: future)
+    robot = RobotStub()
+    task = ViserGripperTask(robot)
+    task.initialize(executor=executor)
+    try:
+        assert task.invoke_async(0, {"action": "close"})
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as callers:
+            cancellations = [callers.submit(task.cancel_request, 0) for _ in range(2)]
+            assert all(cancellation.result(timeout=2) for cancellation in cancellations)
+        assert not robot.requests
+        assert not task._request_sequences
+        assert not task._cancelled_requests
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as workers:
+            task.initialize(executor=workers)
+            assert task.invoke_async(1, {"action": "open"})
+            task._future_map[1].result(timeout=1)
+        assert len(robot.requests) == 1
+    finally:
+        concurrent.futures.Future.cancel(future)
+        task.stop()
+
+
+def test_gripper_completion_clears_cancellation_after_handler_returns():
+    returned, release, completed = (
+        threading.Event(), threading.Event(), threading.Event()
+    )
+
+    class PausedTask(ViserGripperTask):
+        def _call_fn(self, request_id, content=None):
+            result = super()._call_fn(request_id, content)
+            returned.set()
+            assert release.wait(2)
+            return result
+
+    task = PausedTask(RobotStub())
+    task.set_completion_callback(completed.set)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        try:
+            assert task.invoke_async(0, {"action": "close"})
+            assert returned.wait(1)
+            assert task.cancel_request(0)
+            release.set()
+            assert completed.wait(1)
+            assert not task._cancelled_requests
+            assert not task._request_sequences
+        finally:
+            release.set()
+            task.stop()
+
+
+def test_stopping_gripper_ignores_completed_history_and_cancels_queued_work(
+    monkeypatch,
+):
+    robot = RobotStub()
+    task = ViserGripperTask(robot)
+    completed = threading.Event()
+    release_worker = threading.Event()
+    task.set_completion_callback(completed.set)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        try:
+            assert task.invoke_async(0, {"action": "close"})
+            assert completed.wait(1)
+            finished = task._future_map[0]
+            inspect_finished = Mock(wraps=finished.done)
+            monkeypatch.setattr(finished, "done", inspect_finished)
+            blocker = executor.submit(release_worker.wait, 2.0)
+            assert task.invoke_async(1, {"action": "open"})
+            task.stop()
+            inspect_finished.assert_not_called()
+        finally:
+            release_worker.set()
+            task.stop()
+        blocker.result(timeout=1)
+    assert len(robot.requests) == 1
+    assert task.peek_response(0).result_type is PeekResponseResultType.ResponseFound
+    assert task.peek_response(1).result_type is PeekResponseResultType.ErrorUnknown
 
 
 def test_gripper_task_can_restart_after_stopping_queued_request():
@@ -874,6 +1233,47 @@ def test_gripper_timeout_stops_underlying_motion():
         assert position_after_failure < 0.72
     finally:
         pilot.stop()
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+@pytest.mark.parametrize("cancel_fails", [False, True])
+def test_gripper_wait_error_cancels_motion_and_preserves_error(
+    monkeypatch, error_type, cancel_fails,
+):
+    robot = RobotStub()
+    wait_error = error_type("controller wait failed")
+    monkeypatch.setattr(robot, "wait_submodule_move", Mock(side_effect=wait_error))
+    cancel = Mock(side_effect=RuntimeError("cancel failed") if cancel_fails else None)
+    monkeypatch.setattr(robot, "cancel_submodule_move", cancel)
+
+    with pytest.raises(error_type, match="controller wait failed") as raised:
+        ViserGripperTask(robot)._execute_call(7, {"action": "close"})
+
+    assert raised.value is wait_error
+    cancel.assert_called_once_with("gripper", 4)
+
+
+@pytest.mark.parametrize("cancel_fails", [False, True])
+def test_gripper_timeout_reports_wait_context_even_when_cancel_fails(
+    monkeypatch, cancel_fails,
+):
+    robot = RobotStub()
+    monkeypatch.setattr(robot, "wait_submodule_move", Mock(return_value=False))
+    cancel = Mock(side_effect=RuntimeError("cancel failed") if cancel_fails else None)
+    monkeypatch.setattr(robot, "cancel_submodule_move", cancel)
+    monkeypatch.setattr(
+        "integrations.viser.viser_modular_robot_task.time",
+        SimpleNamespace(monotonic=Mock(side_effect=[10.0, 12.5])),
+        raising=False,
+    )
+
+    with pytest.raises(concurrent.futures.CancelledError) as raised:
+        ViserGripperTask(robot)._execute_call(7, {"action": "close", "timeout": 0.25})
+
+    message = str(raised.value)
+    assert "request_id=7, move_id=4" in message
+    assert "elapsed=2.5s, timeout=0.25s" in message
+    cancel.assert_called_once_with("gripper", 4)
 
 
 def test_concurrent_executor_preserves_gripper_command_order():

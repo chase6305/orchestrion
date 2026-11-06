@@ -8,11 +8,17 @@ from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Union
 
 
 def _is_finite_number(value: Any) -> bool:
-    return (
-        not isinstance(value, bool)
-        and isinstance(value, Real)
-        and (isinstance(value, int) or math.isfinite(value))
-    )
+    # Integers are exact even beyond the finite float range.
+    if isinstance(value, int):
+        return not isinstance(value, bool)
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if not isinstance(value, Real):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 _TYPE_CHECKS = {

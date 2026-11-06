@@ -2,6 +2,57 @@
 
 ## Unreleased
 
+- Cancel accepted gripper motion when waiting raises, preserving the original
+  error if cancellation also fails. Include move IDs and timing in wait failures.
+- Include scheduler tick rounding in default gripper timeouts, so slow animations
+  can finish with non-integral sampling intervals; explicit timeouts are unchanged.
+- Release cancelled request inputs outside pilot state locks, including during
+  shutdown, allowing SDK finalizers to query health from a cleanup thread.
+- Skip result scans for service notifications with no active requests, using
+  per-service running counts while preserving callback aliases and fallback polls.
+- Roll back viewer startup failures, closing the Viser transport and owned
+  executor/controller resources when initialization or monitor startup fails.
+- Finish dual-arm monitor updates before publishing the final frame, preventing
+  late monitor samples or errors from replacing it, even after the join times out.
+  Clarify payload-center coordinate names.
+- Check native numeric types before the Real ABC during trajectory validation,
+  reducing per-joint overhead while preserving finite-float range checks.
+- Reuse timing validation in the HTTP demo client, rejecting float overflow and
+  underflow before socket operations while accepting representable fractions.
+- Clean up gripper request state at future completion, making concurrent queued
+  cancellation idempotent and preventing late cancellation flags from accumulating.
+- Validate Viser gripper request IDs before sequence reservation or cancellation,
+  so boolean/float aliases cannot affect an active integer-ID request.
+- Reuse discovered references for workflow inputs without schemas. Derive final
+  dependencies and recheck paths after schema hooks replace nested references.
+- Fast-path native numeric schema values while preserving exact large integers;
+  report overflowing real values as validation errors before command dispatch.
+- Reuse each arm's latest rendered pose and kinematics while updating progress,
+  grippers and ownership every frame. Serialize complete live/replay frame updates
+  and retry pose updates after renderer or kinematics failures.
+- Reject underflowing retry settings during policy validation and expose fractional
+  retry values as JSON numbers in service descriptions, preserving exact policies.
+- Reject positive timing intervals that become zero as native floats, preserving
+  motion IDs and avoiding zero-cadence polling. Normalize pilot polling intervals.
+- Advertise the actual Viser listening port in browser and SSH instructions when
+  the requested port is occupied.
+- Locate replay frames with indexed binary search, avoiding a full timestamp
+  copy on every seek or playback tick while preserving duplicate-time behavior.
+- Capture replay stage and payload ownership from one event snapshot, avoiding
+  duplicate history copies and inconsistent frames during concurrent updates.
+  Stamp frames under the append lock so overlapping final capture stays ordered.
+- Vectorize Viser joint interpolation while preserving endpoint weights and
+  independent trajectory points.
+- Resolve workflow output references on demand instead of projecting every
+  ordering dependency into a temporary output dictionary.
+- Release pruned, cancelled threaded responses after SDK cleanup finishes,
+  including after pilot shutdown, without changing public response-forgetting rules.
+- Reuse terminal counts when pruning request history and retain removed SDK
+  payloads until state-lock release, preserving active waiters and newest results.
+- Bound slow gripper animation preparation while preserving nominal travel time;
+  avoid interval underflow for tiny speeds and stationary commands. Reuse pending
+  futures on gripper shutdown instead of inspecting completed response history.
+  Include the final sample's hold in estimated default timeouts.
 - Reduce JSON snapshot overhead with direct string encoding and one-pass
   dictionary copying. Count actual copied entries and ignore custom string lengths
   when enforcing workflow payload budgets.

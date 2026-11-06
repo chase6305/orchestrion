@@ -168,7 +168,8 @@ class SQLiteJournal:
             db.execute(
                 "CREATE TABLE nodes ("
                 "run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE, "
-                "node_id TEXT NOT NULL, action TEXT NOT NULL, action_version TEXT, status TEXT NOT NULL, "
+                "node_id TEXT NOT NULL, action TEXT NOT NULL, "
+                "action_version TEXT, status TEXT NOT NULL, "
                 "output TEXT, error TEXT, started_at REAL, finished_at REAL, "
                 "feedback_dropped INTEGER NOT NULL DEFAULT 0, claims TEXT NOT NULL, "
                 "lease_active INTEGER NOT NULL DEFAULT 0, checkpoint TEXT, "
@@ -179,7 +180,8 @@ class SQLiteJournal:
                 "CREATE TABLE events ("
                 "sequence INTEGER PRIMARY KEY AUTOINCREMENT, "
                 "run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE, "
-                "node_id TEXT, kind TEXT NOT NULL, timestamp REAL NOT NULL, detail TEXT)"
+                "node_id TEXT, kind TEXT NOT NULL, "
+                "timestamp REAL NOT NULL, detail TEXT)"
             )
             db.execute("CREATE INDEX events_run ON events(run_id, sequence)")
             db.execute("PRAGMA application_id={}".format(_APPLICATION_ID))
@@ -218,7 +220,8 @@ class SQLiteJournal:
 
     def _event(self, db, run_id, node_id, kind, detail=None, *, trim=True) -> None:
         db.execute(
-            "INSERT INTO events(run_id,node_id,kind,timestamp,detail) VALUES(?,?,?,?,?)",
+            "INSERT INTO events(run_id,node_id,kind,timestamp,detail) "
+            "VALUES(?,?,?,?,?)",
             (run_id, node_id, kind, time.time(), _json(detail)),
         )
         if trim:
@@ -236,7 +239,8 @@ class SQLiteJournal:
     def _admit(self, run, compiled, fingerprint) -> None:
         with self._transaction() as db:
             db.execute(
-                "INSERT INTO runs(run_id,idempotency_key,fingerprint,status,submitted_at,node_count) "
+                "INSERT INTO runs(run_id,idempotency_key,fingerprint,"
+                "status,submitted_at,node_count) "
                 "VALUES(?,?,?,?,?,?)",
                 (
                     run.run_id,
@@ -314,7 +318,8 @@ class SQLiteJournal:
                 if cursor.rowcount != 1:
                     raise JournalError("missing durable operation result record")
                 self._event(
-                    db, run_id, result.node_id, "settled", result.status.value, trim=False
+                    db, run_id, result.node_id, "settled", result.status.value,
+                    trim=False,
                 )
             self._trim_events(db, run_id)
 
@@ -341,7 +346,8 @@ class SQLiteJournal:
     def _reconcile(self, run_id: str, node_id: str, evidence: str) -> None:
         with self._transaction() as db:
             cursor = db.execute(
-                "UPDATE nodes SET lease_active=0, reconciled_at=?, reconciliation_evidence=? "
+                "UPDATE nodes SET lease_active=0, reconciled_at=?, "
+                "reconciliation_evidence=? "
                 "WHERE run_id=? AND node_id=? AND status='unknown' AND lease_active=1",
                 (time.time(), evidence, run_id, node_id),
             )
@@ -367,7 +373,8 @@ class SQLiteJournal:
                 "SELECT 1 FROM nodes WHERE nodes.run_id=runs.run_id AND ("
                 "lease_active=1 OR status IN ('running','cancelling') OR "
                 "(status='unknown' AND (reconciled_at IS NULL OR "
-                "reconciliation_evidence IS NULL OR trim(reconciliation_evidence)='')))) "
+                "reconciliation_evidence IS NULL OR "
+                "trim(reconciliation_evidence)='')))) "
                 "ORDER BY rowid"
             ).fetchall()
             return [self.get_run(row[0]) for row in ids]
@@ -391,9 +398,11 @@ class SQLiteJournal:
                     )
                     node.update(
                         status=status.value,
-                        error="process interrupted; device result requires reconciliation"
-                        if node["lease_active"]
-                        else "process interrupted before dispatch",
+                        error=(
+                            "process interrupted; device result requires reconciliation"
+                            if node["lease_active"]
+                            else "process interrupted before dispatch"
+                        ),
                         finished_at=time.time(),
                     )
                     db.execute(
@@ -477,7 +486,8 @@ class SQLiteJournal:
                 "DELETE FROM runs WHERE run_id IN ("
                 "SELECT run_id FROM runs WHERE finished_at IS NOT NULL "
                 "AND idempotency_key IS NULL AND NOT EXISTS ("
-                "SELECT 1 FROM nodes WHERE nodes.run_id=runs.run_id AND lease_active=1) "
+                "SELECT 1 FROM nodes WHERE nodes.run_id=runs.run_id "
+                "AND lease_active=1) "
                 "ORDER BY rowid DESC LIMIT -1 OFFSET ?)",
                 (keep_last,),
             )

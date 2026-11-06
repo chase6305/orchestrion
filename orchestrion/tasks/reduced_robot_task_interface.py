@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional
 
-from orchestrion.utils.numeric import is_finite_real
+from orchestrion.utils.numeric import is_finite_real, is_positive_finite_real
 
 
 class ReducedRobotTaskInterface(ABC):
@@ -73,8 +73,9 @@ class ReducedRobotTaskInterface(ABC):
 
         return previous_endpoint == len(motion_target)
 
-    # Preserve the validator name used by robot subclasses without another call.
+    # Expose shared predicates directly to robot subclasses.
     _is_finite_real = staticmethod(is_finite_real)
+    _is_positive_finite_real = staticmethod(is_positive_finite_real)
 
     @staticmethod
     def _is_finite_trajectory(motion_target: List[List[float]]) -> bool:

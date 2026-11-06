@@ -56,6 +56,18 @@ Gripper requests complete only after the animated finger joint reaches its targe
 Trajectories always start from the current position, so repeated commands and motion
 reversal do not jump back to a hard-coded endpoint.
 
+Animation samples at most 60 updates per second and precomputes at most 4096
+points. Longer motions use a larger interval to preserve nominal travel time.
+The default timeout includes each sample's interval, up to one extra scheduler
+tick per sample, and two seconds of margin. This covers the final hold and tick
+rounding; an explicit `timeout` overrides the estimate.
+
+Wait failures attempt local motion cancellation. The original wait error is
+preserved if cleanup fails; timeout messages include IDs, elapsed time and budget.
+
+A [runtime recording](../../assets/08-gripper-cancellation.webp) shows a running
+close being cancelled and reversed, followed by a full close/open cycle.
+
 ```python
 pilot.call_srv_async("gripper", {"action": "open", "speed": 0.8})
 pilot.call_srv_async("gripper", {"action": "close", "speed": 0.5})

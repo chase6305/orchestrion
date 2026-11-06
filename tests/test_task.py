@@ -1,6 +1,7 @@
 """Function tasks, retries, telemetry, result retention, and lifecycle races."""
 
 import concurrent.futures
+import json
 import threading
 import time
 import weakref
@@ -28,6 +29,21 @@ class InPlaceTaskStub(InPlaceFunctionCallTask):
 class ThreadedPoolTaskStub(ThreadedPoolFunctionCallTask):
     def _call_fn(self, request_id, content):
         return {"result": content["value"] + 1}
+
+
+def test_fractional_retry_settings_have_a_json_compatible_description():
+    policy = RetryPolicy(
+        max_attempts=2,
+        delay=Fraction(1, 2),
+        backoff=Fraction(3, 2),
+        max_delay=Fraction(5, 2),
+    )
+    task = CallableTask(lambda request_id, content: content, retry_policy=policy)
+    retry = json.loads(json.dumps(task.describe(), allow_nan=False))["retry"]
+    assert retry["delay"] == 0.5
+    assert retry["backoff"] == 1.5
+    assert retry["max_delay"] == 2.5
+    assert isinstance(policy.delay, Fraction)
 
 
 def test_polling_releases_a_rejected_sample_before_the_next_poll():
@@ -765,6 +781,31 @@ def test_inline_response_reports_pending_until_call_finishes():
             release.set()
         assert future.result(1.0)
     assert task.peek_response(0).content == {"value": 1}
+
+
+def test_forgetting_pending_threaded_response_keeps_its_later_result():
+    started = threading.Event()
+    release = threading.Event()
+
+    def call(request_id, content):
+        started.set()
+        assert release.wait(2.0)
+        return content
+
+    task = CallableTask(call)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        try:
+            assert task.invoke_async(0, {"value": 1})
+            assert started.wait(1.0)
+            assert not task.forget_response(0)
+        finally:
+            release.set()
+            task.stop()
+
+    response = task.peek_response(0)
+    assert response.result_type is PeekResponseResultType.ResponseFound
+    assert response.content == {"value": 1}
 
 
 def test_inline_failure_is_retained_and_notified():
