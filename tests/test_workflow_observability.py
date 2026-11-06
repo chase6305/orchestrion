@@ -180,34 +180,46 @@ def test_explain_preserves_each_owner_for_multiple_blocked_claims(unrelated_reso
         ]
         async with WorkflowEngine(
             [Action("hold", hold), Action("echo", echo)],
-            resources, max_concurrency=3,
+            resources,
+            max_concurrency=3,
         ) as engine:
-            owner = engine.submit(Workflow(tuple(
+            owner_nodes = tuple(
                 Node(name, "hold", claims=(ResourceClaim(name),)) for name in names
-            )))
+            )
+            owner = engine.submit(Workflow(owner_nodes))
             try:
                 await asyncio.wait_for(
                     asyncio.gather(*(event.wait() for event in entered.values())), 1
                 )
-                waiter = engine.submit(Workflow((Node(
-                    "both", "echo", claims=(ResourceClaim("arm"), ResourceClaim("tool")),
-                ),)))
-                capacity = [
-                    blocker for blocker in waiter.explain("both")["blockers"]
+                blocked_node = Node(
+                    "both", "echo", claims=(ResourceClaim("arm"), ResourceClaim("tool"))
+                )
+                waiter = engine.submit(Workflow((blocked_node,)))
+                expected = waiter.explain("both")
+                diagnostic = waiter.explain("both")
+                capacity_blockers = [
+                    blocker
+                    for blocker in diagnostic["blockers"]
                     if blocker["kind"] == "resource_capacity"
                 ]
-                assert [blocker["resource"] for blocker in capacity] == ["arm", "tool"]
-                for blocker in capacity:
-                    assert blocker["owners"] == [{
-                        "operation_id": owner.operation_id(blocker["resource"]),
-                        "units": 1, "quarantined": False,
-                    }]
+                assert [blocker["resource"] for blocker in capacity_blockers] == [
+                    "arm",
+                    "tool",
+                ]
+                for blocker in capacity_blockers:
+                    assert blocker["owners"] == [
+                        {
+                            "operation_id": owner.operation_id(blocker["resource"]),
+                            "units": 1,
+                            "quarantined": False,
+                        }
+                    ]
                 snapshot = engine.scheduler_snapshot()
                 assert snapshot["resources"]["camera"]["owners"][0]["operation_id"] == (
                     owner.operation_id("camera")
                 )
-                capacity[0]["owners"][0]["units"] = 99
-                assert waiter.explain("both")["blockers"][1]["owners"][0]["units"] == 1
+                capacity_blockers[0]["owners"][0]["units"] = 99
+                assert waiter.explain("both") == expected
             finally:
                 release.set()
             await asyncio.gather(owner.wait(1), waiter.wait(1))
