@@ -512,6 +512,7 @@ class WorkflowEngine:
     async def aclose(self, timeout: Optional[float] = None) -> None:
         """Stop admission and drain actions; timeout does not release active claims.
 
+        The timeout bounds the wait after stop requests have been issued.
         May be called again after timeout. Uncertain operations remain quarantined
         and must be reconciled externally even after this method returns.
         """

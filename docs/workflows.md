@@ -93,7 +93,9 @@ historical result remains `UNKNOWN`.
 precedence, and `None` inherits the engine default (unbounded). Expiry marks the
 node `UNKNOWN` without cancelling its adapter or releasing resources. A draining
 adapter keeps its concurrency slot and must exit before reconciliation.
-`aclose(timeout=...)` shares one shutdown budget and can be called again.
+`aclose(timeout=...)` bounds the combined wait for runs and draining adapters after
+issuing stop requests. A timeout keeps active claims held; call it again to await
+cleanup.
 
 Use `run.explain(node_id)` for dependency, concurrency, resource, queue, stop or
 quarantine blockers. `engine.scheduler_snapshot()` shows counts, owners, queue
