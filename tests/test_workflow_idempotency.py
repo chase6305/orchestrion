@@ -297,6 +297,10 @@ def test_explicit_pruning_releases_capacity_and_allows_intentional_key_reuse():
             await second.wait(1)
             with pytest.raises(RuntimeError, match="max_idempotency_keys"):
                 engine.submit(workflow, idempotency_key="third")
+            assert engine.prune_idempotency_keys() == 0
+            assert engine.prune_idempotency_keys(keep_last=2) == 0
+            assert engine.get_run_by_key("first") is first
+            assert engine.get_run_by_key("second") is second
             assert engine.prune_idempotency_keys(keep_last=1) == 1
             assert engine.get_run_by_key("first") is None
             assert engine.get_run_by_key("second") is second

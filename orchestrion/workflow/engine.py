@@ -440,6 +440,8 @@ class WorkflowEngine:
             or keep_last < 0
         ):
             raise ValueError("keep_last must be a nonnegative integer")
+        if len(self._submissions) <= keep_last:
+            return 0
         uncertain = {run.run_id for run, _ in self._quarantined.values()}
         eligible = [
             key
