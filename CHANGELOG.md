@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Reduce JSON snapshot overhead with direct string encoding and one-pass
+  dictionary copying. Count actual copied entries and ignore custom string lengths
+  when enforcing workflow payload budgets.
 - Reduce resource queue scans when cancelling workflows.
 - Skip workflow key-retention scans when the total is already within the limit.
 - Clear ready queues once when closing all workflows, while retaining active
@@ -10,9 +13,6 @@
 - Return immediately when workflow event cursors are already current.
 - Avoid copying the final SDK feedback batch while preserving bounded queues,
   drop counts and event-loop yielding.
-- Reduce JSON snapshot overhead with direct string encoding and one-pass
-  dictionary copying. Count actual copied entries and ignore custom string lengths
-  when enforcing workflow payload budgets.
 - Correct the Viser pick-and-place payload fit, grasp width and approach/lift
   paths; replace the README recording with the corrected runtime sequence.
 - Reduce scheduler and snapshot overhead with linear motion-wait scans, cached
