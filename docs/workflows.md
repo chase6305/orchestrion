@@ -70,11 +70,11 @@ Oversized outputs fail before retention or downstream dispatch. Keep images and
 point clouds in artifact storage and pass references; these limits do not bound
 total process memory.
 
-`context.report()` accepts JSON progress, including from SDK threads. Each action
-has a bounded queue (`max_pending_feedback_per_action=128` by default); overflow
-drops the oldest pending report and increments `NodeResult.feedback_dropped`.
-Late reports are dropped. Required results belong in final outputs or the device
-protocol.
+`context.report()` accepts JSON progress. Reports on the owning event loop are
+delivered immediately; SDK-thread reports use a per-action bounded queue
+(`max_pending_feedback_per_action=128` by default). Overflow drops the oldest
+pending report and increments `NodeResult.feedback_dropped`. Late reports are
+dropped. Required results belong in final outputs or the device protocol.
 
 ## Cancellation and diagnostics
 
