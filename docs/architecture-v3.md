@@ -360,7 +360,7 @@ tests/
 
 ## 12. 运行与验证
 
-当前持久化、资源作用域、跨版本测试和微基准见 [2026-10-21 优化记录](optimization-2026-10-21.md)。第一阶段的测试、隔离安装与性能数据见 [验证记录](workflow-validation-2026-09-05.md)。
+开发环境、测试分组和验证命令见 [开发与测试指南](../tests/README.md)。下面的命令可运行模拟流程、回归测试和调度基准。
 
 ```bash
 python -m examples.heterogeneous_workflow --preview

@@ -76,5 +76,9 @@ $RECYCLE.BIN/
 CLAUDE.md
 GEMINI.md
 
+# Local optimization and validation reports
+/docs/optimization-*
+/docs/workflow-validation-20*.md
+
 # Local agent instructions
 AGENTS.md
