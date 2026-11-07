@@ -704,6 +704,57 @@ def test_sdk_thread_feedback_is_snapshotted_and_delivered_on_the_event_loop():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("followup_count", [8, 64])
+def test_incremental_events_preserve_order_and_isolation_across_history_eviction(
+    followup_count,
+):
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        initial_count, history_limit = 16, 32
+
+        async def report(context, inputs):
+            for step in range(initial_count):
+                context.report({"progress": [step]})
+            entered.set()
+            await asyncio.wait_for(release.wait(), 2)
+            for step in range(initial_count, initial_count + followup_count):
+                context.report({"progress": [step]})
+
+        async with WorkflowEngine(
+            [Action("report", report)], max_events_per_run=history_limit
+        ) as engine:
+            run = engine.submit(Workflow((Node("report", "report"),)))
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                cursor = run.events()[-1].sequence
+                tail = run.events(after=cursor - 2)
+                assert [event.detail["progress"] for event in tail] == [[14], [15]]
+                tail[0].detail["progress"].clear()
+                assert run.events(after=cursor - 2)[0].detail["progress"] == [14]
+            finally:
+                release.set()
+            await run.wait(1)
+            recent = run.events(after=cursor)
+            total_count = initial_count + followup_count
+            first_step = max(initial_count, total_count - history_limit + 1)
+            assert [
+                event.detail["progress"][0]
+                for event in recent
+                if event.kind == "feedback"
+            ] == list(range(first_step, total_count))
+            assert len(recent) == min(followup_count + 1, history_limit)
+            assert recent[-1].status == NodeStatus.SUCCEEDED
+            assert (recent[0].sequence > cursor + 1) == (
+                followup_count >= history_limit
+            )
+            assert all(
+                right.sequence == left.sequence + 1
+                for left, right in zip(recent, recent[1:])
+            )
+
+    asyncio.run(scenario())
+
+
 def test_events_are_bounded_and_defensive_with_monotonic_sequences():
     async def scenario():
         async def report(context, inputs):
