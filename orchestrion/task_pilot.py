@@ -159,25 +159,25 @@ class TaskPilot:
                     "Failed to roll back peripheral task: %s", exception_message(exc)
                 )
         for _, task in self._lifecycle_tasks:
-            set_completion_callback = getattr(task, "set_completion_callback", None)
-            if callable(set_completion_callback):
-                try:
-                    set_completion_callback(None)
-                except Exception as exc:
-                    log_error(
-                        "Failed to clear task completion callback: %s",
-                        exception_message(exc),
-                    )
-        set_state_callback = getattr(
-            self._robot_task, "set_state_change_callback", None
-        )
-        if callable(set_state_callback):
             try:
-                set_state_callback(None)
+                set_completion_callback = getattr(task, "set_completion_callback", None)
+                if callable(set_completion_callback):
+                    set_completion_callback(None)
             except Exception as exc:
                 log_error(
-                    "Failed to clear robot state callback: %s", exception_message(exc)
+                    "Failed to clear task completion callback: %s",
+                    exception_message(exc),
                 )
+        try:
+            set_state_callback = getattr(
+                self._robot_task, "set_state_change_callback", None
+            )
+            if callable(set_state_callback):
+                set_state_callback(None)
+        except Exception as exc:
+            log_error(
+                "Failed to clear robot state callback: %s", exception_message(exc)
+            )
         try:
             self._robot_task.stop()
         except Exception as exc:
@@ -317,17 +317,17 @@ class TaskPilot:
                     if task_stop_error is None:
                         task_stop_error = exc
                 finally:
-                    set_completion_callback = getattr(
-                        task, "set_completion_callback", None
-                    )
-                    if callable(set_completion_callback):
-                        try:
+                    try:
+                        set_completion_callback = getattr(
+                            task, "set_completion_callback", None
+                        )
+                        if callable(set_completion_callback):
                             set_completion_callback(None)
-                        except Exception as exc:
-                            log_error(
-                                "Failed to clear task completion callback: %s",
-                                exception_message(exc),
-                            )
+                    except Exception as exc:
+                        log_error(
+                            "Failed to clear task completion callback: %s",
+                            exception_message(exc),
+                        )
         finally:
             try:
                 if self._executor is not None:
@@ -337,17 +337,17 @@ class TaskPilot:
                     self._executor.shutdown(wait=False, cancel_futures=True)
                     self._executor_shutdown = True
             finally:
-                set_callback = getattr(
-                    self._robot_task, "set_state_change_callback", None
-                )
-                if callable(set_callback):
-                    try:
+                try:
+                    set_callback = getattr(
+                        self._robot_task, "set_state_change_callback", None
+                    )
+                    if callable(set_callback):
                         set_callback(None)
-                    except Exception as exc:
-                        log_error(
-                            "Failed to clear robot state callback: %s",
-                            exception_message(exc),
-                        )
+                except Exception as exc:
+                    log_error(
+                        "Failed to clear robot state callback: %s",
+                        exception_message(exc),
+                    )
                 try:
                     self._robot_task.stop()
                 finally:
@@ -391,6 +391,9 @@ class TaskPilot:
         idempotency_key: Optional[str],
     ) -> Union[int, str]:
         """Prepare and atomically admit a request behind the nonthrowing boundary."""
+        if not isinstance(srv_name, str):
+            return "srv_name must be a string"
+        srv_name = str.__str__(srv_name)
         if srv_name not in self._task_map:
             return "Unknown service: {}".format(srv_name)
         if not self._initialized:
@@ -399,8 +402,11 @@ class TaskPilot:
             submission_epoch = self._lifecycle_epoch
         if isinstance(priority, bool) or not isinstance(priority, int):
             return "priority must be an integer"
+        priority = int.__int__(priority)
         if idempotency_key is not None and not isinstance(idempotency_key, str):
             return "idempotency_key must be a string or None"
+        if idempotency_key is not None:
+            idempotency_key = str.__str__(idempotency_key)
         if idempotency_key == "":
             return "idempotency_key must not be empty"
         deduplication_key = (
@@ -834,9 +840,10 @@ class TaskPilot:
             except KeyError:
                 continue
             except Exception as exc:
-                logger.error(
+                log_error(
                     "Failed to cancel request %s: %s",
-                    request_id, exception_message(exc),
+                    request_id,
+                    exception_message(exc),
                 )
         return cancelled
 
@@ -1109,18 +1116,18 @@ class TaskPilot:
                 request = self._running_requests.get(request_id)
                 cancellation_in_progress = request_id in self._cancelling_requests
             if request is not None and not cancellation_in_progress:
-                cancel = getattr(
-                    self._task_map[request.service_name], "cancel_request", None
-                )
-                if callable(cancel):
-                    try:
+                try:
+                    cancel = getattr(
+                        self._task_map[request.service_name], "cancel_request", None
+                    )
+                    if callable(cancel):
                         cancel(request_id)
-                    except Exception as exc:
-                        log_error(
-                            "Failed to cancel request %s: %s",
-                            request_id,
-                            exception_message(exc),
-                        )
+                except Exception as exc:
+                    log_error(
+                        "Failed to cancel request %s: %s",
+                        request_id,
+                        exception_message(exc),
+                    )
             self._transition(request_id, RequestStatus.CANCELLED, error=reason)
 
     def _admit_queued_requests(

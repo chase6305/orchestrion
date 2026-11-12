@@ -293,6 +293,130 @@ def test_submodule_name_snapshot_uses_plain_string_keys():
         assert type(result.associated_submodule) is str
 
 
+@pytest.mark.parametrize(
+    "field", ["priority", "latest_sent", "latest_finished", "explicit"]
+)
+def test_submission_captures_plain_integer_values_before_queueing(field):
+    class Number(int):
+        def __int__(self):
+            raise RuntimeError("custom integer conversion")
+
+        def __neg__(self):
+            raise RuntimeError("custom queue priority")
+
+        def __lt__(self, other):
+            raise RuntimeError("custom movement comparison")
+
+        def __le__(self, other):
+            raise RuntimeError("custom movement comparison")
+
+    robot = RobotTaskStub()
+    priority = Number(5) if field == "priority" else 0
+    option = MoveSyncOption.sync_w_latest_move()
+    if field == "latest_sent":
+        robot.latest_sent_id = Number(10)
+    elif field == "latest_finished":
+        robot.latest_finished_id = Number(10)
+    elif field == "explicit":
+        option.associated_move_id = Number(0)
+    with TaskPilot(robot, {"device": RecordingTask()}) as pilot:
+        request_id = pilot.call_srv_async(
+            "device", sync_option=option, priority=priority
+        )
+        assert request_id == 0
+        result = pilot.wait_request(request_id, timeout=1)
+        assert result.status is RequestStatus.SUCCEEDED
+        assert type(result.priority) is int
+        assert type(result.associated_move_id) is int
+
+
+def test_submission_captures_plain_service_names_and_idempotency_keys():
+    class Text(str):
+        __hash__ = None
+
+        def __eq__(self, other):
+            raise RuntimeError("custom key comparison")
+
+    task = RecordingTask()
+    with TaskPilot(RobotTaskStub(), {"device": task}) as pilot:
+        request_id = pilot.call_srv_async(
+            Text("device"), {"ok": True}, idempotency_key=Text("once")
+        )
+        assert request_id == 0
+        assert pilot.call_srv_async("device", idempotency_key="once") == request_id
+        result = pilot.wait_request(request_id, timeout=1)
+        assert result.content == {"ok": True}
+        assert type(result.service_name) is str
+        assert type(result.idempotency_key) is str
+        assert task.calls == [{"ok": True}]
+
+
+@pytest.mark.parametrize("initialization_fails", [False, True])
+def test_cleanup_contains_optional_hook_lookup_and_logging_failures(
+    initialization_fails, monkeypatch
+):
+    cleaning = threading.Event()
+    admitted = threading.Event()
+
+    class Task(GenericTaskStub):
+        @property
+        def set_completion_callback(self):
+            if cleaning.is_set():
+                raise RuntimeError("callback hook unavailable")
+            return lambda callback: None
+
+        @property
+        def cancel_request(self):
+            raise RuntimeError("cancel hook unavailable")
+
+        def stop(self):
+            super().stop()
+            cleaning.set()
+
+        def invoke_async(self, request_id, content=None):
+            result = super().invoke_async(request_id, content)
+            admitted.set()
+            return result
+
+    class Robot(RobotTaskStub):
+        @property
+        def set_state_change_callback(self):
+            if cleaning.is_set():
+                raise RuntimeError("robot callback hook unavailable")
+            return lambda callback: None
+
+    class FailingTask(GenericTaskStub):
+        def initialize(self, **kwargs):
+            raise ValueError("original initialization failure")
+
+    def broken_logger(*args, **kwargs):
+        raise RuntimeError("log handler unavailable")
+
+    monkeypatch.setattr("orchestrion.utils.logger.logger.error", broken_logger)
+    monkeypatch.setattr("orchestrion.utils.logger.logger.exception", broken_logger)
+    robot, first, second = Robot(), Task(), GenericTaskStub()
+    services = {"first": first, "second": second}
+    if initialization_fails:
+        services["broken"] = FailingTask()
+    pilot = TaskPilot(robot, services)
+    try:
+        if initialization_fails:
+            with pytest.raises(ValueError, match="original initialization failure"):
+                pilot.initialize()
+        else:
+            pilot.initialize()
+            request_id = pilot.call_srv_async("first")
+            assert admitted.wait(1)
+            pilot.stop()
+            assert (
+                pilot.wait_request(request_id, timeout=0).status
+                is RequestStatus.CANCELLED
+            )
+        assert first.stopped and second.stopped and robot.stopped
+    finally:
+        pilot.stop(timeout=1)
+
+
 @pytest.mark.parametrize("immediate_failure", [False, True])
 def test_scheduler_failure_closes_admission_cancels_pending_and_allows_restart(
     immediate_failure, monkeypatch, caplog
@@ -1075,7 +1199,10 @@ def test_completion_during_cancellation_preserves_the_final_outcome(accepted):
 
 
 @pytest.mark.parametrize("broken_formatter", [False, True])
-def test_bulk_cancellation_continues_after_backend_error(broken_formatter, caplog):
+@pytest.mark.parametrize("broken_logger", [False, True])
+def test_bulk_cancellation_continues_after_backend_error(
+    broken_formatter, broken_logger, caplog, monkeypatch
+):
     class CancelError(Exception):
         def __str__(self):
             if broken_formatter:
@@ -1084,6 +1211,13 @@ def test_bulk_cancellation_continues_after_backend_error(broken_formatter, caplo
 
     admitted = threading.Event()
     attempts = []
+
+    if broken_logger:
+
+        def fail_log(*args, **kwargs):
+            raise RuntimeError("log handler unavailable")
+
+        monkeypatch.setattr("orchestrion.utils.logger.logger.error", fail_log)
 
     class Task(GenericTaskStub):
         def invoke_async(self, request_id, content=None):
@@ -1107,7 +1241,8 @@ def test_bulk_cancellation_continues_after_backend_error(broken_formatter, caplo
         for request_id in ids[1:]:
             assert pilot.query_request(request_id).status is RequestStatus.CANCELLED
         assert not pilot._cancelling_requests
-        assert "Failed to cancel request 0" in caplog.text
+        if not broken_logger:
+            assert "Failed to cancel request 0" in caplog.text
 
 
 def test_request_prepared_before_stop_cannot_enter_a_restarted_pilot():
