@@ -1,6 +1,6 @@
 name: Bounded workflow runtime comparison
 
-# Final probe: include captured progress and all completed ownership fixes.
+# Final verification: scheduler faults stay inside the owned coroutine too.
 
 on:
   push:

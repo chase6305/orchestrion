@@ -45,7 +45,9 @@ def test_failed_eager_driver_preserves_its_fault_when_factory_also_fails(
         def factory(loop, coroutine, **kwargs):
             task = asyncio.eager_task_factory(loop, coroutine, **kwargs)
             if coroutine.cr_code.co_name == "_schedule":
-                raise RuntimeError("instrumentation failed after eager driver completion")
+                raise RuntimeError(
+                    "instrumentation failed after eager driver completion"
+                )
             return task
 
         def fail_advance():
@@ -59,11 +61,16 @@ def test_failed_eager_driver_preserves_its_fault_when_factory_also_fails(
         loop.set_exception_handler(lambda loop, detail: unhandled.append(detail))
         try:
             loop.set_task_factory(factory)
-            run = engine.submit(Workflow((Node("device", "record"),)), idempotency_key="once")
+            run = engine.submit(
+                Workflow((Node("device", "record"),)), idempotency_key="once"
+            )
             assert (await run.wait(1)).status is RunStatus.FAILED
             await asyncio.sleep(0)
             gc.collect()
-            assert "scheduler accounting unavailable" in engine.scheduler_snapshot()["scheduler_error"]
+            assert (
+                "scheduler accounting unavailable"
+                in engine.scheduler_snapshot()["scheduler_error"]
+            )
             assert "scheduler accounting unavailable" in caplog.text
             assert engine.get_run_by_key("once") is run
             assert calls == [] and unhandled == []

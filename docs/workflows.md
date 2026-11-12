@@ -172,6 +172,8 @@ the remaining graph and logs the error, committing already confirmed outcomes
 even when queue preparation fails. Durable recovery sees consistent final states.
 Cancellation callback failures log and leave the remaining scope notifications
 and owned transport cleanup running until they finish.
+Scheduler and completion faults log inside their owned coroutines, including when
+a task factory fails after eager completion.
 
 ## Submission identity and retention
 

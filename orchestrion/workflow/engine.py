@@ -893,17 +893,26 @@ class WorkflowEngine:
             self._finish_run(run)
 
     async def _schedule(self) -> None:
-        while self._runs:
-            self._wake.clear()
-            dispatch_pending = self._advance_scheduler()
-            if self._runs:
-                if dispatch_pending:
-                    # An already-set wake event does not yield. Let cancellation
-                    # callbacks and timers run before another eager dispatch batch.
-                    await asyncio.sleep(0)
-                else:
-                    await self._wake.wait()
-        self._clear_ready_queues()
+        try:
+            while self._runs:
+                self._wake.clear()
+                dispatch_pending = self._advance_scheduler()
+                if self._runs:
+                    if dispatch_pending:
+                        # A set event does not yield. Allow callbacks and timers
+                        # to run before another eager dispatch batch.
+                        await asyncio.sleep(0)
+                    else:
+                        await self._wake.wait()
+            self._clear_ready_queues()
+        except (Exception, asyncio.CancelledError) as exc:
+            # Contain faults before an eager factory can discard the completed
+            # driver Task by raising its own instrumentation error.
+            self._fail_scheduler(
+                "CancelledError: workflow scheduler interrupted"
+                if isinstance(exc, asyncio.CancelledError)
+                else _error_text(exc)
+            )
 
     def _clear_ready_queues(self) -> None:
         """Release ready definitions without changing active workers or leases."""
