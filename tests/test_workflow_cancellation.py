@@ -32,8 +32,9 @@ async def reached(event):
     not hasattr(asyncio, "eager_task_factory"), reason="requires eager task support"
 )
 @pytest.mark.parametrize("topology", ["wide", "chain"])
+@pytest.mark.parametrize("notification", ["ready", "timer"])
 def test_eager_action_bursts_allow_scheduled_cancellation_before_more_device_calls(
-    topology,
+    topology, notification
 ):
     async def scenario():
         loop = asyncio.get_running_loop()
@@ -45,7 +46,14 @@ def test_eager_action_bursts_allow_scheduled_cancellation_before_more_device_cal
             calls.append(context.node_id)
             if len(calls) == 1:
                 run = engine.get_run_by_key("burst")
-                loop.call_soon(lambda: accepted.append(run.cancel()))
+
+                def cancel():
+                    accepted.append(run.cancel())
+
+                if notification == "timer":
+                    loop.call_later(0, cancel)
+                else:
+                    loop.call_soon(cancel)
 
         engine = WorkflowEngine(
             [Action("device", device, (ResourceClaim("arm"),))],
