@@ -231,7 +231,10 @@ and capacity constraints; an unknown step quarantines the whole scope.
 Cancellation reaches nested scopes synchronously through loop-local callbacks;
 it does not depend on starting a forwarding task. Deep nesting uses an iterative
 dispatch queue. Inner handlers recheck parent cancellation before device entry,
-and callbacks are released when the scope finishes.
+and callbacks are released when the scope finishes. Repeated native cancellation
+of the outer adapter still waits for every inner handler to exit. A stop deadline
+can publish `UNKNOWN` while that cleanup continues; the outer worker remains
+counted and reconciliation remains blocked until cleanup finishes.
 
 The output contains `nodes[step_id]` with `status`, `output` and `error`. Use
 `run.operation_id(node_id)` for encoded scoped IDs. Inner plans, action versions
