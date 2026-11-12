@@ -161,6 +161,9 @@ def test_resource_quantities_capture_base_integers_before_reservation_arithmetic
 
         __radd__ = __sub__ = __rsub__ = __add__
 
+        def __lt__(self, other):
+            raise RuntimeError("custom positivity comparison")
+
     async def scenario():
         calls = []
 
@@ -192,6 +195,26 @@ def test_resource_quantities_capture_base_integers_before_reservation_arithmetic
             assert engine.scheduler_snapshot()["scheduler_error"] is None
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("value", [0, -1])
+@pytest.mark.parametrize(
+    "definition",
+    [
+        lambda value: Resource("arm", value),
+        lambda value: ResourceClaim("arm", value),
+        lambda value: WorkflowEngine([], max_concurrency=value),
+        lambda value: WorkflowEngine([], max_input_bytes_per_node=value),
+    ],
+    ids=["capacity", "claim", "concurrency", "payload-limit"],
+)
+def test_integer_comparison_hooks_cannot_bypass_positive_quantity_checks(value, definition):
+    class FalsePositive(int):
+        def __lt__(self, other):
+            return False
+
+    with pytest.raises(ValueError, match="positive integer"):
+        definition(FalsePositive(value))
 
 
 @pytest.mark.parametrize("base", [int, float])
