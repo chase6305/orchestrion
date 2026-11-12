@@ -518,6 +518,49 @@ def test_scoped_checkpoint_preserves_the_first_captured_sdk_ticket(durable, tmp_
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("threaded", [False, True])
+@pytest.mark.parametrize("depth", [1, 3])
+def test_scoped_feedback_reuses_the_successfully_captured_sdk_snapshot(threaded, depth):
+    async def scenario():
+        captures = []
+
+        class Feedback(dict):
+            def items(self):
+                captures.append(len(captures) + 1)
+                return {"sdk_capture": captures[-1]}.items()
+
+        async def device(context, inputs):
+            if threaded:
+                producer = threading.Thread(target=lambda: context.report(Feedback()))
+                producer.start()
+                producer.join(1)
+                assert not producer.is_alive()
+            else:
+                assert context.report(Feedback()) is None
+
+        action = Action("device", device)
+        for index in range(depth):
+            action = workflow_action(
+                "scope" + str(index), Workflow((Node("step", action.name),)), [action]
+            )
+        async with WorkflowEngine([action]) as engine:
+            run = engine.submit(Workflow((Node("scope", action.name),)))
+            assert (await run.wait(1)).status is RunStatus.SUCCEEDED
+            assert captures == [1]
+            received = []
+            for event in run.events():
+                if event.kind != "feedback":
+                    continue
+                detail = event.detail
+                while isinstance(detail, dict) and "feedback" in detail:
+                    detail = detail["feedback"]
+                if isinstance(detail, dict) and "sdk_capture" in detail:
+                    received.append(detail)
+            assert received == [{"sdk_capture": 1}]
+
+    asyncio.run(scenario())
+
+
 def test_blocking_sdk_in_scope_uses_thread_cancellation_and_stable_operation_ids():
     async def scenario():
         release = threading.Event()
