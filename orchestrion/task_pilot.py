@@ -94,6 +94,7 @@ class TaskPilot:
         self._dirty_services: Set[str] = set()
         self._wake_event = threading.Event()
         self._stop_event = threading.Event()
+        self._scheduler_ready = threading.Event()
         self._bg_thread: Optional[threading.Thread] = None
         self._initialized = False
         self._lifecycle_epoch = 0
@@ -153,27 +154,34 @@ class TaskPilot:
         for task in reversed(initialized_tasks):
             try:
                 task.stop()
-            except Exception:
-                logger.exception("Failed to roll back peripheral task")
+            except Exception as exc:
+                log_error(
+                    "Failed to roll back peripheral task: %s", exception_message(exc)
+                )
         for _, task in self._lifecycle_tasks:
             set_completion_callback = getattr(task, "set_completion_callback", None)
             if callable(set_completion_callback):
                 try:
                     set_completion_callback(None)
-                except Exception:
-                    logger.exception("Failed to clear task completion callback")
+                except Exception as exc:
+                    log_error(
+                        "Failed to clear task completion callback: %s",
+                        exception_message(exc),
+                    )
         set_state_callback = getattr(
             self._robot_task, "set_state_change_callback", None
         )
         if callable(set_state_callback):
             try:
                 set_state_callback(None)
-            except Exception:
-                logger.exception("Failed to clear robot state callback")
+            except Exception as exc:
+                log_error(
+                    "Failed to clear robot state callback: %s", exception_message(exc)
+                )
         try:
             self._robot_task.stop()
-        except Exception:
-            logger.exception("Failed to roll back robot task")
+        except Exception as exc:
+            log_error("Failed to roll back robot task: %s", exception_message(exc))
 
     def initialize(self) -> None:
         """Initialize the pilot once, serializing concurrent lifecycle calls."""
@@ -197,8 +205,11 @@ class TaskPilot:
         except Exception:
             try:
                 self._robot_task.stop()
-            except Exception:
-                logger.exception("Failed to roll back robot task initialization")
+            except Exception as exc:
+                log_error(
+                    "Failed to roll back robot task initialization: %s",
+                    exception_message(exc),
+                )
             raise
         initialized_tasks = []
         try:
@@ -214,6 +225,7 @@ class TaskPilot:
             self._rollback_initialization(initialized_tasks)
             raise
 
+        self._scheduler_ready.clear()
         try:
             set_callback = getattr(
                 self._robot_task, "set_state_change_callback", None
@@ -228,9 +240,16 @@ class TaskPilot:
                 self._initialized = True
                 self._mark_health_changed_locked()
         except Exception:
+            with self._state_condition:
+                self._initialized = False
+                self._lifecycle_epoch += 1
+                self._stop_event.set()
+            self._cancel_nonterminal("TaskPilot initialization failed")
             self._rollback_initialization(initialized_tasks)
             self._bg_thread = None
             raise
+        finally:
+            self._scheduler_ready.set()
 
     def stop(self, timeout: float = 5.0) -> None:
         """Stop the pilot, serializing against initialization and other stops."""
@@ -240,7 +259,9 @@ class TaskPilot:
         with self._lifecycle_lock:
             self._stop_locked(timeout)
 
-    def _stop_locked(self, timeout: float) -> None:
+    def _stop_locked(
+        self, timeout: float, *, reason: str = "TaskPilot stopped"
+    ) -> None:
         if not is_finite_real(timeout) or timeout < 0:
             raise ValueError("timeout must be non-negative and finite")
         if timeout > threading.TIMEOUT_MAX:
@@ -278,7 +299,7 @@ class TaskPilot:
             self._bg_thread.join(timeout=timeout)
             thread_timed_out = self._bg_thread.is_alive()
 
-        self._cancel_nonterminal("TaskPilot stopped")
+        self._cancel_nonterminal(reason)
         while True:
             try:
                 self._task_queue.get_nowait()
@@ -290,7 +311,9 @@ class TaskPilot:
                 try:
                     task.stop()
                 except Exception as exc:
-                    logger.exception("Failed to stop peripheral task")
+                    log_error(
+                        "Failed to stop peripheral task: %s", exception_message(exc)
+                    )
                     if task_stop_error is None:
                         task_stop_error = exc
                 finally:
@@ -300,8 +323,11 @@ class TaskPilot:
                     if callable(set_completion_callback):
                         try:
                             set_completion_callback(None)
-                        except Exception:
-                            logger.exception("Failed to clear task completion callback")
+                        except Exception as exc:
+                            log_error(
+                                "Failed to clear task completion callback: %s",
+                                exception_message(exc),
+                            )
         finally:
             try:
                 if self._executor is not None:
@@ -317,8 +343,11 @@ class TaskPilot:
                 if callable(set_callback):
                     try:
                         set_callback(None)
-                    except Exception:
-                        logger.exception("Failed to clear robot state callback")
+                    except Exception as exc:
+                        log_error(
+                            "Failed to clear robot state callback: %s",
+                            exception_message(exc),
+                        )
                 try:
                     self._robot_task.stop()
                 finally:
@@ -386,6 +415,14 @@ class TaskPilot:
             sync_option = MoveSyncOption.sync_w_latest_move()
         elif not isinstance(sync_option, MoveSyncOption):
             return "sync_option must be a MoveSyncOption or None"
+        else:
+            # Options are intentionally mutable. Validate a plain-value snapshot
+            # before SDK callbacks can mutate them or invalid fields reach the
+            # background scheduler's hash keys and movement comparisons.
+            snapshot = MoveSyncOption._snapshot(sync_option)
+            if isinstance(snapshot, str):
+                return snapshot
+            sync_option = snapshot
 
         associated_move_id = -1
         associated_submodule = sync_option.submodule_name
@@ -413,6 +450,7 @@ class TaskPilot:
                 associated_move_id, int
             ):
                 return "associated_move_id must be an integer"
+            associated_move_id = int.__int__(associated_move_id)
             if associated_move_id < -1:
                 return "associated_move_id must be -1 or non-negative"
 
@@ -1132,7 +1170,9 @@ class TaskPilot:
 
         # Index shared sequences only within this pass. Sets and short batches
         # keep their existing membership lookup without an extra allocation.
-        progress_by_submodule: Dict[Optional[str], Tuple[int, Container[int]]] = {}
+        progress_by_submodule: Dict[
+            Optional[str], Union[Tuple[int, Container[int]], str]
+        ] = {}
         still_waiting = []
         for queue_entry in waiting_for_motion:
             request = queue_entry[2]
@@ -1141,42 +1181,28 @@ class TaskPilot:
             if result is None or result.status.terminal:
                 continue
             submodule_name = request.associated_submodule
+            if submodule_name is None and main_state is None:
+                still_waiting.append(queue_entry)
+                continue
+            if submodule_name not in progress_by_submodule:
+                progress = self._read_motion_progress(
+                    submodule_name, main_state, dependency_counts[submodule_name]
+                )
+                progress_by_submodule[submodule_name] = progress
+                if isinstance(progress, str):
+                    log_error(
+                        "Failed to read motion progress for %s: %s",
+                        "main robot" if submodule_name is None else submodule_name,
+                        progress,
+                    )
+            progress = progress_by_submodule[submodule_name]
+            if isinstance(progress, str):
+                self._transition(
+                    request.request_id, RequestStatus.FAILED, error=progress
+                )
+                continue
             try:
-                if submodule_name not in progress_by_submodule:
-                    if submodule_name is None:
-                        if main_state is None:
-                            still_waiting.append(queue_entry)
-                            continue
-                        cancelled_move_ids = getattr(
-                            main_state, "cancelled_move_ids", ()
-                        )
-                        latest_finished_id = main_state.latest_finished_id
-                    else:
-                        submodule_state = self._robot_task.query_submodule_state(
-                            submodule_name
-                        )
-                        cancelled_move_ids = submodule_state.cancelled_move_ids
-                        latest_finished_id = submodule_state.latest_finished_id
-                    if isinstance(latest_finished_id, bool) or not isinstance(
-                        latest_finished_id, int
-                    ):
-                        raise TypeError("Robot latest_finished_id must be an integer")
-                    if latest_finished_id < -1:
-                        raise ValueError(
-                            "Robot latest_finished_id must be -1 or non-negative"
-                        )
-                    cancellation_lookup = (
-                        set(cancelled_move_ids)
-                        if dependency_counts[submodule_name] >= 4
-                        and isinstance(cancelled_move_ids, (list, tuple))
-                        else cancelled_move_ids
-                    )
-                    progress_by_submodule[submodule_name] = (
-                        latest_finished_id, cancellation_lookup
-                    )
-                latest_finished_id, cancelled_moves = progress_by_submodule[
-                    submodule_name
-                ]
+                latest_finished_id, cancelled_moves = progress
                 if request.associated_move_id in cancelled_moves:
                     self._transition(
                         request.request_id,
@@ -1189,16 +1215,45 @@ class TaskPilot:
                     continue
                 move_finished = request.associated_move_id <= latest_finished_id
             except Exception as exc:
-                self._transition(
-                    request.request_id, RequestStatus.FAILED,
-                    error=exception_message(exc),
-                )
+                self._fail_request(request, exception_message(exc))
                 continue
             if move_finished:
                 heapq.heappush(ready_to_dispatch, queue_entry)
             else:
                 still_waiting.append(queue_entry)
         return still_waiting
+
+    def _read_motion_progress(
+        self,
+        submodule_name: Optional[str],
+        main_state: Optional[ReducedRobotTaskInterface.ReducedRobotState],
+        dependency_count: int,
+    ) -> Union[Tuple[int, Container[int]], str]:
+        """Return a progress snapshot or one reusable error for this scheduler pass."""
+        try:
+            if submodule_name is None:
+                cancelled_move_ids = getattr(main_state, "cancelled_move_ids", ())
+                latest_finished_id = main_state.latest_finished_id
+            else:
+                state = self._robot_task.query_submodule_state(submodule_name)
+                cancelled_move_ids = state.cancelled_move_ids
+                latest_finished_id = state.latest_finished_id
+            if isinstance(latest_finished_id, bool) or not isinstance(
+                latest_finished_id, int
+            ):
+                return "Robot latest_finished_id must be an integer"
+            latest_finished_id = int.__int__(latest_finished_id)
+            if latest_finished_id < -1:
+                return "Robot latest_finished_id must be -1 or non-negative"
+            cancellation_lookup = (
+                set(cancelled_move_ids)
+                if dependency_count >= 4
+                and isinstance(cancelled_move_ids, (list, tuple))
+                else cancelled_move_ids
+            )
+            return latest_finished_id, cancellation_lookup
+        except Exception as exc:
+            return exception_message(exc)
 
     def _dispatch_next_request(self, ready_to_dispatch: List[_QueueEntry]) -> None:
         request = heapq.heappop(ready_to_dispatch)[2]
@@ -1207,6 +1262,25 @@ class TaskPilot:
         self._refresh_request(request)
 
     def _bg_thread_loop(self) -> None:
+        # Startup must publish admission before the worker can report a failure;
+        # otherwise an early worker exit could be overwritten by initialize().
+        self._scheduler_ready.wait()
+        if not self._initialized:
+            return
+        try:
+            self._run_scheduler()
+        except Exception as exc:
+            message = exception_message(exc)
+            log_error("TaskPilot scheduler failed: %s", message)
+            try:
+                self._stop_locked(0.0, reason="TaskPilot scheduler failed: " + message)
+            except Exception as cleanup_error:
+                log_error(
+                    "TaskPilot scheduler cleanup failed: %s",
+                    exception_message(cleanup_error),
+                )
+
+    def _run_scheduler(self) -> None:
         waiting_for_motion: List[_QueueEntry] = []
         ready_to_dispatch: List[_QueueEntry] = []
         next_poll_at = time.monotonic()
