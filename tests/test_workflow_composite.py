@@ -762,6 +762,31 @@ def test_deep_scope_cancellation_callbacks_do_not_require_recursive_stack_growth
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+def test_failed_cancellation_callback_does_not_skip_remaining_scope_notifications(
+    failure, caplog
+):
+    async def scenario():
+        parent = ActionContext("run", "parent", lambda feedback: None)
+        child = ActionContext("run", "child", lambda feedback: None)
+
+        def broken():
+            raise failure("scope cancellation callback interrupted")
+
+        try:
+            parent._add_cancel_callback(broken)
+            parent._add_cancel_callback(lambda: child._request_cancel("parent stopped"))
+            assert parent._request_cancel("cancelled")
+            assert child.cancel_requested and child.cancel_reason == "parent stopped"
+            assert "scope cancellation callback interrupted" in caplog.text
+            assert not parent._request_cancel("cancelled again")
+        finally:
+            parent._finish()
+            child._finish()
+
+    asyncio.run(scenario())
+
+
 def test_scope_fingerprint_tracks_inner_fixed_inputs_and_action_versions(tmp_path):
     async def record(context, inputs):
         return inputs
