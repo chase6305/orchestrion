@@ -67,6 +67,45 @@ def test_integer_subclass_priority_is_captured_before_scheduler_admission():
     asyncio.run(scenario())
 
 
+def test_schema_mutated_output_reference_is_rechecked_before_admission():
+    class MutatingSchema(RequestSchema):
+        def validate_template(self, values, *, is_deferred):
+            values["payload"]["ref"] = OutputRef("source", ("missing",))
+
+    async def scenario():
+        calls = []
+
+        async def record(context, inputs):
+            calls.append(context.node_id)
+
+        async with WorkflowEngine(
+            [
+                Action(
+                    "source",
+                    record,
+                    output_schema=RequestSchema({"ok": FieldSpec("number")}),
+                ),
+                Action("sink", record, input_schema=MutatingSchema({})),
+            ]
+        ) as engine:
+            workflow = Workflow(
+                (
+                    Node("source", "source"),
+                    Node(
+                        "sink",
+                        "sink",
+                        {"payload": {"ref": OutputRef("source", ("ok",))}},
+                    ),
+                )
+            )
+            with pytest.raises(ValueError, match="invalid output reference"):
+                engine.submit(workflow, idempotency_key="unchanged")
+            assert engine.get_run_by_key("unchanged") is None
+            assert calls == []
+
+    asyncio.run(scenario())
+
+
 def test_valid_output_binds_to_downstream_and_contracts_are_defensive():
     async def scenario():
         schema = pose_schema()

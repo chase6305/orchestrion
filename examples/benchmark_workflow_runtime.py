@@ -68,10 +68,15 @@ async def _cancel_burst(count):
             run = engine.get_run_by_key("burst")
 
             def cancel():
+                received_at = time.perf_counter()
+                accepted = run.cancel()
+                completed_at = time.perf_counter()
                 cancellation.append(
                     {
-                        "accepted": run.cancel(),
-                        "response_seconds": time.perf_counter() - first_call_at,
+                        "accepted": accepted,
+                        "response_seconds": completed_at - first_call_at,
+                        "callback_delay_seconds": received_at - first_call_at,
+                        "cancellation_seconds": completed_at - received_at,
                     }
                 )
 
@@ -102,6 +107,7 @@ async def _cancel_burst(count):
     finally:
         loop.set_task_factory(previous_factory)
         await engine.aclose(5)
+        engine.prune_idempotency_keys(0)
 
 
 async def _checkpoint_capture():
@@ -139,9 +145,12 @@ async def benchmark(counts, payload_items, repeats):
         samples = [await _cancel_burst(count) for _ in range(repeats)]
         row = dict(samples[0])
         if row["supported"]:
-            row["response_seconds"] = statistics.median(
-                sample["response_seconds"] for sample in samples
-            )
+            for metric in (
+                "response_seconds",
+                "callback_delay_seconds",
+                "cancellation_seconds",
+            ):
+                row[metric] = statistics.median(sample[metric] for sample in samples)
             row["calls_before_cancel"] = statistics.median(
                 sample["calls_before_cancel"] for sample in samples
             )

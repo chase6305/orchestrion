@@ -1,5 +1,7 @@
 name: Bounded workflow runtime comparison
 
+# Second probe: compare stable reference reuse and separate callback latency.
+
 on:
   push:
     branches: [optimize-async-resource-lifecycle-20261112]

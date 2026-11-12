@@ -71,6 +71,7 @@ def compile_workflow(
     if len(workflow.nodes) > max_nodes:
         raise ValueError("workflow exceeds max_nodes_per_run")
     nodes: Dict[str, CompiledNode] = {}
+    stable_references: Dict[str, Tuple[OutputRef, ...]] = {}
     for original in workflow.nodes:
         # Re-snapshot even frozen definitions: nested dictionaries are mutable.
         node = replace(original)
@@ -99,6 +100,10 @@ def compile_workflow(
                 schema.validate_template(node.inputs, is_deferred=_is_output_reference)
             else:
                 schema.validate(dict(node.inputs))
+        elif references:
+            # With no schema hook, the owned input snapshot cannot change during
+            # validation. Reuse the references instead of walking its JSON twice.
+            stable_references[node.node_id] = references
         nodes[node.node_id] = CompiledNode(node, dependencies, claims, action.version)
 
     successors = {node_id: [] for node_id in nodes}
@@ -109,7 +114,13 @@ def compile_workflow(
             if dependency not in nodes:
                 raise ValueError("unknown dependency: " + dependency)
             successors[dependency].append(node_id)
-        for reference in _output_references(compiled.node.inputs):
+        if actions[compiled.node.action].input_schema is None:
+            references = stable_references.get(node_id, ())
+        else:
+            # Custom validators can mutate the supplied template. Preserve the
+            # final path checks against that template rather than a stale cache.
+            references = _output_references(compiled.node.inputs)
+        for reference in references:
             schema = actions[nodes[reference.node_id].node.action].output_schema
             if schema is not None:
                 try:
