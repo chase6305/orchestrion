@@ -135,7 +135,7 @@ class ActionContext:
     async def sleep(self, delay: float) -> None:
         """An interruptible positive delay, useful for cooperative adapters."""
         self._check_loop()
-        _timeout(delay)
+        delay = _timeout(delay)
         if delay is None:
             raise ValueError("delay must be positive")
         self.raise_if_cancelled()

@@ -7,6 +7,7 @@ import pytest
 from orchestrion import CommandValidationError, FieldSpec, RequestSchema
 from orchestrion.workflow import (
     Action,
+    ActionOutcome,
     BlockingAction,
     ExecutionUncertain,
     FailurePolicy,
@@ -188,6 +189,56 @@ def test_resource_quantities_capture_base_integers_before_reservation_arithmetic
             assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
             assert engine.scheduler_snapshot()["running_actions"] == 0
             assert engine.scheduler_snapshot()["scheduler_error"] is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("base", [int, float])
+@pytest.mark.parametrize("node_stop", [False, True])
+def test_timer_budgets_capture_plain_numbers_without_changing_integral_types(
+    base, node_stop
+):
+    class Budget(base):
+        def __radd__(self, other):
+            raise RuntimeError("custom timer arithmetic")
+
+    class Delay(float):
+        def __radd__(self, other):
+            raise RuntimeError("custom delay arithmetic")
+
+    async def scenario():
+        calls = []
+
+        async def record(context, inputs):
+            calls.append("entered")
+            await context.sleep(Delay(0.001))
+            context._request_cancel("cancelled")
+            calls.append("stopping")
+            return ActionOutcome.cancelled("device stopped")
+
+        node = Node(
+            "record",
+            "record",
+            timeout=Budget(1),
+            stop_timeout=Budget(1) if node_stop else None,
+        )
+        workflow = Workflow((node,), timeout=Budget(1))
+        assert type(node.timeout) is base
+        if node_stop:
+            assert type(node.stop_timeout) is base
+        else:
+            assert node.stop_timeout is None
+        assert type(workflow.timeout) is base
+        engine = WorkflowEngine([Action("record", record)], stop_timeout=Budget(1))
+        try:
+            run = engine.submit(workflow, idempotency_key="captured-budgets")
+            assert (await run.wait(Budget(1))).status is RunStatus.CANCELLED
+            assert calls == ["entered", "stopping"]
+            assert engine.scheduler_snapshot()["scheduler_error"] is None
+            assert engine.scheduler_snapshot()["running_actions"] == 0
+            assert engine.submit(workflow, idempotency_key="captured-budgets") is run
+        finally:
+            await engine.aclose(Budget(1))
 
     asyncio.run(scenario())
 

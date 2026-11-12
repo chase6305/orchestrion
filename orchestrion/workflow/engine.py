@@ -86,8 +86,7 @@ class WorkflowEngine:
         max_output_bytes_per_node: Optional[int] = None,
         max_feedback_bytes_per_report: Optional[int] = None,
     ) -> None:
-        _timeout(stop_timeout)
-        self._stop_timeout = stop_timeout
+        self._stop_timeout = _timeout(stop_timeout)
         self._stop_timers = {}
         self._draining = set()
         for label, limit in (
@@ -580,7 +579,7 @@ class WorkflowEngine:
         and must be reconciled externally even after this method returns.
         """
         self._check_loop()
-        _timeout(timeout)
+        timeout = _timeout(timeout)
         self._check_external_wait()
         self._check_driver()
         self._closed = True

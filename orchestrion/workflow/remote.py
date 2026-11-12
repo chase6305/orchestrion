@@ -100,22 +100,24 @@ class TicketAction:
         stop_timeout: float = 5.0,
         max_query_errors: int = 3,
     ) -> None:
+        budgets = {}
         for name, value in (
             ("poll_interval", poll_interval),
             ("rpc_timeout", rpc_timeout),
             ("stop_timeout", stop_timeout),
         ):
-            _timeout(value)
+            value = _timeout(value)
             if value is None:
                 raise ValueError(name + " must be positive")
+            budgets[name] = value
         _positive_int(max_query_errors, "max_query_errors")
         for method in ("submit", "query", "cancel"):
             if not inspect.iscoroutinefunction(getattr(backend, method, None)):
                 raise TypeError("backend.{} must be async".format(method))
         self._backend = backend
-        self._poll_interval = poll_interval
-        self._rpc_timeout = rpc_timeout
-        self._stop_timeout = stop_timeout
+        self._poll_interval = budgets["poll_interval"]
+        self._rpc_timeout = budgets["rpc_timeout"]
+        self._stop_timeout = budgets["stop_timeout"]
         self._max_query_errors = max_query_errors
 
     async def _query(self, context: ActionContext, ticket: str, budget: float, on_stop):
