@@ -248,7 +248,11 @@ class TaskPilot:
                 self._stop_event.set()
             self._cancel_nonterminal("TaskPilot initialization failed")
             self._rollback_initialization(initialized_tasks)
-            self._bg_thread = None
+            # An instrumented start() can launch the worker before reporting a
+            # failure. Retain that owner until it exits so a retry cannot publish
+            # running state that resurrects the old scheduler behind its gate.
+            if self._bg_thread is None or not self._bg_thread.is_alive():
+                self._bg_thread = None
             raise
         finally:
             self._scheduler_ready.set()
