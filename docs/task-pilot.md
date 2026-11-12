@@ -42,6 +42,8 @@ mutable options changed after construction. Rejected options log and return `-1`
 without reserving an ID or idempotency key. Completion reads and failures are
 shared by requests waiting on the same component within one scheduler pass;
 later passes read fresh state so a recovered adapter can make progress.
+Transient main-state query failures keep dependent requests waiting and log only
+when the diagnostic changes; successful queries reset that suppression.
 
 An unexpected pilot scheduler failure logs the error, closes admission, cancels
 nonterminal local requests and attempts cleanup of every peripheral and the robot.

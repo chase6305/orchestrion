@@ -233,6 +233,71 @@ def test_motion_progress_failures_are_shared_within_one_pass_and_recover(
         assert synced.calls == [{"retry": True}]
 
 
+def test_repeated_main_progress_errors_log_changes_and_reset_after_recovery(caplog):
+    class Robot(RobotTaskStub):
+        failure = "controller offline"
+
+        def query_state(self):
+            if self.failure is not None:
+                raise RuntimeError(self.failure)
+            return super().query_state()
+
+    robot = Robot()
+    synchronized, working = RecordingTask(), RecordingTask()
+    with TaskPilot(
+        robot, {"synced": synchronized, "working": working}, poll_interval=5
+    ) as pilot:
+        request_id = pilot.call_srv_async(
+            "synced", sync_option=MoveSyncOption.sync_w_explicit_id(0)
+        )
+
+        def next_pass():
+            pilot._on_component_change()
+            marker = pilot.call_srv_async(
+                "working", sync_option=MoveSyncOption.no_sync()
+            )
+            assert (
+                pilot.wait_request(marker, timeout=1).status is RequestStatus.SUCCEEDED
+            )
+
+        for _ in range(3):
+            next_pass()
+        assert pilot.query_request(request_id).status is RequestStatus.WAITING_FOR_MOVE
+
+        def errors():
+            return [
+                record.getMessage()
+                for record in caplog.records
+                if "Failed to query robot state" in record.getMessage()
+            ]
+
+        assert errors() == ["Failed to query robot state: controller offline"]
+
+        robot.failure = "controller timed out"
+        next_pass()
+        assert errors()[-1] == "Failed to query robot state: controller timed out"
+        assert len(errors()) == 2
+        robot.failure = None
+        next_pass()
+        assert (
+            pilot.wait_request(request_id, timeout=1).status is RequestStatus.SUCCEEDED
+        )
+
+        robot.failure = "controller offline"
+        request_id = pilot.call_srv_async(
+            "synced", sync_option=MoveSyncOption.sync_w_explicit_id(0)
+        )
+        next_pass()
+        assert errors()[-1] == "Failed to query robot state: controller offline"
+        assert len(errors()) == 3
+        robot.failure = None
+        next_pass()
+        assert (
+            pilot.wait_request(request_id, timeout=1).status is RequestStatus.SUCCEEDED
+        )
+        assert pilot.is_running
+
+
 @pytest.mark.parametrize(
     "changes",
     [

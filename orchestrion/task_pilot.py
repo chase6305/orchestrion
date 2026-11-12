@@ -95,6 +95,7 @@ class TaskPilot:
         self._wake_event = threading.Event()
         self._stop_event = threading.Event()
         self._scheduler_ready = threading.Event()
+        self._last_motion_query_error: Optional[str] = None
         self._bg_thread: Optional[threading.Thread] = None
         self._initialized = False
         self._lifecycle_epoch = 0
@@ -200,6 +201,7 @@ class TaskPilot:
             )
         self._stop_event.clear()
         self._wake_event.clear()
+        self._last_motion_query_error = None
         try:
             self._robot_task.initialize()
         except Exception:
@@ -1173,7 +1175,12 @@ class TaskPilot:
                 main_state = self._robot_task.query_state()
             except Exception as exc:
                 # A transient main-state failure leaves its requests waiting.
-                log_error("Failed to query robot state: %s", exception_message(exc))
+                error = exception_message(exc)
+                if error != self._last_motion_query_error:
+                    log_error("Failed to query robot state: %s", error)
+                    self._last_motion_query_error = error
+            else:
+                self._last_motion_query_error = None
 
         # Index shared sequences only within this pass. Sets and short batches
         # keep their existing membership lookup without an extra allocation.

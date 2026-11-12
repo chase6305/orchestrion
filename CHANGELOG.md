@@ -21,6 +21,7 @@
   share bad completion snapshots across dependent requests within each pass.
   Contain pilot scheduler failures, close admission, cancel local pending results
   and attempt all device cleanup even when logging fails.
+  Log changed transient main-state query errors and reset suppression on recovery.
 
 - Reduce JSON snapshot overhead with direct string encoding and one-pass
   dictionary copying. Count actual copied entries and ignore custom string lengths
