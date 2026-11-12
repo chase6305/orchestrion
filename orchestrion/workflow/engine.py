@@ -988,11 +988,15 @@ class WorkflowEngine:
             self._wake.set()
         exception = None if worker.cancelled() else worker.exception()
         if run._results[item.node.node_id].status.terminal:
-            if exception is not None:
+            if exception is not None or worker.cancelled():
                 # The action outcome can be confirmed before successor admission
                 # fails. Preserve that outcome and stop the remaining scheduler
                 # work rather than leaving a graph waiting with no wake source.
-                error = "action completion failed: " + _error_text(exception)
+                error = (
+                    "CancelledError: action completion interrupted"
+                    if worker.cancelled()
+                    else "action completion failed: " + _error_text(exception)
+                )
                 log_error("%s", error)
                 self._fail_scheduler(error)
             return
