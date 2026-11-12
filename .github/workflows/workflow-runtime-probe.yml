@@ -1,6 +1,6 @@
 name: Bounded workflow runtime comparison
 
-# Sixth probe: include completion accounting in eager throughput comparisons.
+# Final probe: include captured progress and all completed ownership fixes.
 
 on:
   push:
