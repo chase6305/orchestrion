@@ -486,6 +486,38 @@ def test_completed_scope_releases_checkpoint_data_when_sdk_retains_context():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("durable", [False, True])
+def test_scoped_checkpoint_preserves_the_first_captured_sdk_ticket(durable, tmp_path):
+    async def scenario():
+        captured = []
+
+        class Ticket(dict):
+            def items(self):
+                value = "accepted-ticket" if not captured else "changed-ticket"
+                captured.append(value)
+                return {"ticket": value}.items()
+
+        async def submit(context, inputs):
+            assert context.checkpoint(Ticket()) is None
+
+        scoped = workflow_action(
+            "scope", Workflow((Node("submit", "submit"),)), [Action("submit", submit)]
+        )
+        storage = SQLiteJournal(tmp_path / "scope.db") if durable else nullcontext(None)
+        with storage as journal:
+            async with WorkflowEngine([scoped], journal=journal) as engine:
+                run = engine.submit(Workflow((Node("scope", "scope"),)))
+                result = await run.wait(1)
+                assert result.status is RunStatus.SUCCEEDED
+                assert captured == ["accepted-ticket"]
+                expected = {"scope_nodes": {"submit": {"ticket": "accepted-ticket"}}}
+                assert result.nodes["scope"].checkpoint == expected
+                if journal is not None:
+                    assert journal.get_run(run.run_id)["nodes"][0]["checkpoint"] == expected
+
+    asyncio.run(scenario())
+
+
 def test_blocking_sdk_in_scope_uses_thread_cancellation_and_stable_operation_ids():
     async def scenario():
         release = threading.Event()

@@ -53,6 +53,10 @@ already-started calls drain while retaining claims. Async handlers must keep the
 event loop free. Express ordering through graph dependencies: an action cannot
 wait on a run or close its own engine.
 
+Dispatch runs in bounded turns so large ready batches, including eager tasks,
+yield to cancellation callbacks and timers. Follow-up submissions from an action
+reuse the scheduler being started rather than recursively starting another one.
+
 Unexpected coroutine cancellation also keeps a running `BlockingAction` in
 engine accounting until its SDK call exits. Its cancellation token prevents queued
 wrappers from entering device I/O. Configure `stop_timeout` to report `UNKNOWN`
@@ -235,6 +239,13 @@ and callbacks are released when the scope finishes. Repeated native cancellation
 of the outer adapter still waits for every inner handler to exit. A stop deadline
 can publish `UNKNOWN` while that cleanup continues; the outer worker remains
 counted and reconciliation remains blocked until cleanup finishes.
+
+Completed inner contexts ignore late progress, including SDK snapshots that
+overlap completion. Scoped checkpoints reuse the delegate's first captured JSON
+snapshot. A rejected parent checkpoint leaves the accepted accumulator unchanged,
+so an oversized update cannot poison later valid updates. Recovery data stays
+available during draining and is released when the scoped adapter actually exits,
+even if the SDK retains its old context.
 
 The output contains `nodes[step_id]` with `status`, `output` and `error`. Use
 `run.operation_id(node_id)` for encoded scoped IDs. Inner plans, action versions

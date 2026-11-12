@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Bound workflow scheduling turns so eager action bursts yield to cancellation
+  and timers; reuse the starting scheduler for reentrant follow-up submissions.
+- Ignore completed inner nodes' late progress, isolate rejected scope checkpoint
+  updates, capture SDK checkpoint data once and release it after scope cleanup.
+
 - Log and drop invalid or oversized optional workflow progress instead of raising
   into device handlers. Count these reports and contain cancelled progress sinks
   without changing action outcomes or releasing uncertain device claims.

@@ -195,6 +195,10 @@ class ActionContext:
         A still-draining adapter may record a late ticket after a stop deadline;
         this does not change UNKNOWN or release its resources.
         """
+        self._record_checkpoint(data)
+
+    def _record_checkpoint(self, data: Any) -> Any:
+        """Record once and return the owned snapshot for enclosing scopes."""
         if not self._active and not self._late_checkpoint:
             raise RuntimeError("ActionContext has already completed")
         if asyncio.get_running_loop() is not self._loop:
@@ -204,6 +208,7 @@ class ActionContext:
         snapshot = _snapshot(data, max_bytes=65536)
         if self._checkpoint is not None:
             self._checkpoint(snapshot)
+        return snapshot
 
     def _check_loop(self) -> None:
         if not self._active:

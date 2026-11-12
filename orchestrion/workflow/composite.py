@@ -21,7 +21,6 @@ from .model import (
     RunStatus,
     Workflow,
     _operation_id,
-    _snapshot,
 )
 
 
@@ -120,8 +119,8 @@ class _ScopedContext(ActionContext):
         self._delegate._remove_cancel_callback(callback)
 
     def checkpoint(self, data: Any) -> None:
-        self._delegate.checkpoint(data)
-        self._scope_checkpoint(self.node_id, data)
+        snapshot = self._delegate._record_checkpoint(data)
+        self._scope_checkpoint(self.node_id, snapshot)
 
 
 def workflow_action(
@@ -214,8 +213,9 @@ class _WorkflowAction:
         def checkpoint(node_id, data):
             # Publish the accumulator only after the parent accepts and commits
             # the whole snapshot. A rejected update must not poison later ones.
+            # The delegate already captured data, so SDK hooks run only once.
             candidate = dict(checkpoints)
-            candidate[node_id] = _snapshot(data)
+            candidate[node_id] = data
             context.checkpoint({"scope_nodes": candidate})
             checkpoints[node_id] = candidate[node_id]
 
