@@ -6,8 +6,13 @@ import time
 from typing import Callable, Dict, Optional
 
 from orchestrion.health import DeviceHealth
-from orchestrion.tasks.function_call_task import InPlaceFunctionCallTask
+from orchestrion.tasks.function_call_task import (
+    CallResult,
+    InPlaceFunctionCallTask,
+    TaskFailure,
+)
 from orchestrion.utils.errors import exception_message
+from orchestrion.utils.logger import log_error
 from orchestrion.utils.numeric import is_finite_real
 
 
@@ -88,35 +93,45 @@ class PollingTask(InPlaceFunctionCallTask):
 
     def _poll_loop(self) -> None:
         while not self._poll_stop.is_set():
-            previous_sample = None
             try:
-                sample = self._poll()
-                if sample is not None and not isinstance(sample, dict):
-                    raise TypeError("poll callable must return a dictionary or None")
-                sample = copy.deepcopy(sample)
-                if sample is not None and not isinstance(sample, dict):
-                    raise TypeError("copied poll sample must be a dictionary or None")
-                with self._sample_lock:
-                    previous_sample = self._latest_sample
-                    self._latest_sample = sample
-                    self._observed_at = time.time()
-                    self._last_error = None
-                    self._consecutive_failures = 0
+                self._poll_once()
             except Exception as exc:
-                message = exception_message(exc)
-                with self._sample_lock:
-                    self._last_error = message
-                    self._consecutive_failures += 1
-            # Release retired and rejected SDK samples without the cache lock.
-            del previous_sample
-            sample = None
+                self._record_poll_error(exception_message(exc))
             self._notify_completion()
             self._poll_stop.wait(self._interval)
 
-    def _call_fn(self, request_id: int, content: Optional[Dict]) -> Optional[Dict]:
+    def _poll_once(self) -> None:
+        """Publish valid samples, releasing SDK values before the next idle wait."""
+        sample = self._poll()
+        if sample is not None and not isinstance(sample, dict):
+            self._record_poll_error("poll callable must return a dictionary or None")
+            return
+        sample = copy.deepcopy(sample)
+        if sample is not None and not isinstance(sample, dict):
+            self._record_poll_error("copied poll sample must be a dictionary or None")
+            return
+        with self._sample_lock:
+            previous_sample = self._latest_sample
+            self._latest_sample = sample
+            self._observed_at = time.time()
+            self._last_error = None
+            self._consecutive_failures = 0
+        del previous_sample
+
+    def _record_poll_error(self, message: str) -> None:
+        with self._sample_lock:
+            changed = self._last_error != message
+            self._last_error = message
+            self._consecutive_failures += 1
+        if changed:
+            log_error("Device polling failed: %s", message)
+
+    def _call_fn(self, request_id: int, content: Optional[Dict]) -> CallResult:
         with self._sample_lock:
             if self._observed_at is None:
-                raise RuntimeError(self._last_error or "No telemetry sample is available")
+                return TaskFailure(
+                    self._last_error or "No telemetry sample is available"
+                )
             sample = self._latest_sample
             observed_at = self._observed_at
         # Published samples are replaced, never mutated; copying needs no lock.

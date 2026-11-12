@@ -6,6 +6,7 @@ from .engine import WorkflowEngine, WorkflowRun
 from .journal import JournalError, JournalInUse, SQLiteJournal
 from .model import (
     ActionCancelled,
+    ActionOutcome,
     ActionOutputError,
     ExecutionUncertain,
     FailurePolicy,
@@ -34,6 +35,7 @@ __all__ = [
     "Action",
     "ActionCancelled",
     "ActionContext",
+    "ActionOutcome",
     "ActionOutputError",
     "BlockingAction",
     "ExecutionUncertain",

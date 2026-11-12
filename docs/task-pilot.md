@@ -6,7 +6,13 @@ Start with the [README example](../README.md#move-then-grip) or run
 
 ## Motion synchronization
 
-Pass a `MoveSyncOption` to `pilot.call_srv_async(service, content, sync_option)`:
+`pilot.call_srv_async(service, content, sync_option)` returns a nonnegative
+integer for an accepted request;
+`-1` means submission failed and an error was logged. Invalid arguments, missing
+services, unavailable motion state, preparation errors and concurrent shutdown
+leave request IDs and idempotency keys reusable. Do not pass `-1` to a result wait.
+
+Pass a `MoveSyncOption` to select synchronization:
 
 | Policy | Request becomes eligible when… |
 | --- | --- |
@@ -95,6 +101,33 @@ callback exposes device facts; metadata and schemas appear in
 `pilot.describe_services()` without device I/O. Run
 `python -m examples.simulated_multi_peripheral` for command, telemetry and health
 adapters.
+
+Return `TaskFailure` for a known device failure or confirmed cancellation:
+
+```python
+from orchestrion import TaskFailure
+
+
+def grip(request_id, command):
+    if not device.is_ready():
+        return TaskFailure("gripper is offline")
+    return {"closed": device.close_and_wait()}
+```
+
+Inline and threaded tasks contain SDK exceptions, retain an error response and
+log a failure once. `invoke_async()` reports acceptance, so it returns `True` even
+if accepted execution immediately fails. Invalid request IDs, unbound tasks and
+executor submission errors log and return `False` without consuming the ID.
+Read `peek_response()` for the actual outcome. `TaskFailure(..., cancelled=True)`
+sets the response's `cancelled` flag and maps to `RequestStatus.CANCELLED` in the
+pilot; ordinary failures map to `FAILED`. Running Python callbacks still need
+cooperative device cancellation. A timeout alone does not establish cancellation.
+
+Error messages are formatted once at the execution boundary, avoiding retained
+SDK tracebacks and repeated formatter calls during polling. A failing logging
+handler cannot suppress result storage or completion notifications. `PollingTask`
+logs changed polling errors once, preserves its last valid sample and resumes
+sampling after failures.
 
 Threaded tasks report `health="offline"` until bound to an executor and after
 stop. A `CallableTask` status callback may refine device health and availability;

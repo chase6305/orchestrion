@@ -7,6 +7,7 @@ import pytest
 
 from orchestrion.workflow import (
     Action,
+    ExecutionUncertain,
     JournalError,
     Node,
     NodeStatus,
@@ -149,6 +150,23 @@ def test_definite_rejection_is_failed_without_quarantine():
             assert result.status == RunStatus.FAILED
             assert "OperationRejected" in result.nodes["remote"].error
             assert not engine.resource_snapshot()["quarantined"]
+
+    asyncio.run(scenario())
+
+
+def test_explicit_backend_uncertainty_is_returned_without_query_retry():
+    async def scenario():
+        backend = FakeBackend()
+        backend.query_effects = [ExecutionUncertain("controller state is unknown")]
+        async with WorkflowEngine([Action("remote", TicketAction(backend))]) as engine:
+            run = engine.submit(Workflow((Node("remote", "remote"),)))
+            result = await run.wait(1)
+            assert result.status == RunStatus.NEEDS_ATTENTION
+            assert backend.queries == 1
+            assert result.nodes["remote"].error == (
+                "ExecutionUncertain: controller state is unknown"
+            )
+            engine.confirm_quiescent(run.operation_id("remote"), evidence="controller idle")
 
     asyncio.run(scenario())
 

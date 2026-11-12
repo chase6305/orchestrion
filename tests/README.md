@@ -27,6 +27,7 @@ Keep integration scenarios alongside the corresponding example or public API.
 | `test_modular_robot_task.py` | Module layout, atomic multi-arm submission and submodule synchronization |
 | `test_workflow.py` | DAG execution, resource arbitration, failure propagation and scaling |
 | `test_workflow_contracts.py` | Definitions, known input checks before dispatch, action schemas and output bindings |
+| `test_workflow_outcomes.py` | Returned failure/cancellation/unknown outcomes, output contracts, device ownership and logging faults |
 | `test_workflow_cancellation.py` | Caller cancellation, node/whole-run deadlines and stop confirmation |
 | `test_workflow_retention.py` | Completed graph/result retention and inherited background task contexts |
 | `test_workflow_lifecycle.py` | Engine/adapter lifecycle, task factories and scheduler failure cleanup |

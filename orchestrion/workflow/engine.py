@@ -12,6 +12,9 @@ from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from orchestrion.schema import CommandValidationError
+from orchestrion.utils.errors import exception_description as _error_text
+from orchestrion.utils.errors import exception_message
+from orchestrion.utils.logger import log_error
 
 from .actions import Action, ActionContext
 from .compiler import (
@@ -28,7 +31,7 @@ from .dispatch import DispatchBarrier
 from .journal import JournalError, SQLiteJournal
 from .model import (
     ActionCancelled,
-    ActionOutputError,
+    ActionOutcome,
     ExecutionUncertain,
     FailurePolicy,
     NodeStatus,
@@ -50,15 +53,6 @@ _ReadyEntry = Tuple[int, int, WorkflowRun, CompiledNode]
 _current_execution: ContextVar = ContextVar(
     "orchestrion_workflow_execution", default=()
 )
-
-
-def _error_text(error: BaseException) -> str:
-    """A broken SDK exception formatter must not strand the scheduler."""
-    try:
-        message = str(error)
-    except Exception:
-        message = "exception message is unavailable"
-    return "{}: {}".format(type(error).__name__, message)
 
 
 class WorkflowEngine:
@@ -927,55 +921,19 @@ class WorkflowEngine:
                     node_deadline, self._expire_node, run, node.node_id
                 )
             self._check_run_deadline(run)
-            context.raise_if_cancelled()
-            inputs = resolve_inputs(
-                node.inputs,
-                {key: run._results[key].output for key in item.dependencies},
-            )
-            if self._max_input_bytes is not None:
-                inputs = _snapshot(inputs, max_bytes=self._max_input_bytes)
-            action = self._actions[node.action]
-            if action.input_schema is not None:
-                inputs = action.input_schema.validate(inputs)
-                if not isinstance(inputs, dict):
-                    raise CommandValidationError(
-                        "validated action inputs must be a dictionary"
+            if context.cancel_requested:
+                status = NodeStatus.CANCELLED
+                error = context.cancel_reason
+            else:
+                outcome = await self._invoke_action(run, item, context, node_deadline)
+                if isinstance(outcome, ActionOutcome):
+                    status, output, error = (
+                        outcome.status,
+                        outcome.output,
+                        outcome.error,
                     )
-                # Schema copies or overrides can change the prepared payload.
-                inputs = _snapshot(inputs, max_bytes=self._max_input_bytes)
-            # Recheck after input preparation: a delayed event-loop timer must
-            # not allow a new device command to slip past an expired budget.
-            self._check_run_deadline(run)
-            if node_deadline is not None and self._loop.time() >= node_deadline:
-                self._expire_node(run, node.node_id)
-            context.raise_if_cancelled()
-            if self._journal is not None:
-                # Commit intent before effects; recheck the budget after fsync.
-                await self._dispatch_barrier.commit(run, run._results[node.node_id])
-                self._check_run_deadline(run)
-                if node_deadline is not None and self._loop.time() >= node_deadline:
-                    self._expire_node(run, node.node_id)
-                context.raise_if_cancelled()
-            context._handler_started = True
-            output = _snapshot(
-                await action.handler(context, inputs), max_bytes=self._max_output_bytes
-            )
-            if action.output_schema is not None:
-                # RequestSchema allows None as an empty command for legacy APIs;
-                # a declared object result requires an actual JSON object.
-                if not isinstance(output, dict):
-                    raise ActionOutputError("action output must be a dictionary")
-                try:
-                    validated_output = action.output_schema.validate(output)
-                except CommandValidationError as exc:
-                    raise ActionOutputError(str(exc)) from exc
-                # Retain only the final JSON copy after schema validation succeeds.
-                output = None
-                if not isinstance(validated_output, dict):
-                    raise ActionOutputError("action output must be a dictionary")
-                output = _snapshot(
-                    validated_output, max_bytes=self._max_output_bytes
-                )
+                else:
+                    output = outcome
         except ActionCancelled as exc:
             status = NodeStatus.CANCELLED
             error = _error_text(exc)
@@ -1019,6 +977,78 @@ class WorkflowEngine:
         ):
             self._stop_confirmation_expired(run, node.node_id, context)
         self._settle(run, item, context, status, output=output, error=error)
+
+    async def _invoke_action(
+        self,
+        run: WorkflowRun,
+        item: CompiledNode,
+        context: ActionContext,
+        node_deadline: Optional[float],
+    ) -> Any:
+        """Return expected validation/cancellation outcomes before final accounting."""
+        node = item.node
+        inputs = resolve_inputs(
+            node.inputs,
+            {key: run._results[key].output for key in item.dependencies},
+        )
+        if self._max_input_bytes is not None:
+            inputs = _snapshot(inputs, max_bytes=self._max_input_bytes)
+        action = self._actions[node.action]
+        if action.input_schema is not None:
+            inputs = action.input_schema.validate(inputs)
+            if not isinstance(inputs, dict):
+                return ActionOutcome.failed(
+                    "CommandValidationError: validated action inputs must be a dictionary"
+                )
+            inputs = _snapshot(inputs, max_bytes=self._max_input_bytes)
+        # Input preparation and durable fsync can delay the loop's timers.
+        self._check_run_deadline(run)
+        if node_deadline is not None and self._loop.time() >= node_deadline:
+            self._expire_node(run, node.node_id)
+        if context.cancel_requested:
+            return ActionOutcome.cancelled(context.cancel_reason)
+        if self._journal is not None:
+            commit_error = await self._dispatch_barrier.commit(
+                run, run._results[node.node_id]
+            )
+            if commit_error is not None:
+                return ActionOutcome.failed("JournalError: " + commit_error)
+            self._check_run_deadline(run)
+            if node_deadline is not None and self._loop.time() >= node_deadline:
+                self._expire_node(run, node.node_id)
+            if context.cancel_requested:
+                return ActionOutcome.cancelled(context.cancel_reason)
+        context._handler_started = True
+        result = await action.handler(context, inputs)
+        if isinstance(result, ActionOutcome):
+            if result.status != NodeStatus.SUCCEEDED:
+                return result
+            result = result.output
+        output = _snapshot(result, max_bytes=self._max_output_bytes)
+        if action.output_schema is not None:
+            if not isinstance(output, dict):
+                return ActionOutcome(
+                    NodeStatus.FAILED,
+                    output,
+                    "ActionOutputError: action output must be a dictionary",
+                )
+            try:
+                validated_output = action.output_schema.validate(output)
+            except Exception as exc:
+                error = (
+                    "ActionOutputError: " + exception_message(exc)
+                    if isinstance(exc, CommandValidationError)
+                    else _error_text(exc)
+                )
+                return ActionOutcome(NodeStatus.FAILED, output, error)
+            if not isinstance(validated_output, dict):
+                return ActionOutcome.failed(
+                    "ActionOutputError: action output must be a dictionary"
+                )
+            output = _snapshot(validated_output, max_bytes=self._max_output_bytes)
+        # Keep the ordinary success path allocation-free; explicit outcomes are
+        # needed only for failure, cancellation or uncertain device ownership.
+        return output
 
     def _settle(
         self,
@@ -1077,3 +1107,5 @@ class WorkflowEngine:
         if self._driver_error is not None and run._unfinished == 0:
             self._finish_run(run)
         self._wake.set()
+        if status in (NodeStatus.FAILED, NodeStatus.UNKNOWN, NodeStatus.TIMED_OUT):
+            log_error("Operation %s %s: %s", context.operation_id, status.value, error)

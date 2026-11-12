@@ -1,11 +1,11 @@
 """Retries preserve the original command despite mutations by a failed SDK call."""
 
 import threading
-from concurrent.futures import CancelledError, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from orchestrion import CallableTask, FieldSpec, RequestSchema, RetryPolicy
+from orchestrion import CallableTask, FieldSpec, RequestSchema, RetryPolicy, TaskFailure
 
 
 @pytest.mark.parametrize("with_schema", [False, True])
@@ -63,6 +63,7 @@ def test_stop_during_retry_input_copy_prevents_device_call():
         finally:
             resume.set()
             task.stop()
-        with pytest.raises(CancelledError, match="stopped"):
-            task._future_map[0].result(1)
+        outcome = task._future_map[0].result(1)
+        assert isinstance(outcome, TaskFailure) and outcome.cancelled
+        assert "stopped" in outcome.error
         assert not calls

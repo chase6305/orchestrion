@@ -7,12 +7,14 @@ from dataclasses import replace
 from typing import Any, Callable, Dict, Iterable, Optional
 
 from orchestrion.schema import RequestSchema
+from orchestrion.utils.errors import exception_description
 
 from .actions import Action, ActionContext
 from .compiler import compile_workflow, submission_fingerprint
 from .engine import WorkflowEngine
 from .model import (
     ActionCancelled,
+    ActionOutcome,
     ExecutionUncertain,
     Resource,
     ResourceClaim,
@@ -174,8 +176,12 @@ class _WorkflowAction:
 
     async def __call__(self, context: ActionContext, inputs: Dict[str, Any]) -> Any:
         if inputs:
-            raise ValueError("workflow_action uses a fixed plan and accepts no inputs")
-        context.raise_if_cancelled()
+            return ActionOutcome.failed(
+                "workflow_action uses a fixed plan and accepts no inputs"
+            )
+        context._check_loop()
+        if context.cancel_requested:
+            return ActionOutcome.cancelled(context.cancel_reason)
         checkpoints = {}
 
         def checkpoint(node_id, data):
@@ -199,6 +205,7 @@ class _WorkflowAction:
             **self._options,
         )
         try:
+            failure = None
             async with engine:
                 run = engine.submit(self._workflow)
 
@@ -209,13 +216,23 @@ class _WorkflowAction:
                 cancellation = asyncio.create_task(forward_cancel())
                 try:
                     result = await run.wait()
-                except BaseException:
-                    # Cancelling the wrapper cannot silently orphan its inner graph.
+                except asyncio.CancelledError as exc:
                     run.cancel()
-                    raise
+                    failure = ActionOutcome.unknown(exception_description(exc))
+                except Exception as exc:
+                    # The context manager still drains the cancelled graph before
+                    # returning an outcome to the outer engine.
+                    run.cancel()
+                    failure = ActionOutcome.failed(exception_description(exc))
                 finally:
                     cancellation.cancel()
                     await asyncio.gather(cancellation, return_exceptions=True)
+            if failure is not None:
+                if engine.resource_snapshot()["quarantined"]:
+                    return ActionOutcome.unknown(
+                        "scoped workflow contains unresolved device operations"
+                    )
+                return failure
             # wait() already isolated these outputs; the outer engine snapshots
             # the returned detail before retaining or binding it to later nodes.
             detail = {
@@ -240,24 +257,31 @@ class _WorkflowAction:
                 },
             )
             if engine.resource_snapshot()["quarantined"]:
-                raise ExecutionUncertain(
+                return ActionOutcome.unknown(
                     "scoped workflow contains unresolved device operations"
                 )
             if result.status == RunStatus.CANCELLED:
-                raise ActionCancelled("scoped workflow stopped")
+                return ActionOutcome.cancelled("scoped workflow stopped")
             if result.status != RunStatus.SUCCEEDED:
                 errors = "; ".join(
                     "{}: {}".format(node_id, node.error)
                     for node_id, node in result.nodes.items()
                     if node.error
                 )
-                raise WorkflowActionError(errors or "scoped workflow failed")
+                return ActionOutcome.failed(
+                    "WorkflowActionError: " + (errors or "scoped workflow failed")
+                )
             return detail
-        except ExecutionUncertain:
-            raise
+        except asyncio.CancelledError as exc:
+            return ActionOutcome.unknown(exception_description(exc))
+        except ExecutionUncertain as exc:
+            return ActionOutcome.unknown(exception_description(exc))
+        except ActionCancelled as exc:
+            return ActionOutcome.cancelled(exception_description(exc))
         except Exception as exc:
             if engine._quarantined or engine._workers or engine._runs:
-                raise ExecutionUncertain(
-                    "scoped workflow could not confirm all operations stopped"
-                ) from exc
-            raise
+                return ActionOutcome.unknown(
+                    "scoped workflow could not confirm all operations stopped: "
+                    + exception_description(exc)
+                )
+            return ActionOutcome.failed(exception_description(exc))

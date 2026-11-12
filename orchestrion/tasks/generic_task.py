@@ -3,7 +3,8 @@ import json
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Optional
 
-from orchestrion.utils.logger import logger
+from orchestrion.utils.errors import exception_message
+from orchestrion.utils.logger import log_error
 from orchestrion.utils.types import PeekResponseResult
 
 
@@ -51,7 +52,11 @@ class GenericTask(ABC):
 
     @abstractmethod
     def invoke_async(self, request_id: int, content: Optional[Dict] = None) -> bool:
-        """Submit a request and return whether it was accepted."""
+        """Return acceptance; retain execution errors for peek_response().
+
+        A rejected submission returns False without reserving the request ID.
+        Accepted work returns True even when it immediately records a failure.
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -85,5 +90,5 @@ class GenericTask(ABC):
         if callback is not None:
             try:
                 callback()
-            except Exception:
-                logger.exception("Task completion callback failed")
+            except Exception as exc:
+                log_error("Task completion callback failed: %s", exception_message(exc))

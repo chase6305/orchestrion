@@ -2,15 +2,16 @@ import concurrent.futures
 import copy
 import threading
 from abc import abstractmethod
+from dataclasses import dataclass
 from functools import partial
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Union
 
 from orchestrion.health import DeviceHealth
 from orchestrion.retry import RetryPolicy
 from orchestrion.schema import RequestSchema
 from orchestrion.tasks.generic_task import GenericTask
 from orchestrion.utils.errors import exception_message
-from orchestrion.utils.logger import logger
+from orchestrion.utils.logger import log_error
 from orchestrion.utils.request_history import RequestHistory
 from orchestrion.utils.result_retention import ResultRetention
 from orchestrion.utils.types import PeekResponseResult, PeekResponseResultType
@@ -29,6 +30,33 @@ def _validate_request_id(request_id: int) -> None:
         raise TypeError("request_id must be an integer")
     if request_id < 0:
         raise ValueError("request_id must be non-negative")
+
+
+@dataclass(frozen=True)
+class TaskFailure:
+    """Return a failed or cooperatively cancelled call without raising in a worker."""
+
+    error: str
+    cancelled: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.error, str):
+            raise TypeError("error must be a string")
+        if not isinstance(self.cancelled, bool):
+            raise TypeError("cancelled must be a bool")
+
+
+CallResult = Optional[Union[Dict, TaskFailure]]
+
+
+def _accept_request_id(request_id: int) -> bool:
+    if isinstance(request_id, bool) or not isinstance(request_id, int):
+        log_error("Cannot submit request: request_id must be an integer")
+        return False
+    if request_id < 0:
+        log_error("Cannot submit request: request_id must be non-negative")
+        return False
+    return True
 
 
 class InPlaceFunctionCallTask(GenericTask):
@@ -57,13 +85,14 @@ class InPlaceFunctionCallTask(GenericTask):
         )
 
     @abstractmethod
-    def _call_fn(self, request_id: int, content: Optional[Dict]) -> Optional[Dict]:
+    def _call_fn(self, request_id: int, content: Optional[Dict]) -> CallResult:
         """Execute the request and return its response."""
         raise NotImplementedError
 
     def invoke_async(self, request_id: int, content: Optional[Dict] = None) -> bool:
-        """Execute inline and retain the response; reject duplicate request IDs."""
-        _validate_request_id(request_id)
+        """Execute inline; retain execution failures and return acceptance only."""
+        if not _accept_request_id(request_id):
+            return False
         with self._lock:
             if not self._request_history.add(request_id):
                 return False
@@ -71,15 +100,25 @@ class InPlaceFunctionCallTask(GenericTask):
             self._pending_request_ids.add(request_id)
         try:
             response_content = self._call_fn(request_id, content)
-        except Exception as exc:
-            self._store_response(
-                PeekResponseResult(
-                    PeekResponseResultType.ErrorUnknown,
-                    request_id=request_id,
-                    error=exception_message(exc),
-                )
+        except concurrent.futures.CancelledError as exc:
+            response_content = TaskFailure(
+                exception_message(exc) or "Request cancelled", cancelled=True
             )
-            raise
+        except Exception as exc:
+            response_content = TaskFailure(exception_message(exc))
+        if isinstance(response_content, TaskFailure):
+            response = PeekResponseResult(
+                PeekResponseResultType.ErrorUnknown,
+                request_id=request_id,
+                error=response_content.error,
+                cancelled=response_content.cancelled,
+            )
+            # Store and notify before logging; observers must see the terminal
+            # response even if an application's logging handler fails.
+            self._store_response(response)
+            if not response_content.cancelled:
+                log_error("Request %s failed: %s", request_id, response_content.error)
+            return True
         self._store_response(
             PeekResponseResult(
                 PeekResponseResultType.ResponseFound,
@@ -199,27 +238,41 @@ class ThreadedPoolFunctionCallTask(GenericTask):
             future.cancel()
 
     @abstractmethod
-    def _call_fn(self, request_id: int, content: Optional[Dict]) -> Optional[Dict]:
+    def _call_fn(self, request_id: int, content: Optional[Dict]) -> CallResult:
         """Execute the request and return its response."""
         raise NotImplementedError
 
     def invoke_async(self, request_id: int, content: Optional[Dict] = None) -> bool:
         """Submit once; a failed executor submission leaves the request ID reusable."""
-        _validate_request_id(request_id)
+        if not _accept_request_id(request_id):
+            return False
         with self._lock:
             executor = self._borrowed_executor
             if executor is None:
-                raise RuntimeError("Task must be initialized before use")
-            if request_id in self._request_history:
+                submission_error = "Task must be initialized before use"
+            elif request_id in self._request_history:
                 return False
-            # Commit the ID only after submission succeeds. Holding the task lock
-            # prevents another caller reserving it and avoids copying the entire
-            # sparse-ID history on every submission.
-            future = self._submit_call(executor, request_id, content)
-            self._request_history.add(request_id)
-            self._latest_request_id = max(self._latest_request_id, request_id)
-            self._future_map[request_id] = future
-            self._pending_futures[request_id] = future
+            else:
+                submission_error = None
+                # Commit the ID only after submission succeeds. Holding the lock
+                # prevents another caller from reserving the same ID.
+                try:
+                    future = self._submit_call(executor, request_id, content)
+                except Exception as exc:
+                    submission_error = exc
+                else:
+                    self._request_history.add(request_id)
+                    self._latest_request_id = max(self._latest_request_id, request_id)
+                    self._future_map[request_id] = future
+                    self._pending_futures[request_id] = future
+        if submission_error is not None:
+            message = (
+                exception_message(submission_error)
+                if isinstance(submission_error, BaseException)
+                else submission_error
+            )
+            log_error("Request %s was not submitted: %s", request_id, message)
+            return False
         # Register outside the lock: add_done_callback() invokes synchronously
         # when a very fast future has already completed.
         future.add_done_callback(partial(self._on_future_done, request_id))
@@ -231,7 +284,16 @@ class ThreadedPoolFunctionCallTask(GenericTask):
         request_id: int, content: Optional[Dict],
     ) -> concurrent.futures.Future:
         """Prepare a call while submission is protected by the task lock."""
-        return executor.submit(self._call_fn, request_id, content)
+        return executor.submit(self._capture_call, request_id, content)
+
+    def _capture_call(self, request_id: int, content: Optional[Dict]) -> CallResult:
+        """Keep SDK failures inside a completed result instead of a future exception."""
+        try:
+            return self._call_fn(request_id, content)
+        except concurrent.futures.CancelledError as exc:
+            return TaskFailure(exception_message(exc) or "Request cancelled", True)
+        except Exception as exc:
+            return TaskFailure(exception_message(exc))
 
     def _on_future_done(
         self, request_id: int, future: concurrent.futures.Future
@@ -255,9 +317,16 @@ class ThreadedPoolFunctionCallTask(GenericTask):
         # code. Keep them outside the task lock, and always notify observers.
         try:
             if failed:
-                logger.error(
+                exception = future.exception()
+                message = (
+                    exception_message(exception)
+                    if exception is not None
+                    else future.result().error
+                )
+                log_error(
                     "Request %s failed: %s",
-                    request_id, exception_message(future.exception()),
+                    request_id,
+                    message,
                 )
         finally:
             self._notify_completion()
@@ -273,7 +342,11 @@ class ThreadedPoolFunctionCallTask(GenericTask):
         except concurrent.futures.CancelledError:
             outcome = "cancelled"
         else:
-            outcome = "failed" if error is not None else "succeeded"
+            result = None if error is not None else future.result()
+            if isinstance(result, TaskFailure):
+                outcome = "cancelled" if result.cancelled else "failed"
+            else:
+                outcome = "failed" if error is not None else "succeeded"
         self._pending_futures.pop(request_id)
         self._outcomes[request_id] = outcome
         self._outcome_counts[outcome] += 1
@@ -308,7 +381,10 @@ class ThreadedPoolFunctionCallTask(GenericTask):
             )
         if future.cancelled():
             return PeekResponseResult(
-                PeekResponseResultType.ErrorUnknown, request_id=request_id
+                PeekResponseResultType.ErrorUnknown,
+                request_id=request_id,
+                error="Request cancelled before execution",
+                cancelled=True,
             )
         exception = future.exception()
         if exception is not None:
@@ -317,10 +393,18 @@ class ThreadedPoolFunctionCallTask(GenericTask):
                 request_id=request_id,
                 error=exception_message(exception),
             )
+        result = future.result()
+        if isinstance(result, TaskFailure):
+            return PeekResponseResult(
+                PeekResponseResultType.ErrorUnknown,
+                request_id=request_id,
+                error=result.error,
+                cancelled=result.cancelled,
+            )
         return PeekResponseResult(
             PeekResponseResultType.ResponseFound,
             request_id=request_id,
-            content=copy.deepcopy(future.result()),
+            content=copy.deepcopy(result),
         )
 
     def cancel_request(self, request_id: int) -> bool:
@@ -372,7 +456,7 @@ class CallableTask(ThreadedPoolFunctionCallTask):
 
     def __init__(
         self,
-        call: Callable[[int, Optional[Dict]], Optional[Dict]],
+        call: Callable[[int, Optional[Dict]], CallResult],
         status: Optional[Callable[[], Optional[Dict]]] = None,
         max_result_count: int = -1,
         retry_policy: Optional[RetryPolicy] = None,
@@ -448,34 +532,34 @@ class CallableTask(ThreadedPoolFunctionCallTask):
 
     def _call_in_lifecycle(
         self, request_id: int, content: Optional[Dict], stop_event: threading.Event
-    ) -> Optional[Dict]:
+    ) -> CallResult:
         previous_stop_event = getattr(self._call_context, "stop_event", None)
         self._call_context.stop_event = stop_event
         try:
             # Preserve the inherited extension hook for CallableTask subclasses.
-            return self._call_fn(request_id, content)
+            return self._capture_call(request_id, content)
         finally:
             if previous_stop_event is None:
                 del self._call_context.stop_event
             else:
                 self._call_context.stop_event = previous_stop_event
 
-    def _call_fn(self, request_id: int, content: Optional[Dict]) -> Optional[Dict]:
+    def _call_fn(self, request_id: int, content: Optional[Dict]) -> CallResult:
         stop_event = getattr(self._call_context, "stop_event", self._retry_stop_event)
         return self._call_with_retries(request_id, content, stop_event)
 
     def _call_with_retries(
         self, request_id: int, content: Optional[Dict], stop_event: threading.Event
-    ) -> Optional[Dict]:
+    ) -> CallResult:
         if stop_event.is_set():
-            raise concurrent.futures.CancelledError("Callable task stopped")
+            return TaskFailure("Callable task stopped", cancelled=True)
         if self._request_schema is not None:
             content = self._request_schema.validate(content)
         elif self._retry_policy.max_attempts > 1:
             content = copy.deepcopy(content)
         for attempt in range(1, self._retry_policy.max_attempts + 1):
             if stop_event.is_set():
-                raise concurrent.futures.CancelledError("Callable task stopped")
+                return TaskFailure("Callable task stopped", cancelled=True)
             attempt_content = content
             if self._retry_policy.max_attempts > 1:
                 # Failed SDK calls may mutate their arguments. Preserve the
@@ -486,32 +570,31 @@ class CallableTask(ThreadedPoolFunctionCallTask):
                     else copy.deepcopy(content)
                 )
             if stop_event.is_set():
-                raise concurrent.futures.CancelledError("Callable task stopped")
+                return TaskFailure("Callable task stopped", cancelled=True)
             with self._retry_lock:
                 self._latest_attempts = attempt
             try:
                 return self._call(request_id, attempt_content)
-            except concurrent.futures.CancelledError:
-                raise
+            except concurrent.futures.CancelledError as exc:
+                return TaskFailure(exception_message(exc) or "Request cancelled", True)
             except self._retry_policy.retry_exceptions as exc:
                 message = exception_message(exc)
                 with self._retry_lock:
                     self._last_retry_error = message
                 if attempt >= self._retry_policy.max_attempts:
-                    raise
+                    return TaskFailure(message)
                 with self._retry_lock:
                     self._total_retries += 1
                 self._notify_completion()
                 delay = self._retry_policy.delay_before(attempt + 1)
                 if delay > threading.TIMEOUT_MAX and not stop_event.is_set():
-                    raise ValueError(
+                    return TaskFailure(
                         "retry delay must not exceed threading.TIMEOUT_MAX"
                     )
                 if stop_event.wait(float(delay)):
-                    raise concurrent.futures.CancelledError(
-                        "Callable task stopped during retry backoff"
+                    return TaskFailure(
+                        "Callable task stopped during retry backoff", cancelled=True
                     )
-        raise AssertionError("unreachable")
 
     def peek_status(self) -> Dict:
         """Merge device facts with the adapter's executor binding."""

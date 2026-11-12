@@ -78,12 +78,46 @@ dropped. Required results belong in final outputs or the device protocol.
 
 ## Cancellation and diagnostics
 
+Handlers can return an `ActionOutcome` to report execution failures without
+raising inside asynchronous work:
+
+```python
+from orchestrion.workflow import ActionOutcome
+
+
+async def grip(context, inputs):
+    if context.cancel_requested:
+        return ActionOutcome.cancelled(context.cancel_reason)
+    observation = await device.close_and_wait(inputs)
+    if observation.stop_unconfirmed:
+        return ActionOutcome.unknown("gripper stop could not be confirmed")
+    if observation.failed:
+        return ActionOutcome.failed("gripper rejected the command")
+    return {"closed": True}
+```
+
+`FAILED` and `CANCELLED` outcomes confirm that device work has stopped. `UNKNOWN`
+keeps claims quarantined and makes the run `NEEDS_ATTENTION`. The engine records
+the outcome before logging failures; logging errors cannot interrupt accounting.
+Returning a normal JSON value still means success. An explicit
+`ActionOutcome(NodeStatus.SUCCEEDED, output=...)` follows the same JSON budget,
+schema validation and defensive copying. Failure diagnostic outputs are bounded;
+an invalid diagnostic never changes `UNKNOWN` or releases its leases.
+
+Built-in blocking, ticket and composite adapters return these outcomes for known
+failures and cancellations. Existing adapters that raise `ActionCancelled`,
+`ExecutionUncertain` or ordinary SDK exceptions remain supported at the execution
+boundary. The legacy `context.raise_if_cancelled()` and interruptible
+`context.sleep()` retain their raising contract; return a cancellation outcome
+after cleanup when writing new adapters. Synchronous definition/submission
+validation and caller wait timeouts retain their existing exception contracts.
+
 `run.wait(timeout=...)` only bounds the caller's wait. `Workflow(timeout=...)`
 covers dependencies, resource queues and execution; `Node(timeout=...)` begins at
 execution. Expiry stops admission and requests cooperative cancellation. With
 `FAIL_FAST`, node expiry stops sibling admission before cleanup finishes.
 
-Claims stay held until adapters confirm completion. `ExecutionUncertain` records
+Claims stay held until adapters confirm completion. An unknown outcome records
 `UNKNOWN` and quarantines claims. Neither command acceptance nor cancellation
 acceptance proves physical termination. After external reconciliation, call
 `engine.confirm_quiescent(run.operation_id(node_id), evidence="...")`; the

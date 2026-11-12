@@ -221,8 +221,7 @@ def test_request_priority_reorders_queued_work_and_preserves_fifo_ties():
         pilot.wait_requests([first, low, high_a, high_b], timeout=0.5)
         assert task.execution_order == ["first", "high-a", "high-b", "low"]
         assert pilot.query_request(high_a).priority == 10
-        with pytest.raises(TypeError, match="priority"):
-            pilot.call_srv_async("device", priority=True)
+        assert pilot.call_srv_async("device", priority=True) == -1
     finally:
         task.release_first.set()
         pilot.stop()
@@ -280,15 +279,13 @@ def test_idempotency_key_is_service_scoped_and_released_when_pruned():
         pilot.stop()
 
 
-@pytest.mark.parametrize(
-    "key, expected", [("", ValueError), (1, TypeError), (True, TypeError)]
-)
-def test_idempotency_key_validation(key, expected):
+@pytest.mark.parametrize("key", ["", 1, True])
+def test_idempotency_key_validation(key, caplog):
     pilot = TaskPilot(SimulatedRobotTask([0.0]), {"plc": EchoTask()})
     pilot.initialize()
     try:
-        with pytest.raises(expected, match="idempotency_key"):
-            pilot.call_srv_async("plc", idempotency_key=key)
+        assert pilot.call_srv_async("plc", idempotency_key=key) == -1
+        assert "idempotency_key" in caplog.text
     finally:
         pilot.stop()
 
@@ -933,8 +930,7 @@ def test_stop_does_not_allow_request_to_enqueue_after_cancellation_pass():
         assert preparing.wait(0.5)
         pilot.stop()
         release.set()
-        with pytest.raises(RuntimeError, match="stopped"):
-            caller.result(timeout=0.5)
+        assert caller.result(timeout=0.5) == -1
     assert pilot.timeline() == []
 
 

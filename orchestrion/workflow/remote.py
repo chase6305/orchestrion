@@ -6,9 +6,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, Optional, Protocol
 
+from orchestrion.utils.errors import exception_description
+
 from .actions import ActionContext
 from .model import (
-    ActionCancelled,
+    ActionOutcome,
     ExecutionUncertain,
     _name,
     _positive_int,
@@ -77,7 +79,7 @@ class TicketAction:
     Bind with Action(name, TicketAction(backend), claims=...). No actuator submit
     retries are performed here. Query transport errors are bounded; cancellation
     requests may be repeated and must be idempotent. Lost submissions, exhausted
-    queries, bad tickets and stop timeouts raise ExecutionUncertain. Optional
+    queries, bad tickets and stop timeouts return UNKNOWN outcomes. Optional
     malformed/oversized progress reports cannot release an active device lease.
     """
 
@@ -137,23 +139,29 @@ class TicketAction:
             await asyncio.gather(query, stopped, return_exceptions=True)
 
     async def __call__(self, context: ActionContext, inputs: Dict[str, Any]) -> Any:
-        context.raise_if_cancelled()
+        context._check_loop()
+        if context.cancel_requested:
+            return ActionOutcome.cancelled(context.cancel_reason)
         try:
             ticket = await asyncio.wait_for(
                 self._backend.submit(context.operation_id, inputs), self._rpc_timeout
             )
-            _name(ticket, "operation ticket")
-        except OperationRejected:
-            raise
+        except OperationRejected as exc:
+            return ActionOutcome.failed(exception_description(exc))
         except Exception as exc:
-            raise ExecutionUncertain("remote submission outcome is unknown") from exc
+            return ActionOutcome.unknown(
+                "remote submission outcome is unknown: " + exception_description(exc)
+            )
+        if not isinstance(ticket, str) or not ticket.strip():
+            return ActionOutcome.unknown("device returned an invalid operation ticket")
 
         try:
             context.checkpoint({"ticket": ticket, "operation_id": context.operation_id})
         except Exception as exc:
-            raise ExecutionUncertain(
-                "accepted remote ticket could not be recorded"
-            ) from exc
+            return ActionOutcome.unknown(
+                "accepted remote ticket could not be recorded: "
+                + exception_description(exc)
+            )
 
         loop = asyncio.get_running_loop()
         stop_deadline = None
@@ -169,14 +177,16 @@ class TicketAction:
             if stop_deadline is None:
                 return self._rpc_timeout
             remaining = stop_deadline - loop.time()
-            if remaining <= 0:
-                raise ExecutionUncertain("remote stop confirmation deadline expired")
-            return min(self._rpc_timeout, remaining)
+            return max(0.0, min(self._rpc_timeout, remaining))
 
         while True:
             observe_stop()
             if stop_deadline is not None and not cancel_accepted:
                 budget = rpc_budget()
+                if budget <= 0:
+                    return ActionOutcome.unknown(
+                        "remote stop confirmation deadline expired"
+                    )
                 try:
                     await asyncio.wait_for(self._backend.cancel(ticket), budget)
                 except Exception:
@@ -186,6 +196,10 @@ class TicketAction:
                 else:
                     cancel_accepted = True
             budget = rpc_budget()
+            if budget <= 0:
+                return ActionOutcome.unknown(
+                    "remote stop confirmation deadline expired"
+                )
             try:
                 update = await self._query(context, ticket, budget, observe_stop)
                 if update is _QUERY_INTERRUPTED:
@@ -193,31 +207,35 @@ class TicketAction:
                     # next iteration rather than waiting out the normal RPC.
                     continue
                 if stop_deadline is not None and loop.time() >= stop_deadline:
-                    raise ExecutionUncertain(
+                    return ActionOutcome.unknown(
                         "remote stop confirmation deadline expired"
                     )
                 if not isinstance(update, OperationUpdate) or update.ticket != ticket:
-                    raise ExecutionUncertain(
+                    return ActionOutcome.unknown(
                         "device returned an invalid or mismatched ticket"
                     )
-            except ExecutionUncertain:
-                raise
+            except ExecutionUncertain as exc:
+                return ActionOutcome.unknown(exception_description(exc))
             except Exception as exc:
                 query_errors += 1
                 if query_errors >= self._max_query_errors:
-                    raise ExecutionUncertain("remote result is unavailable") from exc
+                    return ActionOutcome.unknown(
+                        "remote result is unavailable: " + exception_description(exc)
+                    )
             else:
                 query_errors = 0
                 if update.status == OperationStatus.SUCCEEDED:
                     return update.output
                 if update.status == OperationStatus.CANCELLED:
-                    raise ActionCancelled(update.error or "remote operation stopped")
+                    return ActionOutcome.cancelled(
+                        update.error or "remote operation stopped"
+                    )
                 if update.status == OperationStatus.FAILED:
-                    raise RemoteOperationError(
+                    return ActionOutcome.failed(
                         update.error or "remote operation failed"
                     )
                 if update.status == OperationStatus.UNKNOWN:
-                    raise ExecutionUncertain(
+                    return ActionOutcome.unknown(
                         update.error or "remote outcome is unknown"
                     )
                 if update.feedback is not None:

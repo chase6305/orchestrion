@@ -9,10 +9,13 @@ from functools import partial
 from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Protocol, Tuple
 
 from orchestrion.schema import RequestSchema
+from orchestrion.utils.errors import exception_description
 
 from .feedback import FeedbackChannel
 from .model import (
     ActionCancelled,
+    ActionOutcome,
+    ExecutionUncertain,
     ResourceClaim,
     Workflow,
     _name,
@@ -201,8 +204,10 @@ ActionHandler = Callable[[ActionContext, Dict[str, Any]], Awaitable[Any]]
 class Action:
     """A bound capability with mandatory resource claims and an async handler.
 
-    Ordinary exceptions assert the operation has stopped. Network ambiguity must
-    use ExecutionUncertain. Do not return an acceptance ticket as a final result.
+    Return ActionOutcome for explicit failure, cancellation or uncertain device
+    state; the engine logs failures and quarantines UNKNOWN resources. Legacy
+    exceptions are still contained at the execution boundary. Do not return an
+    acceptance ticket as a final result.
     """
 
     name: str
@@ -259,11 +264,15 @@ class BlockingAction:
         self._executor = executor
 
     async def __call__(self, context: ActionContext, inputs: Dict[str, Any]) -> Any:
-        context.raise_if_cancelled()
         cancellation = context._thread_cancellation()
-        future = asyncio.get_running_loop().run_in_executor(
-            self._executor, partial(self._invoke, context, cancellation, inputs)
-        )
+        if cancellation.is_set():
+            return ActionOutcome.cancelled(context.cancel_reason)
+        try:
+            future = asyncio.get_running_loop().run_in_executor(
+                self._executor, partial(self._invoke, context, cancellation, inputs)
+            )
+        except Exception as exc:
+            return ActionOutcome.failed(exception_description(exc))
         future.add_done_callback(self._observe_completion)
         # Unexpected coroutine cancellation becomes UNKNOWN in the engine; the
         # worker is not cancelled and its device resources remain quarantined.
@@ -274,10 +283,13 @@ class BlockingAction:
                 # Executor shutdown can cancel a queued callable before it starts.
                 # Shielding keeps cancellation of this adapter from marking the
                 # underlying future cancelled, so this is a quiescence proof.
-                raise ActionCancelled(
+                return ActionOutcome.cancelled(
                     "executor cancelled the SDK call before start"
-                ) from None
-            raise
+                )
+            context._request_cancel("adapter_interrupted")
+            return ActionOutcome.unknown(
+                "CancelledError: blocking action wait interrupted"
+            )
 
     @staticmethod
     def _observe_completion(future: asyncio.Future) -> None:
@@ -297,8 +309,15 @@ class BlockingAction:
         # thread-safe token prevents a known cancellation from becoming device I/O
         # when that wrapper eventually gets a worker. Already started calls drain.
         if cancellation.is_set():
-            raise ActionCancelled(context.cancel_reason)
-        return self._function(inputs)
+            return ActionOutcome.cancelled(context.cancel_reason)
+        try:
+            return self._function(inputs)
+        except ActionCancelled as exc:
+            return ActionOutcome.cancelled(exception_description(exc))
+        except ExecutionUncertain as exc:
+            return ActionOutcome.unknown(exception_description(exc))
+        except Exception as exc:
+            return ActionOutcome.failed(exception_description(exc))
 
 
 class Planner(Protocol):

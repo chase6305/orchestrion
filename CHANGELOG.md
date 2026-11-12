@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Return explicit `TaskFailure` and `ActionOutcome` values for asynchronous
+  failures, cooperative cancellation and uncertain device states. Built-in task,
+  blocking, ticket and composite adapters contain SDK errors; workflow UNKNOWN
+  outcomes continue to quarantine resources, including with invalid diagnostics.
+- Log and return `False` from rejected function-task submissions and `-1` from
+  rejected `TaskPilot.call_srv_async()` submissions without consuming request IDs
+  or idempotency keys. Accepted inline failures remain queryable and return True.
+- Preserve confirmed cancellation through task response envelopes and pilot
+  results. Keep gripper wait timeouts as failures while cancelling their motion.
+- Keep completion and resource accounting independent of log-handler failures;
+  format threaded SDK errors once and log changed polling errors without floods.
+  Durable dispatch barriers return commit errors instead of failing waiter futures.
+  Motion input copy failures log and reject before allocating any movement IDs;
+  failed robot workers still cancel queued motion when log handlers fail.
+
 - Reduce JSON snapshot overhead with direct string encoding and one-pass
   dictionary copying. Count actual copied entries and ignore custom string lengths
   when enforcing workflow payload budgets.

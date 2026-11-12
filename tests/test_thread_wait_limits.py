@@ -1,7 +1,7 @@
 """Single thread waits reject overflow without changing pending work or cadence."""
 
 import threading
-from concurrent.futures import CancelledError, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 
 import pytest
@@ -206,5 +206,6 @@ def test_already_requested_stop_wins_over_excessive_retry_delay():
         finally:
             release.set()
             task.stop()
-        with pytest.raises(CancelledError, match="stopped"):
-            task._future_map[0].result(timeout=1)
+        outcome = task._future_map[0].result(timeout=1)
+        assert outcome.cancelled
+        assert "stopped" in outcome.error

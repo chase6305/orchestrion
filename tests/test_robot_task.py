@@ -49,17 +49,20 @@ class UncopyableTrajectory(list):
         raise RuntimeError("trajectory copy failed")
 
 
-def test_copy_failure_does_not_consume_main_move_id(robot):
-    with pytest.raises(RuntimeError, match="copy failed"):
-        robot.move_joint_trajectory_async(UncopyableTrajectory([[1.0]]))
+def test_copy_failure_does_not_consume_main_move_id(robot, caplog):
+    assert robot.move_joint_trajectory_async(UncopyableTrajectory([[1.0]])) == -1
+    assert "trajectory copy failed" in caplog.text
     assert robot.query_state().latest_sent_id == -1
     assert robot.move_joint_trajectory_async([[2.0]]) == 0
 
 
-def test_copy_failure_does_not_consume_submodule_move_id():
+def test_copy_failure_does_not_consume_submodule_move_id(caplog):
     robot = ModularRobot()
-    with pytest.raises(RuntimeError, match="copy failed"):
+    assert (
         robot.move_submodule_trajectory_async("gripper", UncopyableTrajectory([[1.0]]))
+        == -1
+    )
+    assert "trajectory copy failed" in caplog.text
     assert robot.query_submodule_state("gripper").latest_sent_id == -1
     assert robot.move_submodule_trajectory_async("gripper", [[2.0]]) == 0
     robot.stop()
@@ -208,9 +211,8 @@ def test_worker_logging_failure_discards_queued_motion_before_restart(
         robot.set_state_change_callback(fail_observer)
     with monkeypatch.context() as failure:
         failure.setattr(robot, step_name, fail_step)
-        failure.setattr(logger, "exception", fail_log)
-        with pytest.raises(RuntimeError, match="log sink unavailable"):
-            worker()
+        failure.setattr(logger, "error", fail_log)
+        assert worker() is None
     assert {first, second}.issubset(robot.query_state().cancelled_move_ids)
     assert robot.move_joint_trajectory_async([[4.0]]) == -1
     if not simulated:

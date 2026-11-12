@@ -7,7 +7,8 @@ import time
 from bisect import bisect_left
 from typing import Callable, List, Optional
 
-from orchestrion.utils.logger import logger
+from orchestrion.utils.errors import exception_message
+from orchestrion.utils.logger import log_error
 
 from .reduced_robot_task_interface import ReducedRobotTaskInterface
 
@@ -115,7 +116,7 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
         with self._lock:
             expected_joint_count = len(self._state.jps)
             submission_epoch = self._motion_epoch
-        motion_target = copy.deepcopy(motion_target)
+        motion_target = self._copy_motion_input(motion_target)
         if not self._is_finite_trajectory(motion_target):
             return -1
         if any(len(point) != expected_joint_count for point in motion_target):
@@ -123,7 +124,7 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
         segment_endpoints = (
             [len(motion_target)]
             if endpoint_index is None
-            else copy.deepcopy(endpoint_index)
+            else self._copy_motion_input(endpoint_index)
         )
         if not self._check_assigned_endpoint_index(motion_target, segment_endpoints):
             return -1
@@ -189,18 +190,20 @@ class SimulatedRobotTask(ReducedRobotTaskInterface):
         if callback is not None:
             try:
                 callback()
-            except Exception:
-                logger.exception("Robot state-change callback failed")
+            except Exception as exc:
+                log_error(
+                    "Robot state-change callback failed: %s", exception_message(exc)
+                )
 
     def _run(self) -> None:
         try:
             while not self._stop_event.is_set():
                 self._run_next_trajectory()
-        except Exception:
-            try:
-                logger.exception("Simulated robot motion worker failed")
-            finally:
-                self._stop_locked(0.0)
+        except Exception as exc:
+            log_error(
+                "Simulated robot motion worker failed: %s", exception_message(exc)
+            )
+            self._stop_locked(0.0)
 
     def _run_next_trajectory(self) -> None:
         """Release the request and its point aliases before the next idle wait."""

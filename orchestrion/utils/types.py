@@ -23,6 +23,7 @@ class PeekResponseResult:
     request_id: int = -1
     content: Optional[Dict] = None
     error: Optional[str] = None
+    cancelled: bool = False
 
     @staticmethod
     def error_unknown() -> "PeekResponseResult":

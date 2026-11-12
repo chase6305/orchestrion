@@ -7,7 +7,7 @@ import weakref
 
 import pytest
 
-from orchestrion import RequestStatus, SimulatedRobotTask
+from orchestrion import RequestStatus, SimulatedRobotTask, TaskFailure
 from orchestrion.move_sync_option import MoveSyncOption
 from orchestrion.task_pilot import TaskPilot
 from orchestrion.tasks import CallableTask, GenericTask, InPlaceFunctionCallTask
@@ -302,18 +302,69 @@ def test_motion_waiters_preserve_priority_and_fifo_across_submission_batches():
         ]
 
 
-def test_unknown_service_is_rejected():
+def test_unknown_service_is_rejected(caplog):
     pilot = TaskPilot(RobotTaskStub())
-    with pytest.raises(KeyError):
-        pilot.call_srv_async("missing", {}, MoveSyncOption.no_sync())
+    assert pilot.call_srv_async("missing", {}, MoveSyncOption.no_sync()) == -1
+    assert "Unknown service" in caplog.text
 
 
-def test_call_rejects_invalid_sync_option():
+@pytest.mark.parametrize("threaded", [False, True])
+def test_returned_device_cancellation_is_not_a_failed_pilot_request(threaded):
+    def call(request_id, content):
+        return TaskFailure("controller confirmed stop", cancelled=True)
+
+    class InlineTask(InPlaceFunctionCallTask):
+        def _call_fn(self, request_id, content):
+            return call(request_id, content)
+
+    task = CallableTask(call) if threaded else InlineTask()
+    executor = (
+        concurrent.futures.ThreadPoolExecutor(max_workers=1) if threaded else None
+    )
+    with TaskPilot(
+        SimulatedRobotTask([0.0]), {"device": task}, executor_owned=executor
+    ) as pilot:
+        request_id = pilot.call_srv_async(
+            "device", sync_option=MoveSyncOption.no_sync()
+        )
+        result = pilot.wait_request(request_id, timeout=1)
+        assert result.status is RequestStatus.CANCELLED
+        assert result.error == "controller confirmed stop"
+        assert task.peek_response(request_id).cancelled is True
+        assert pilot.is_running
+
+
+def test_preparation_failure_logs_outside_locks_and_preserves_submission_identity(
+    monkeypatch,
+):
+    class BrokenContent(dict):
+        def __deepcopy__(self, memo):
+            raise RuntimeError("content copy failed")
+
+    messages = []
+    with TaskPilot(SimulatedRobotTask([0.0]), {"device": RecordingTask()}) as pilot:
+
+        def log(message, *args):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                assert executor.submit(lambda: pilot.timeline()).result(1) == []
+            messages.append(message % args)
+
+        monkeypatch.setattr("orchestrion.utils.logger.logger.error", log)
+        assert (
+            pilot.call_srv_async("device", BrokenContent(), idempotency_key="key") == -1
+        )
+        assert messages == ["Service request was not submitted: content copy failed"]
+        request_id = pilot.call_srv_async("device", {"ok": True}, idempotency_key="key")
+        assert request_id == 0
+        assert pilot.wait_request(request_id, timeout=1).content == {"ok": True}
+
+
+def test_call_rejects_invalid_sync_option(caplog):
     pilot = TaskPilot(RobotTaskStub(), {"task": GenericTaskStub()})
     pilot.initialize()
     try:
-        with pytest.raises(TypeError, match="sync_option"):
-            pilot.call_srv_async("task", sync_option=object())
+        assert pilot.call_srv_async("task", sync_option=object()) == -1
+        assert "sync_option" in caplog.text
     finally:
         pilot.stop()
 
@@ -321,7 +372,7 @@ def test_call_rejects_invalid_sync_option():
 @pytest.mark.parametrize("submodule_name", [None, "arm"], ids=["main", "submodule"])
 @pytest.mark.parametrize("invalid_id", _INVALID_PROGRESS_IDS)
 def test_invalid_latest_sent_id_does_not_reserve_a_request_or_idempotency_key(
-    submodule_name, invalid_id
+    submodule_name, invalid_id, caplog
 ):
     robot = SubmoduleRobotTaskStub()
     robot.latest_sent_id = invalid_id
@@ -333,11 +384,13 @@ def test_invalid_latest_sent_id_does_not_reserve_a_request_or_idempotency_key(
         else MoveSyncOption.sync_w_submodule(submodule_name)
     )
     with TaskPilot(robot, {"device": task}) as pilot:
-        error_type = ValueError if invalid_id == -2 else TypeError
-        with pytest.raises(error_type, match="associated_move_id"):
+        assert (
             pilot.call_srv_async(
                 "device", {"invalid": True}, sync_option, idempotency_key="retry"
             )
+            == -1
+        )
+        assert "associated_move_id" in caplog.text
         assert task.calls == []
         robot.latest_sent_id = 0
         request_id = pilot.call_srv_async(
@@ -449,10 +502,10 @@ def test_malformed_submodule_state_fails_request_without_stopping_scheduler():
         pilot.stop()
 
 
-def test_request_before_initialization_is_rejected():
+def test_request_before_initialization_is_rejected(caplog):
     pilot = TaskPilot(RobotTaskStub(), {"task": GenericTaskStub()})
-    with pytest.raises(RuntimeError):
-        pilot.call_srv_async("task", {}, MoveSyncOption.no_sync())
+    assert pilot.call_srv_async("task", {}, MoveSyncOption.no_sync()) == -1
+    assert "initialized" in caplog.text
 
 
 @pytest.mark.parametrize("move_id", [True, 1.5, "1"])
@@ -826,8 +879,7 @@ def test_request_prepared_before_stop_cannot_enter_a_restarted_pilot():
                 pilot.initialize()
             finally:
                 resume.set()
-            with pytest.raises(RuntimeError, match="stopped"):
-                submission.result(1.0)
+            assert submission.result(1.0) == -1
         assert task.calls == []
         request_id = pilot.call_srv_async("device", {"fresh": True})
         assert pilot.wait_request(request_id, timeout=1.0).content == {"fresh": True}
@@ -841,6 +893,18 @@ def test_request_prepared_before_stop_cannot_enter_a_restarted_pilot():
             "different request",
         ),
         (PeekResponseResult(PeekResponseResultType.ErrorRequestNotSent), "no record"),
+        (
+            PeekResponseResult(PeekResponseResultType.ErrorUnknown, error={}),
+            "error must be a string",
+        ),
+        (
+            PeekResponseResult(PeekResponseResultType.ErrorUnknown, cancelled="yes"),
+            "invalid cancellation flag",
+        ),
+        (
+            PeekResponseResult(PeekResponseResultType.ResponseFound, cancelled=True),
+            "invalid cancellation flag",
+        ),
         *[
             pytest.param(
                 PeekResponseResult(PeekResponseResultType.ResponseFound, request_id),

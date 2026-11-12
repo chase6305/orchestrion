@@ -327,10 +327,12 @@ def test_batch_submodule_copy_failure_does_not_allocate_any_move_ids():
         SubModuleTask("torso", 0, 1),
         [SubModuleTask("left_arm", 1, 1), SubModuleTask("right_arm", 2, 1)],
     )
-    with pytest.raises(RuntimeError, match="copy failed"):
+    assert (
         robot.move_submodules_trajectories_async(
             {"left_arm": [[0.1]], "right_arm": FailingCopyList([[0.1]])}
         )
+        == {}
+    )
     assert robot.query_submodule_state("left_arm").latest_sent_id == -1
     assert robot.query_submodule_state("right_arm").latest_sent_id == -1
 

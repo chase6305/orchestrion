@@ -10,7 +10,7 @@ import time
 from collections import Counter, deque
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Any, Container, Dict, List, Optional, Set, Tuple
+from typing import Any, Container, Dict, List, Optional, Set, Tuple, Union
 
 from orchestrion.health import DeviceHealth
 from orchestrion.move_sync_option import MoveSyncOption
@@ -18,7 +18,7 @@ from orchestrion.request import RequestResult, RequestStatus, TimelineEvent
 from orchestrion.tasks.generic_task import GenericTask
 from orchestrion.tasks.reduced_robot_task_interface import ReducedRobotTaskInterface
 from orchestrion.utils.errors import exception_message
-from orchestrion.utils.logger import logger
+from orchestrion.utils.logger import log_error, logger
 from orchestrion.utils.numeric import is_finite_real
 from orchestrion.utils.types import PeekResponseResult, PeekResponseResultType
 
@@ -337,20 +337,43 @@ class TaskPilot:
         priority: int = 0,
         idempotency_key: Optional[str] = None,
     ) -> int:
-        if srv_name not in self._task_map:
-            raise KeyError("Unknown service: {}".format(srv_name))
-        if not self._initialized:
-            raise RuntimeError(
-                "TaskPilot must be initialized before accepting requests"
+        """Queue a service request; log and return -1 when submission is rejected.
+
+        Failed preparation does not consume a request ID or idempotency key.
+        Accepted requests expose execution failures through wait_request().
+        """
+        try:
+            result = self._submit_service_request(
+                srv_name, content, sync_option, priority, idempotency_key
             )
+        except Exception as exc:
+            result = exception_message(exc)
+        if isinstance(result, str):
+            log_error("Service request was not submitted: %s", result)
+            return -1
+        return result
+
+    def _submit_service_request(
+        self,
+        srv_name: str,
+        content: Optional[Dict],
+        sync_option: Optional[MoveSyncOption],
+        priority: int,
+        idempotency_key: Optional[str],
+    ) -> Union[int, str]:
+        """Prepare and atomically admit a request behind the nonthrowing boundary."""
+        if srv_name not in self._task_map:
+            return "Unknown service: {}".format(srv_name)
+        if not self._initialized:
+            return "TaskPilot must be initialized before accepting requests"
         with self._state_condition:
             submission_epoch = self._lifecycle_epoch
         if isinstance(priority, bool) or not isinstance(priority, int):
-            raise TypeError("priority must be an integer")
+            return "priority must be an integer"
         if idempotency_key is not None and not isinstance(idempotency_key, str):
-            raise TypeError("idempotency_key must be a string or None")
+            return "idempotency_key must be a string or None"
         if idempotency_key == "":
-            raise ValueError("idempotency_key must not be empty")
+            return "idempotency_key must not be empty"
         deduplication_key = (
             None if idempotency_key is None else (srv_name, idempotency_key)
         )
@@ -362,7 +385,7 @@ class TaskPilot:
         if sync_option is None:
             sync_option = MoveSyncOption.sync_w_latest_move()
         elif not isinstance(sync_option, MoveSyncOption):
-            raise TypeError("sync_option must be a MoveSyncOption or None")
+            return "sync_option must be a MoveSyncOption or None"
 
         associated_move_id = -1
         associated_submodule = sync_option.submodule_name
@@ -372,9 +395,7 @@ class TaskPilot:
                     self._robot_task, "query_submodule_state", None
                 )
                 if not callable(query_submodule_state):
-                    raise TypeError(
-                        "Robot task does not support submodule synchronization"
-                    )
+                    return "Robot task does not support submodule synchronization"
                 submodule_state = query_submodule_state(associated_submodule)
                 associated_move_id = (
                     sync_option.associated_move_id
@@ -386,21 +407,19 @@ class TaskPilot:
             else:
                 robot_state = self._robot_task.query_state()
                 if robot_state is None:
-                    raise RuntimeError("Robot state is unavailable")
+                    return "Robot state is unavailable"
                 associated_move_id = robot_state.latest_sent_id
             if isinstance(associated_move_id, bool) or not isinstance(
                 associated_move_id, int
             ):
-                raise TypeError("associated_move_id must be an integer")
+                return "associated_move_id must be an integer"
             if associated_move_id < -1:
-                raise ValueError("associated_move_id must be -1 or non-negative")
+                return "associated_move_id must be -1 or non-negative"
 
         request_content = copy.deepcopy(content)
         with self._state_condition:
             if not self._initialized or submission_epoch != self._lifecycle_epoch:
-                raise RuntimeError(
-                    "TaskPilot stopped while the request was being prepared"
-                )
+                return "TaskPilot stopped while the request was being prepared"
             if deduplication_key is not None:
                 existing_id = self._idempotency_requests.get(deduplication_key)
                 if existing_id is not None:
@@ -930,18 +949,17 @@ class TaskPilot:
                 request.request_id, request.content
             )
             if not accepted:
-                self._transition(
-                    request.request_id, RequestStatus.FAILED,
-                    error="Task rejected request",
-                )
+                self._fail_request(request, "Task rejected request")
         except Exception as exc:
-            logger.exception(
-                "Task %s failed to accept request %s",
+            self._fail_request(request, exception_message(exc))
+
+    def _fail_request(self, request: BackgroundRequest, error: str) -> None:
+        if self._transition(request.request_id, RequestStatus.FAILED, error=error):
+            log_error(
+                "Task %s request %s failed: %s",
                 request.service_name,
                 request.request_id,
-            )
-            self._transition(
-                request.request_id, RequestStatus.FAILED, error=exception_message(exc)
+                error,
             )
 
     def _refresh_running(self, service_names: Optional[Set[str]] = None) -> None:
@@ -970,54 +988,76 @@ class TaskPilot:
             if not isinstance(response, PeekResponseResult) or not isinstance(
                 response.result_type, PeekResponseResultType
             ):
-                raise TypeError("Task returned an invalid response envelope")
+                self._fail_request(
+                    request, "Task returned an invalid response envelope"
+                )
+                return
             if isinstance(response.request_id, bool) or not isinstance(
                 response.request_id, int
             ):
-                raise TypeError("Task response request_id must be an integer")
+                self._fail_request(
+                    request, "Task response request_id must be an integer"
+                )
+                return
             if response.request_id not in (-1, request.request_id):
-                raise ValueError("Task returned a response for a different request")
+                self._fail_request(
+                    request, "Task returned a response for a different request"
+                )
+                return
+            if response.error is not None and not isinstance(response.error, str):
+                self._fail_request(
+                    request, "Task response error must be a string or None"
+                )
+                return
+            if not isinstance(response.cancelled, bool) or (
+                response.cancelled
+                and response.result_type is not PeekResponseResultType.ErrorUnknown
+            ):
+                self._fail_request(
+                    request, "Task response has an invalid cancellation flag"
+                )
+                return
             if response.result_type is PeekResponseResultType.ResponseFound:
                 try:
                     content = copy.deepcopy(response.content)
                 except Exception as exc:
-                    raise ValueError(
+                    self._fail_request(
+                        request,
                         "Task response could not be copied: {}".format(
                             exception_message(exc)
-                        )
-                    ) from exc
+                        ),
+                    )
+                    return
                 self._transition(
                     request.request_id,
                     RequestStatus.SUCCEEDED,
                     content=content,
                 )
             elif response.result_type is PeekResponseResultType.ErrorUnknown:
-                self._transition(
-                    request.request_id,
-                    RequestStatus.FAILED,
-                    error=response.error or "Task execution failed",
-                )
+                if response.cancelled:
+                    self._transition(
+                        request.request_id,
+                        RequestStatus.CANCELLED,
+                        error=response.error or "Task execution cancelled",
+                    )
+                else:
+                    self._fail_request(
+                        request, response.error or "Task execution failed"
+                    )
             elif (
                 response.result_type
                 is PeekResponseResultType.ResponseReceivedButFlushed
             ):
-                self._transition(
-                    request.request_id,
-                    RequestStatus.FAILED,
-                    error="Task result was flushed before collection",
-                )
+                self._fail_request(request, "Task result was flushed before collection")
             elif response.result_type is PeekResponseResultType.ErrorRequestNotSent:
-                self._transition(
-                    request.request_id, RequestStatus.FAILED,
-                    error="Task has no record of the accepted request",
+                self._fail_request(
+                    request, "Task has no record of the accepted request"
                 )
         except NotImplementedError:
             # Legacy adapters may only implement fire-and-forget invocation.
             return
         except Exception as exc:
-            self._transition(
-                request.request_id, RequestStatus.FAILED, error=exception_message(exc)
-            )
+            self._fail_request(request, exception_message(exc))
 
     def _cancel_nonterminal(self, reason: str) -> None:
         with self._state_condition:
@@ -1037,8 +1077,12 @@ class TaskPilot:
                 if callable(cancel):
                     try:
                         cancel(request_id)
-                    except Exception:
-                        logger.exception("Failed to cancel request %s", request_id)
+                    except Exception as exc:
+                        log_error(
+                            "Failed to cancel request %s: %s",
+                            request_id,
+                            exception_message(exc),
+                        )
             self._transition(request_id, RequestStatus.CANCELLED, error=reason)
 
     def _admit_queued_requests(
@@ -1082,9 +1126,9 @@ class TaskPilot:
         if None in dependency_counts:
             try:
                 main_state = self._robot_task.query_state()
-            except Exception:
+            except Exception as exc:
                 # A transient main-state failure leaves its requests waiting.
-                logger.exception("Failed to query robot state")
+                log_error("Failed to query robot state: %s", exception_message(exc))
 
         # Index shared sequences only within this pass. Sets and short batches
         # keep their existing membership lookup without an extra allocation.

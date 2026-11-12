@@ -257,6 +257,46 @@ class RunStatus(str, Enum):
 
 
 @dataclass(frozen=True)
+class ActionOutcome:
+    """An adapter's explicit result, including failures returned without raising.
+
+    FAILED and CANCELLED confirm device quiescence. UNKNOWN keeps resource leases
+    quarantined. Deadline outcomes belong to the engine, not the adapter.
+    """
+
+    status: NodeStatus
+    output: Any = None
+    error: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        status = NodeStatus(self.status)
+        if status not in (
+            NodeStatus.SUCCEEDED,
+            NodeStatus.FAILED,
+            NodeStatus.CANCELLED,
+            NodeStatus.UNKNOWN,
+        ):
+            raise ValueError(
+                "action outcome must be succeeded, failed, cancelled or unknown"
+            )
+        if self.error is not None and not isinstance(self.error, str):
+            raise TypeError("action error must be a string or None")
+        object.__setattr__(self, "status", status)
+
+    @classmethod
+    def failed(cls, error: str) -> "ActionOutcome":
+        return cls(NodeStatus.FAILED, error=error)
+
+    @classmethod
+    def cancelled(cls, error: Optional[str] = None) -> "ActionOutcome":
+        return cls(NodeStatus.CANCELLED, error=error)
+
+    @classmethod
+    def unknown(cls, error: str) -> "ActionOutcome":
+        return cls(NodeStatus.UNKNOWN, error=error)
+
+
+@dataclass(frozen=True)
 class NodeResult:
     node_id: str
     action: str
