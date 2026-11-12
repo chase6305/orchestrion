@@ -50,6 +50,9 @@ from .run import WorkflowRun
 # (-priority, sequence, run, node): descending priority, FIFO for ties.
 _ReadyEntry = Tuple[int, int, WorkflowRun, CompiledNode]
 
+# Limit one synchronous scheduling turn even when eager adapters finish inline.
+_DISPATCH_BATCH_SIZE = 128
+
 _current_execution: ContextVar = ContextVar(
     "orchestrion_workflow_execution", default=()
 )
@@ -395,7 +398,9 @@ class WorkflowEngine:
                 run._deadline_timer = self._loop.call_at(
                     run._deadline, self._expire_run, run
                 )
-            if self._driver is None or self._driver.done():
+            if not self._starting_driver and (
+                self._driver is None or self._driver.done()
+            ):
                 self._starting_driver = True
                 try:
                     self._driver = self._spawn(self._schedule())
@@ -799,9 +804,14 @@ class WorkflowEngine:
     async def _schedule(self) -> None:
         while self._runs:
             self._wake.clear()
-            self._advance_scheduler()
+            dispatch_pending = self._advance_scheduler()
             if self._runs:
-                await self._wake.wait()
+                if dispatch_pending:
+                    # An already-set wake event does not yield. Let cancellation
+                    # callbacks and timers run before another eager dispatch batch.
+                    await asyncio.sleep(0)
+                else:
+                    await self._wake.wait()
         self._clear_ready_queues()
 
     def _clear_ready_queues(self) -> None:
@@ -811,20 +821,24 @@ class WorkflowEngine:
         for waiters in self._resource_waiters.values():
             waiters.clear()
 
-    def _advance_scheduler(self) -> None:
-        """Advance one turn without retaining dispatch locals across idle waits."""
+    def _advance_scheduler(self) -> bool:
+        """Advance a bounded turn; report whether ready work needs another turn."""
         for run in tuple(self._runs.values()):
             self._check_run_deadline(run)
             if run._unfinished == 0:
                 self._finish_run(run)
 
         if self._journal_error is not None:
-            return
+            return False
 
         # Each resource exposes only its first eligible waiter. A single busy
         # arm with thousands of queued actions costs O(log N) per completion,
         # without repeatedly scanning the whole blocked backlog.
+        attempts = 0
         while self._ready_heap and self._running_count < self._max_concurrency:
+            if attempts == _DISPATCH_BATCH_SIZE:
+                return True
+            attempts += 1
             entry = heapq.heappop(self._ready_heap)
             self._ready_queued.discard(entry[1])
             _, _, run, item = entry
@@ -866,6 +880,7 @@ class WorkflowEngine:
                 self._workers.add(worker)
                 self._workers_drained.clear()
                 worker.add_done_callback(partial(self._worker_done, run, item, context))
+        return False
 
     def _worker_done(
         self,
