@@ -1,6 +1,7 @@
 """Continuous resource ownership across the steps of a composite capability."""
 
 import asyncio
+import gc
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -397,6 +398,90 @@ def test_rejected_scope_checkpoint_does_not_poison_later_accepted_updates(
                         journal.get_run(run.run_id)["nodes"][0]["checkpoint"]
                         == checkpoint
                     )
+
+    asyncio.run(scenario())
+
+
+def test_inner_completion_during_sdk_snapshot_suppresses_the_late_outer_copy():
+    async def scenario():
+        copying, copied = threading.Event(), threading.Event()
+        entered, release = asyncio.Event(), asyncio.Event()
+        producers = []
+
+        class DelayedMapping(dict):
+            def items(self):
+                copying.set()
+                assert copied.wait(2)
+                return super().items()
+
+        async def first(context, inputs):
+            producer = threading.Thread(
+                target=lambda: context.report(DelayedMapping(late=True))
+            )
+            producers.append(producer)
+            producer.start()
+            assert copying.wait(1)
+
+        async def hold(context, inputs):
+            entered.set()
+            await release.wait()
+
+        scoped = workflow_action(
+            "scope",
+            Workflow((Node("first", "first"), Node("hold", "hold", after=("first",)))),
+            [Action("first", first), Action("hold", hold)],
+        )
+        async with WorkflowEngine([scoped]) as engine:
+            run = engine.submit(Workflow((Node("scope", "scope"),)))
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                copied.set()
+                producers[0].join(1)
+                assert not producers[0].is_alive()
+                await asyncio.sleep(0)
+                assert not any(
+                    event.kind == "feedback"
+                    and event.detail.get("feedback") == {"late": True}
+                    for event in run.events()
+                )
+            finally:
+                copied.set()
+                release.set()
+                for producer in producers:
+                    producer.join(1)
+            assert (await run.wait(1)).status is RunStatus.SUCCEEDED
+
+    asyncio.run(scenario())
+
+
+def test_completed_scope_releases_checkpoint_data_when_sdk_retains_context():
+    async def scenario():
+        released = threading.Event()
+        contexts = []
+
+        class Marker(str):
+            def __del__(self):
+                released.set()
+
+        async def update(context, inputs):
+            contexts.append(context)
+            context.checkpoint({"marker": Marker("completed scope checkpoint")})
+
+        scoped = workflow_action(
+            "scope", Workflow((Node("update", "update"),)), [Action("update", update)]
+        )
+        engine = WorkflowEngine([scoped])
+        async with engine:
+            run = engine.submit(Workflow((Node("scope", "scope"),)))
+            assert (await run.wait(1)).status is RunStatus.SUCCEEDED
+        del run, engine
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        gc.collect()
+        assert contexts
+        assert released.is_set()
+        with pytest.raises(RuntimeError, match="already completed"):
+            contexts[0].checkpoint({"late": True})
 
     asyncio.run(scenario())
 

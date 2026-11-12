@@ -98,10 +98,14 @@ class _ScopedContext(ActionContext):
         self._delegate.raise_if_cancelled()
 
     def report(self, feedback: Any) -> None:
+        if not self._delegate._active:
+            return
         self._delegate.report(feedback)
-        _report_optional(
-            self._parent, {"scope_node": self.node_id, "feedback": feedback}
-        )
+        # An SDK-thread snapshot can overlap the inner node finishing.
+        if self._delegate._active:
+            _report_optional(
+                self._parent, {"scope_node": self.node_id, "feedback": feedback}
+            )
 
     def _thread_cancellation(self):
         return self._delegate._thread_cancellation()
@@ -208,8 +212,12 @@ class _WorkflowAction:
         checkpoints = {}
 
         def checkpoint(node_id, data):
-            checkpoints[node_id] = _snapshot(data)
-            context.checkpoint({"scope_nodes": checkpoints})
+            # Publish the accumulator only after the parent accepts and commits
+            # the whole snapshot. A rejected update must not poison later ones.
+            candidate = dict(checkpoints)
+            candidate[node_id] = _snapshot(data)
+            context.checkpoint({"scope_nodes": candidate})
+            checkpoints[node_id] = candidate[node_id]
 
         def wrap(action):
             async def invoke(inner_context, inner_inputs):
@@ -317,3 +325,7 @@ class _WorkflowAction:
                     + exception_description(exc)
                 )
             return ActionOutcome.failed(exception_description(exc))
+        finally:
+            # SDKs may retain scoped contexts after completion. Their checkpoint
+            # callback must not keep the completed scope's recovery data alive.
+            checkpoints.clear()
