@@ -261,7 +261,9 @@ async def benchmark(counts, payload_items, repeats, idle_runs):
         if row["supported"]:
             for metric in _TIMING_FIELDS:
                 if metric in row:
-                    row[metric] = statistics.median(sample[metric] for sample in samples)
+                    row[metric] = statistics.median(
+                        sample[metric] for sample in samples
+                    )
         eager_completion.append(row)
     return {
         "python": platform.python_version(),

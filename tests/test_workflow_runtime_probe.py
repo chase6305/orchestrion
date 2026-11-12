@@ -9,8 +9,7 @@ def test_runtime_probe_finishes_without_leaving_background_tasks():
     async def scenario():
         result = await benchmark([8], payload_items=2, repeats=1, idle_runs=2)
         assert {
-            (row["idle_runs"], row["deadline_seconds"])
-            for row in result["active_runs"]
+            (row["idle_runs"], row["deadline_seconds"]) for row in result["active_runs"]
         } == {(0, None), (2, None), (0, 60), (2, 60)}
         assert all(row["total_seconds"] >= 0 for row in result["active_runs"])
         eager_supported = hasattr(asyncio, "eager_task_factory")

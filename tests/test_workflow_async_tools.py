@@ -44,8 +44,10 @@ def test_cancel_observer_failure_does_not_finish_before_the_owned_task_exits(
         finally:
             release.set()
             await asyncio.wait_for(
-                asyncio.gather(*(item for item in (task, waiter) if item is not None),
-                               return_exceptions=True),
+                asyncio.gather(
+                    *(item for item in (task, waiter) if item is not None),
+                    return_exceptions=True,
+                ),
                 1,
             )
 

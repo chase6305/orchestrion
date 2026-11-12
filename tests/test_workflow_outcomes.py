@@ -204,8 +204,10 @@ def test_scope_feedback_delivery_failure_logs_and_preserves_device_execution(
             return ActionOutcome.unknown("controller stop remains unconfirmed")
 
         scoped = workflow_action(
-            "scope", Workflow((Node("device", "device"),)),
-            [Action("device", device)], [Resource("arm")],
+            "scope",
+            Workflow((Node("device", "device"),)),
+            [Action("device", device)],
+            [Resource("arm")],
         )
         monkeypatch.setattr(ActionContext, "report", broken_report)
         async with WorkflowEngine([scoped], [Resource("arm")]) as engine:

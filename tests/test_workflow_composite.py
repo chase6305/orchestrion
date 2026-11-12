@@ -513,7 +513,10 @@ def test_scoped_checkpoint_preserves_the_first_captured_sdk_ticket(durable, tmp_
                 expected = {"scope_nodes": {"submit": {"ticket": "accepted-ticket"}}}
                 assert result.nodes["scope"].checkpoint == expected
                 if journal is not None:
-                    assert journal.get_run(run.run_id)["nodes"][0]["checkpoint"] == expected
+                    assert (
+                        journal.get_run(run.run_id)["nodes"][0]["checkpoint"]
+                        == expected
+                    )
 
     asyncio.run(scenario())
 

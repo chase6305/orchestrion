@@ -51,7 +51,8 @@ def test_completion_queue_failure_logs_and_finishes_without_losing_confirmed_suc
 
         journal = SQLiteJournal(tmp_path / "cell.db") if durable else None
         engine = WorkflowEngine(
-            [Action("record", record, (ResourceClaim("arm"),))], [Resource("arm")],
+            [Action("record", record, (ResourceClaim("arm"),))],
+            [Resource("arm")],
             journal=journal,
         )
         original_ready = engine._make_ready
@@ -104,7 +105,8 @@ def test_completion_queue_failure_logs_and_finishes_without_losing_confirmed_suc
             if journal is not None:
                 recorded = journal.get_run(run.run_id)
                 assert [node["status"] for node in recorded["nodes"]] == [
-                    "succeeded", "failed"
+                    "succeeded",
+                    "failed",
                 ]
                 assert all(not node["lease_active"] for node in recorded["nodes"])
         finally:
@@ -117,9 +119,12 @@ def test_completion_queue_failure_logs_and_finishes_without_losing_confirmed_suc
 
     asyncio.run(scenario())
     if durable:
+
         async def restart():
             with SQLiteJournal(tmp_path / "cell.db") as journal:
-                async with WorkflowEngine([], [Resource("arm")], journal=journal) as engine:
+                async with WorkflowEngine(
+                    [], [Resource("arm")], journal=journal
+                ) as engine:
                     recovered = await engine.get_run_by_key("once").wait(1)
                     assert recovered.status is RunStatus.FAILED
                     assert recovered.nodes["first"].status is NodeStatus.SUCCEEDED
@@ -1096,9 +1101,11 @@ def test_retiring_inputs_can_reenter_admission_without_finishing_a_graph_twice()
                             Node(
                                 "source",
                                 "noop",
-                                {"value": SubmitOnRelease("SDK input")}
-                                if index == 0
-                                else {},
+                                (
+                                    {"value": SubmitOnRelease("SDK input")}
+                                    if index == 0
+                                    else {}
+                                ),
                             ),
                             Node("hold", "hold", after=("source",)),
                         )
@@ -1319,7 +1326,9 @@ def test_driver_failure_drains_active_actions_and_never_starts_queued_work(
 
 
 @pytest.mark.parametrize("kind", ["exception", "early_return"])
-def test_unexpected_driver_exit_is_observed_without_unhandled_task_exception(kind, caplog):
+def test_unexpected_driver_exit_is_observed_without_unhandled_task_exception(
+    kind, caplog
+):
     async def scenario():
         errors = []
         loop = asyncio.get_running_loop()

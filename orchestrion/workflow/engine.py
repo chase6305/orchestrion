@@ -296,7 +296,6 @@ class WorkflowEngine:
             return
         self._driver_error = error
         self._closed = True
-        log_error("Workflow scheduler failed: %s", error)
         for run in tuple(self._runs.values()):
             self._stop_run(run, "scheduler_failed")
             for node_id, context in tuple(run._contexts.items()):
@@ -317,6 +316,7 @@ class WorkflowEngine:
             if not run.done and run._unfinished == 0:
                 self._finish_run(run)
         self._clear_ready_queues()
+        log_error("Workflow scheduler failed: %s", error)
 
     def _check_driver(self) -> None:
         # Eager factories can enter adapters before the new driver is assigned.
