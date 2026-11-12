@@ -4,6 +4,11 @@
 
 - Bound workflow scheduling turns so eager action bursts yield to cancellation
   and timers; reuse the starting scheduler for reentrant follow-up submissions.
+- Retire completed graphs without scanning unrelated waiting adapters, and reuse
+  stable output-reference scans during validation while rechecking custom schemas.
+- Roll back failed initial queue preparation, recheck admission after input
+  preparation, and retain real worker owners after partial task-factory failures.
+  Completion queue faults log and stop pending work without rewriting success.
 - Ignore completed inner nodes' late progress, isolate rejected scope checkpoint
   updates, capture SDK checkpoint data once and release it after scope cleanup.
 

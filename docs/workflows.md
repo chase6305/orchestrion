@@ -56,6 +56,9 @@ wait on a run or close its own engine.
 Dispatch runs in bounded turns so large ready batches, including eager tasks,
 yield to cancellation callbacks and timers. Follow-up submissions from an action
 reuse the scheduler being started rather than recursively starting another one.
+Completed graphs retire through a FIFO queue, so unrelated waiting adapters do
+not add a full active-run scan to every completion. Their live workers still
+consume concurrency until cleanup exits.
 
 Unexpected coroutine cancellation also keeps a running `BlockingAction` in
 engine accounting until its SDK call exits. Its cancellation token prevents queued
@@ -154,7 +157,8 @@ Use `run.explain(node_id)` for dependency, concurrency, resource, queue, stop or
 quarantine blockers. `engine.scheduler_snapshot()` shows counts, owners, queue
 heads and errors without device calls. A scheduler fault closes admission,
 fails unstarted work and requests running work to stop; cleanup still retains
-claims until confirmed quiescent.
+claims until confirmed quiescent. Failure while admitting a successor also stops
+the remaining graph and logs the error, preserving already confirmed outcomes.
 
 ## Submission identity and retention
 
@@ -163,6 +167,13 @@ for identical submissions, including failed or cancelled results. Changed
 execution snapshots raise `ValueError`. Validation happens before reserving a
 key; replay does not restart deadlines. Retrieve handles with
 `engine.get_run_by_key(key)`.
+
+Admission rechecks closure and active-run capacity after preparing inputs, since
+custom validation can invoke lifecycle APIs or submit other work. Failed initial
+queue preparation rolls back admission and its key. If a task factory fails after
+starting work, the engine keeps the accepted handle, real worker and resource
+claims in accounting; a startup error cannot make an active operation's key
+available for resubmission.
 
 `max_idempotency_keys` defaults to 1024. Explicitly use
 `engine.prune_idempotency_keys(keep_last=...)` to forget settled keys; active and
@@ -253,3 +264,20 @@ and limits contribute to the composite version. Bind parameters when constructin
 the inner graph; dynamic node inputs are not supported. Outer concurrency counts
 composites and inner concurrency counts steps. Use shared resource claims to
 enforce aggregate capacity across scopes.
+
+## Runtime probe
+
+Run the bounded, hardware-free probe on Python 3.12 to include eager cancellation:
+
+```bash
+python -m examples.benchmark_workflow_runtime --counts 512 2048 --repeats 3
+```
+
+It prints JSON with median validation/preview times for static inputs and output
+references, cancellation callback delay and cancellation processing time, graph
+execution with zero or 64 other waiting runs, and the number of SDK checkpoint
+captures. Node construction is outside the validation measurements; graph
+submission and execution times are reported separately. It starts no worker pool
+or network service. Use the same script, parameters and environment for paired
+comparisons; these synthetic workloads do not predict device latency or general
+application throughput.

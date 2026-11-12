@@ -976,6 +976,74 @@ def test_reentrant_followup_submissions_do_not_recursively_start_schedulers(
     asyncio.run(scenario())
 
 
+def test_retiring_inputs_can_reenter_admission_without_finishing_a_graph_twice():
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        held, reentered, errors = [], [], []
+
+        class SubmitOnRelease(str):
+            def __del__(self):
+                try:
+                    for index in range(2):
+                        reentered.append(
+                            engine.submit(Workflow((Node(str(index), "noop"),)))
+                        )
+                except Exception as exc:
+                    errors.append(exc)
+
+        async def noop(context, inputs):
+            return None
+
+        async def hold(context, inputs):
+            held.append(context.run_id)
+            if len(held) == 3:
+                entered.set()
+            await release.wait()
+
+        engine = WorkflowEngine(
+            [Action("noop", noop), Action("hold", hold)],
+            max_active_runs=3,
+            max_concurrency=3,
+        )
+        try:
+            initial = [
+                engine.submit(
+                    Workflow(
+                        (
+                            Node(
+                                "source",
+                                "noop",
+                                {"value": SubmitOnRelease("SDK input")}
+                                if index == 0
+                                else {},
+                            ),
+                            Node("hold", "hold", after=("source",)),
+                        )
+                    )
+                )
+                for index in range(3)
+            ]
+            await asyncio.wait_for(entered.wait(), 1)
+            release.set()
+            # Holders finish before this task resumes; the scheduler's wake is
+            # queued afterward, so admission itself retires the terminal graphs.
+            await asyncio.sleep(0)
+            outer = engine.submit(Workflow((Node("outer", "noop"),)))
+            assert errors == []
+            assert len(reentered) == 2
+            results = await asyncio.gather(
+                *(run.wait(1) for run in [*initial, *reentered, outer])
+            )
+            assert all(result.status is RunStatus.SUCCEEDED for result in results)
+            assert engine.scheduler_snapshot()["active_runs"] == 0
+            assert engine.scheduler_snapshot()["scheduler_error"] is None
+        finally:
+            release.set()
+            await engine.aclose(2)
+
+    asyncio.run(scenario())
+
+
 def test_driver_cancelled_during_worker_startup_releases_unstarted_reservation():
     async def scenario():
         loop = asyncio.get_running_loop()
