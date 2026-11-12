@@ -1,6 +1,7 @@
 """Ticket adapters distinguish transport acceptance from physical completion."""
 
 import asyncio
+from contextlib import nullcontext
 from unittest.mock import patch
 
 import pytest
@@ -260,6 +261,70 @@ def test_late_submit_acknowledgement_during_timeout_cleanup_keeps_its_ticket():
             assert result.status == RunStatus.SUCCEEDED
             assert result.nodes["remote"].checkpoint["ticket"] == "accepted-during-cleanup"
             assert len(backend.submissions) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("repeat_cancel", [False, True])
+@pytest.mark.parametrize("durable", [False, True])
+def test_native_cancellation_preserves_a_ticket_returned_during_submit_cleanup(
+    repeat_cancel, durable, tmp_path
+):
+    async def scenario():
+        entered, draining, release = (asyncio.Event() for _ in range(3))
+
+        class Backend(FakeBackend):
+            async def submit(self, operation_id, inputs):
+                self.submissions.append((operation_id, inputs))
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    draining.set()
+                    await release.wait()
+                    return "accepted-after-native-cancel"
+
+            async def query(self, ticket):
+                self.queries += 1
+                return OperationUpdate(ticket, OperationStatus.UNKNOWN, error="stop unconfirmed")
+
+        backend = Backend()
+        storage = SQLiteJournal(tmp_path / "cancel.db") if durable else nullcontext(None)
+        with storage as journal:
+            engine = WorkflowEngine(
+                [Action("remote", TicketAction(backend, stop_timeout=1), (ResourceClaim("arm"),))],
+                [Resource("arm")], journal=journal,
+            )
+            try:
+                run = engine.submit(Workflow((Node("remote", "remote"),)))
+                await asyncio.wait_for(entered.wait(), 1)
+                worker = next(iter(engine._workers))
+                worker.cancel()
+                await asyncio.wait_for(draining.wait(), 1)
+                if repeat_cancel:
+                    for _ in range(2):
+                        worker.cancel()
+                        await asyncio.sleep(0)
+                assert not run.done
+                assert engine.scheduler_snapshot()["running_actions"] == 1
+                assert engine.resource_snapshot()["resources"]["arm"]["used"] == 1
+                release.set()
+                result = await run.wait(1)
+                assert result.status is RunStatus.NEEDS_ATTENTION
+                expected = {
+                    "ticket": "accepted-after-native-cancel",
+                    "operation_id": run.operation_id("remote"),
+                }
+                assert result.nodes["remote"].checkpoint == expected
+                assert len(backend.submissions) == 1
+                assert backend.cancels == 1 and backend.queries == 1
+                if journal is not None:
+                    assert journal.get_run(run.run_id)["nodes"][0]["checkpoint"] == expected
+                assert engine.resource_snapshot()["resources"]["arm"]["used"] == 1
+                engine.confirm_quiescent(run.operation_id("remote"), evidence="arm stopped")
+            finally:
+                release.set()
+                await engine.aclose(2)
 
     asyncio.run(scenario())
 
