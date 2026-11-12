@@ -61,7 +61,7 @@ not add a full active-run scan to every completion. Their live workers still
 consume concurrency until cleanup exits. Workflow deadline timers expire waiting
 graphs; candidate deadlines are checked before new resource reservations, including
 when a blocked event loop delayed timer delivery.
-Quiescent node contexts are released while the rest of a graph keeps running;
+The engine retires its references to quiescent contexts during long graphs;
 draining contexts stay available for late recovery tickets until SDK cleanup exits.
 
 Unexpected coroutine cancellation also keeps a running `BlockingAction` in
