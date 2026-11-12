@@ -49,14 +49,16 @@ class TaskFailure:
 CallResult = Optional[Union[Dict, TaskFailure]]
 
 
-def _accept_request_id(request_id: int) -> bool:
+def _submission_request_id(request_id: int) -> Optional[int]:
+    """Capture plain integer IDs before request bookkeeping or SDK entry."""
     if isinstance(request_id, bool) or not isinstance(request_id, int):
         log_error("Cannot submit request: request_id must be an integer")
-        return False
+        return None
+    request_id = int.__int__(request_id)
     if request_id < 0:
         log_error("Cannot submit request: request_id must be non-negative")
-        return False
-    return True
+        return None
+    return request_id
 
 
 class InPlaceFunctionCallTask(GenericTask):
@@ -91,7 +93,8 @@ class InPlaceFunctionCallTask(GenericTask):
 
     def invoke_async(self, request_id: int, content: Optional[Dict] = None) -> bool:
         """Execute inline; retain execution failures and return acceptance only."""
-        if not _accept_request_id(request_id):
+        request_id = _submission_request_id(request_id)
+        if request_id is None:
             return False
         with self._lock:
             if not self._request_history.add(request_id):
@@ -244,7 +247,8 @@ class ThreadedPoolFunctionCallTask(GenericTask):
 
     def invoke_async(self, request_id: int, content: Optional[Dict] = None) -> bool:
         """Submit once; a failed executor submission leaves the request ID reusable."""
-        if not _accept_request_id(request_id):
+        request_id = _submission_request_id(request_id)
+        if request_id is None:
             return False
         with self._lock:
             executor = self._borrowed_executor
