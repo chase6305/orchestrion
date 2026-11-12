@@ -24,6 +24,8 @@
   Log changed transient main-state query errors and reset suppression on recovery.
   Capture plain scalar request identifiers and priorities before asynchronous
   admission so subclass hooks cannot fail after reserving an ID.
+  Avoid waiting on the lifecycle lock when an inline callback initializes a pilot
+  that an external caller is stopping and joining.
 
 - Reduce JSON snapshot overhead with direct string encoding and one-pass
   dictionary copying. Count actual copied entries and ignore custom string lengths
