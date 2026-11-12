@@ -3,6 +3,7 @@
 import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 
 import pytest
 
@@ -12,6 +13,7 @@ from orchestrion.workflow import (
     ActionOutcome,
     BlockingAction,
     ExecutionUncertain,
+    JournalInUse,
     Node,
     NodeStatus,
     OutputRef,
@@ -198,7 +200,10 @@ def test_scope_cancellation_retains_all_resources_until_inner_cleanup(uncertain)
 
 
 @pytest.mark.parametrize("depth", [1, 3])
-def test_repeated_scope_task_cancellation_keeps_inner_cleanup_in_accounting(depth):
+@pytest.mark.parametrize("durable", [False, True])
+def test_repeated_scope_task_cancellation_keeps_inner_cleanup_in_accounting(
+    depth, durable, tmp_path
+):
     async def scenario():
         entered, stopping, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
@@ -217,40 +222,54 @@ def test_repeated_scope_task_cancellation_keeps_inner_cleanup_in_accounting(dept
                 [scoped],
                 [Resource("arm")],
             )
-        async with WorkflowEngine(
-            [scoped], [Resource("arm")], stop_timeout=0.01
-        ) as engine:
-            run = engine.submit(Workflow((Node("scope", "scope"),)))
-            try:
-                await asyncio.wait_for(entered.wait(), 1)
-                worker = next(iter(engine._workers))
-                worker.cancel()
-                await asyncio.wait_for(stopping.wait(), 1)
-                assert (await run.wait(1)).status == RunStatus.NEEDS_ATTENTION
-                for _ in range(3):
+        storage = SQLiteJournal(tmp_path / "scope.db") if durable else nullcontext(None)
+        with storage as journal:
+            async with WorkflowEngine(
+                [scoped], [Resource("arm")], stop_timeout=0.01, journal=journal
+            ) as engine:
+                run = engine.submit(Workflow((Node("scope", "scope"),)))
+                try:
+                    await asyncio.wait_for(entered.wait(), 1)
+                    worker = next(iter(engine._workers))
                     worker.cancel()
-                    await asyncio.sleep(0)
-                    assert not worker.done()
-                    snapshot = engine.scheduler_snapshot()
-                    assert snapshot["draining_adapters"] == 1
-                    assert snapshot["running_actions"] == 1
-                    assert snapshot["resources"]["arm"]["used"] == 1
-                    with pytest.raises(RuntimeError, match="still draining"):
-                        engine.confirm_quiescent(
-                            run.operation_id("scope"), evidence="unconfirmed cleanup"
-                        )
-            finally:
-                release.set()
-            await asyncio.wait_for(asyncio.shield(worker), 1)
-            # The done callback runs after the task's last step.
-            await asyncio.sleep(0)
-            assert engine.scheduler_snapshot()["draining_adapters"] == 0
-            assert engine.scheduler_snapshot()["running_actions"] == 0
-            assert run.snapshot().nodes["scope"].status == NodeStatus.UNKNOWN
-            engine.confirm_quiescent(
-                run.operation_id("scope"), evidence="all scoped handlers exited"
-            )
-            assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
+                    await asyncio.wait_for(stopping.wait(), 1)
+                    assert (await run.wait(1)).status == RunStatus.NEEDS_ATTENTION
+                    if journal is not None:
+                        with pytest.raises(asyncio.TimeoutError):
+                            await engine.aclose(0.001)
+                    for _ in range(3):
+                        worker.cancel()
+                        await asyncio.sleep(0)
+                        assert not worker.done()
+                        snapshot = engine.scheduler_snapshot()
+                        assert snapshot["draining_adapters"] == 1
+                        assert snapshot["running_actions"] == 1
+                        assert snapshot["resources"]["arm"]["used"] == 1
+                        with pytest.raises(RuntimeError, match="still draining"):
+                            engine.confirm_quiescent(
+                                run.operation_id("scope"),
+                                evidence="unconfirmed cleanup",
+                            )
+                        if journal is not None:
+                            with pytest.raises(JournalInUse, match="drain"):
+                                journal.close()
+                            record = journal.get_run(run.run_id)["nodes"][0]
+                            assert record["status"] == "unknown"
+                            assert record["lease_active"]
+                finally:
+                    release.set()
+                await asyncio.wait_for(asyncio.shield(worker), 1)
+                # The done callback runs after the task's last step.
+                await asyncio.sleep(0)
+                assert engine.scheduler_snapshot()["draining_adapters"] == 0
+                assert engine.scheduler_snapshot()["running_actions"] == 0
+                assert run.snapshot().nodes["scope"].status == NodeStatus.UNKNOWN
+                engine.confirm_quiescent(
+                    run.operation_id("scope"), evidence="all scoped handlers exited"
+                )
+                assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
+                if journal is not None:
+                    assert not journal.get_run(run.run_id)["nodes"][0]["lease_active"]
 
     asyncio.run(scenario())
 
