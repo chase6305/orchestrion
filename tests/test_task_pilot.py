@@ -537,6 +537,53 @@ def test_scheduler_failure_closes_admission_cancels_pending_and_allows_restart(
         pilot.stop(timeout=1)
 
 
+def test_start_failure_retains_a_launched_scheduler_until_it_exits(monkeypatch):
+    release = threading.Event()
+    launched = []
+    robot, task = RobotTaskStub(), RecordingTask()
+    pilot = TaskPilot(robot, {"device": task})
+    original_loop = pilot._bg_thread_loop
+    original_start = threading.Thread.start
+
+    def parked_scheduler():
+        assert release.wait(2)
+        original_loop()
+
+    def failed_start(thread):
+        original_start(thread)
+        launched.append(thread)
+        raise RuntimeError("thread started before instrumentation failed")
+
+    monkeypatch.setattr(pilot, "_bg_thread_loop", parked_scheduler)
+    try:
+        with monkeypatch.context() as failure:
+            failure.setattr(threading.Thread, "start", failed_start)
+            with pytest.raises(RuntimeError, match="instrumentation failed"):
+                pilot.initialize()
+        assert len(launched) == 1
+        assert pilot._bg_thread is launched[0]
+        assert pilot._bg_thread.is_alive()
+        assert not pilot.is_running
+        assert robot.stopped
+        assert pilot.call_srv_async("device") == -1
+        with pytest.raises(RuntimeError, match="still stopping"):
+            pilot.initialize()
+        release.set()
+        launched[0].join(1)
+        assert not launched[0].is_alive()
+        monkeypatch.setattr(pilot, "_bg_thread_loop", original_loop)
+        pilot.initialize()
+        request_id = pilot.call_srv_async("device", {"fresh": True})
+        assert request_id == 0
+        assert pilot.wait_request(request_id, timeout=1).content == {"fresh": True}
+        assert task.calls == [{"fresh": True}]
+    finally:
+        release.set()
+        pilot.stop(timeout=1)
+        for thread in launched:
+            thread.join(1)
+
+
 def test_scheduler_cleanup_attempts_all_devices_when_stop_and_logging_fail(monkeypatch):
     release = threading.Event()
     entered = threading.Event()
