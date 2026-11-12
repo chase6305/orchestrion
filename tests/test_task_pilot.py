@@ -1821,3 +1821,37 @@ def test_inline_stop_does_not_wait_for_an_external_caller_joining_the_scheduler(
         assert pilot.query_request(request_id).status is RequestStatus.SUCCEEDED
     finally:
         pilot.stop()
+
+
+@pytest.mark.parametrize("broken_logger", [False, True])
+def test_inline_initialize_does_not_wait_for_a_caller_joining_the_scheduler(
+    broken_logger, monkeypatch
+):
+    started = threading.Event()
+    returned = threading.Event()
+
+    class InitializingTask(RecordingTask):
+        def _call_fn(self, request_id, content):
+            started.set()
+            assert pilot._stop_event.wait(2)
+            pilot.initialize()
+            returned.set()
+            return content
+
+    if broken_logger:
+        def fail_log(*args, **kwargs):
+            raise RuntimeError("log handler unavailable")
+
+        monkeypatch.setattr("orchestrion.utils.logger.logger.error", fail_log)
+    pilot = TaskPilot(SimulatedRobotTask([0.0]), {"device": InitializingTask()})
+    pilot.initialize()
+    try:
+        request_id = pilot.call_srv_async("device")
+        assert started.wait(1)
+        pilot.stop(timeout=1)
+        assert returned.is_set()
+        assert not pilot._bg_thread.is_alive()
+        assert not pilot.is_running
+        assert pilot.query_request(request_id).status is RequestStatus.SUCCEEDED
+    finally:
+        pilot.stop(timeout=1)

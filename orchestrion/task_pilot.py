@@ -186,6 +186,12 @@ class TaskPilot:
 
     def initialize(self) -> None:
         """Initialize the pilot once, serializing concurrent lifecycle calls."""
+        if threading.current_thread() is self._bg_thread:
+            # A concurrent stop can hold the lifecycle lock while joining this
+            # thread. An inline callback must not wait for that cleanup owner.
+            if not self._initialized:
+                log_error("TaskPilot cannot initialize from its stopping scheduler")
+            return
         with self._lifecycle_lock:
             self._initialize_locked()
 

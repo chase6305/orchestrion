@@ -54,6 +54,9 @@ It does not escape the background thread. After cleanup finishes, a pilot withou
 an owned executor can be explicitly initialized again. An owned executor is shut
 down during cleanup and requires a new pilot. As with ordinary cancellation,
 local request cancellation does not confirm a physical device has stopped.
+Initialization from an inline scheduler callback is already satisfied while the
+pilot runs. During concurrent shutdown it logs and returns, allowing the external
+stop caller to finish joining the scheduler.
 
 An unexpected built-in motion-worker failure stops local scheduling, cancels
 unfinished move IDs and wakes waiters. Restart explicitly with `initialize()`
