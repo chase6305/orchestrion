@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import heapq
+import inspect
 import time
 import weakref
 from collections import deque
@@ -17,6 +18,7 @@ from orchestrion.utils.errors import exception_message
 from orchestrion.utils.logger import log_error
 
 from .actions import Action, ActionContext
+from .async_tools import find_task_owner
 from .compiler import (
     CompiledNode,
     check_claims,
@@ -234,7 +236,31 @@ class WorkflowEngine:
     def _spawn(self, coroutine):
         try:
             return self._loop.create_task(coroutine)
-        except BaseException:
+        except BaseException as exc:
+            if isinstance(exc, (Exception, asyncio.CancelledError)):
+                owner = find_task_owner(coroutine)
+                completed = inspect.getcoroutinestate(coroutine) == inspect.CORO_CLOSED
+                if owner is not None or completed:
+                    # Instrumentation can fail after the task was created. Keep
+                    # that real owner in accounting instead of closing its frame.
+                    log_error(
+                        "Task factory failed after scheduling began: %s",
+                        _error_text(exc),
+                    )
+                    if isinstance(exc, asyncio.CancelledError):
+                        if owner is not None:
+                            owner.cancel()
+                        self._fail_scheduler(
+                            "CancelledError: task creation interrupted"
+                        )
+                    if owner is not None:
+                        return owner
+                    # Eager execution can finish before the factory throws. Its
+                    # frame has exited, but completion accounting must still run
+                    # (for example, to retire an expired stop budget's drainer).
+                    finished = self._loop.create_future()
+                    finished.set_result(None)
+                    return finished
             coroutine.close()
             raise
 
@@ -245,13 +271,18 @@ class WorkflowEngine:
         if not driver.cancelled() and exception is None and not self._runs:
             return
         if driver.cancelled():
-            self._driver_error = "CancelledError: workflow scheduler interrupted"
+            error = "CancelledError: workflow scheduler interrupted"
         elif exception is not None:
-            self._driver_error = _error_text(exception)
+            error = _error_text(exception)
         else:
-            self._driver_error = (
-                "RuntimeError: workflow scheduler exited with active runs"
-            )
+            error = "RuntimeError: workflow scheduler exited with active runs"
+        self._fail_scheduler(error)
+
+    def _fail_scheduler(self, error: str) -> None:
+        """Stop admission while independently owned actions finish their cleanup."""
+        if self._driver_error is not None:
+            return
+        self._driver_error = error
         self._closed = True
         for run in tuple(self._runs.values()):
             self._stop_run(run, "scheduler_failed")
@@ -407,7 +438,21 @@ class WorkflowEngine:
                 finally:
                     self._starting_driver = False
                 self._driver.add_done_callback(self._driver_done)
-        except BaseException:
+        except BaseException as exc:
+            if isinstance(exc, (Exception, asyncio.CancelledError)) and (
+                run.done or run._contexts
+            ):
+                # An eager factory may run the driver before throwing. Existing
+                # reservations or results belong to an accepted operation; its
+                # key must not be reused while cleanup can still be active.
+                error = (
+                    "scheduler startup failed after work was reserved: "
+                    + _error_text(exc)
+                )
+                log_error("%s", error)
+                if self._runs:
+                    self._fail_scheduler(error)
+                return run
             self._stop_run(run, "scheduler_start_failed")
             self._finish_run(run)
             if idempotency_key is not None:
@@ -869,11 +914,21 @@ class WorkflowEngine:
             try:
                 worker = self._spawn(self._execute(run, item, context))
             except Exception as exc:
+                if run._results[node_id].status.terminal:
+                    log_error(
+                        "Task factory failed after action completion: %s",
+                        _error_text(exc),
+                    )
+                    continue
                 self._settle(
                     run,
                     item,
                     context,
-                    NodeStatus.FAILED,
+                    (
+                        NodeStatus.UNKNOWN
+                        if context._handler_started
+                        else NodeStatus.FAILED
+                    ),
                     error="could not start action: " + _error_text(exc),
                 )
             else:

@@ -3,12 +3,14 @@
 import asyncio
 import gc
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from orchestrion.workflow import (
     Action,
+    ActionOutcome,
     BlockingAction,
     ExecutionUncertain,
     FailurePolicy,
@@ -24,6 +26,277 @@ from orchestrion.workflow import (
 
 async def echo(context, inputs):
     return inputs
+
+
+@pytest.mark.parametrize("stage", ["_schedule", "_execute"])
+@pytest.mark.parametrize("eager", [False, True])
+def test_factory_failure_after_task_creation_keeps_the_real_owner_in_accounting(
+    stage, eager, caplog
+):
+    if eager and not hasattr(asyncio, "eager_task_factory"):
+        pytest.skip("requires eager task support")
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        previous_factory, previous_handler = (
+            loop.get_task_factory(),
+            loop.get_exception_handler(),
+        )
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls, unhandled = [], []
+        rejected = False
+
+        def factory(loop, coroutine, **kwargs):
+            nonlocal rejected
+            name = coroutine.cr_code.co_name
+            task = (
+                asyncio.eager_task_factory(loop, coroutine, **kwargs)
+                if eager
+                else asyncio.Task(coroutine, loop=loop, **kwargs)
+            )
+            if name == stage and not rejected:
+                rejected = True
+                raise RuntimeError("instrumentation failed after task creation")
+            return task
+
+        async def device(context, inputs):
+            calls.append(context.operation_id)
+            entered.set()
+            await release.wait()
+            return {"stopped": True}
+
+        engine = WorkflowEngine(
+            [Action("device", device, (ResourceClaim("arm"),))], [Resource("arm")]
+        )
+        loop.set_exception_handler(lambda loop, detail: unhandled.append(detail))
+        try:
+            loop.set_task_factory(factory)
+            run = engine.submit(
+                Workflow((Node("device", "device"),)), idempotency_key="once"
+            )
+            await asyncio.wait_for(entered.wait(), 1)
+            assert not run.done
+            assert engine.scheduler_snapshot()["running_actions"] == 1
+            assert engine.resource_snapshot()["resources"]["arm"]["used"] == 1
+            assert engine.get_run_by_key("once") is run
+            release.set()
+            assert (await run.wait(1)).status is RunStatus.SUCCEEDED
+            await asyncio.sleep(0)
+            gc.collect()
+            assert calls == [run.operation_id("device")]
+            assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
+            assert not unhandled
+            assert "instrumentation failed after task creation" in caplog.text
+        finally:
+            release.set()
+            loop.set_task_factory(previous_factory)
+            await engine.aclose(2)
+            loop.set_exception_handler(previous_handler)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(
+    not hasattr(asyncio, "eager_task_factory"), reason="requires eager task support"
+)
+@pytest.mark.parametrize("stage", ["_schedule", "_execute"])
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_factory_failure_after_eager_completion_preserves_the_observed_result(
+    stage, uncertain
+):
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        previous_factory = loop.get_task_factory()
+        calls = []
+        rejected = False
+
+        def factory(loop, coroutine, **kwargs):
+            nonlocal rejected
+            name = coroutine.cr_code.co_name
+            task = asyncio.eager_task_factory(loop, coroutine, **kwargs)
+            if name == stage and not rejected:
+                rejected = True
+                raise RuntimeError("factory failed after eager completion")
+            return task
+
+        async def device(context, inputs):
+            calls.append(context.operation_id)
+            if uncertain:
+                return ActionOutcome.unknown("physical stop was not confirmed")
+            return {"stopped": True}
+
+        engine = WorkflowEngine(
+            [Action("device", device, (ResourceClaim("arm"),))], [Resource("arm")]
+        )
+        workflow = Workflow((Node("device", "device"),))
+        try:
+            loop.set_task_factory(factory)
+            run = engine.submit(workflow, idempotency_key="once")
+            result = await run.wait(1)
+            assert result.status is (
+                RunStatus.NEEDS_ATTENTION if uncertain else RunStatus.SUCCEEDED
+            )
+            assert engine.submit(workflow, idempotency_key="once") is run
+            assert calls == [run.operation_id("device")]
+            assert engine.resource_snapshot()["resources"]["arm"]["used"] == int(
+                uncertain
+            )
+            if uncertain:
+                engine.confirm_quiescent(
+                    run.operation_id("device"), evidence="SDK exited; controller idle"
+                )
+        finally:
+            loop.set_task_factory(previous_factory)
+            await engine.aclose(2)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(
+    not hasattr(asyncio, "eager_task_factory"), reason="requires eager task support"
+)
+def test_factory_failure_after_eager_stop_expiry_still_retires_the_finished_drainer():
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        previous_factory = loop.get_task_factory()
+
+        def factory(loop, coroutine, **kwargs):
+            task = asyncio.eager_task_factory(loop, coroutine, **kwargs)
+            if coroutine.cr_code.co_name == "_execute":
+                raise RuntimeError("factory failed after stop expiry")
+            return task
+
+        async def device(context, inputs):
+            context._request_cancel("adapter_interrupted")
+            # Model a blocking adapter that returns only after the stop budget.
+            time.sleep(0.01)
+            return ActionOutcome.cancelled("device has stopped")
+
+        engine = WorkflowEngine(
+            [Action("device", device, (ResourceClaim("arm"),))],
+            [Resource("arm")],
+            stop_timeout=0.001,
+        )
+        try:
+            loop.set_task_factory(factory)
+            run = engine.submit(Workflow((Node("device", "device"),)))
+            assert (await run.wait(1)).status is RunStatus.NEEDS_ATTENTION
+            await asyncio.sleep(0)
+            assert engine.scheduler_snapshot()["draining_adapters"] == 0
+            assert engine.scheduler_snapshot()["running_actions"] == 0
+            engine.confirm_quiescent(
+                run.operation_id("device"), evidence="handler exited; device stopped"
+            )
+            assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
+        finally:
+            loop.set_task_factory(previous_factory)
+            await engine.aclose(2)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stage", ["_schedule", "_execute"])
+def test_cancelled_factory_after_creating_owner_stops_unstarted_device_calls(stage):
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        previous_factory = loop.get_task_factory()
+        calls = []
+        rejected = False
+
+        def factory(loop, coroutine, **kwargs):
+            nonlocal rejected
+            task = asyncio.Task(coroutine, loop=loop, **kwargs)
+            if coroutine.cr_code.co_name == stage and not rejected:
+                rejected = True
+                raise asyncio.CancelledError("factory interrupted after task creation")
+            return task
+
+        async def device(context, inputs):
+            calls.append(context.node_id)
+
+        engine = WorkflowEngine([Action("device", device)])
+        try:
+            loop.set_task_factory(factory)
+            run = engine.submit(
+                Workflow((Node("first", "device"), Node("second", "device")))
+            )
+            assert (await run.wait(1)).status is RunStatus.FAILED
+            assert calls == []
+            assert engine.scheduler_snapshot()["closed"]
+            assert engine.scheduler_snapshot()["running_actions"] == 0
+            assert not engine.resource_snapshot()["quarantined"]
+        finally:
+            loop.set_task_factory(previous_factory)
+            await engine.aclose(2)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(
+    not hasattr(asyncio, "eager_task_factory"), reason="requires eager task support"
+)
+def test_failed_eager_driver_start_retains_a_live_action_and_its_key():
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        previous_factory = loop.get_task_factory()
+        release = asyncio.Event()
+        calls = []
+        attempted = 0
+
+        def factory(loop, coroutine, **kwargs):
+            nonlocal attempted
+            name = coroutine.cr_code.co_name
+            if name == "_execute":
+                attempted += 1
+                if attempted == 2:
+                    raise asyncio.CancelledError("second worker startup interrupted")
+            task = asyncio.eager_task_factory(loop, coroutine, **kwargs)
+            if name == "_schedule":
+                raise RuntimeError("driver instrumentation failed after creation")
+            return task
+
+        async def device(context, inputs):
+            calls.append(context.node_id)
+            await release.wait()
+            return ActionOutcome.cancelled(context.cancel_reason)
+
+        engine = WorkflowEngine(
+            [Action("device", device, (ResourceClaim("arm"),))],
+            [Resource("arm", 2)],
+            max_concurrency=2,
+            stop_timeout=0.01,
+        )
+        try:
+            loop.set_task_factory(factory)
+            run = engine.submit(
+                Workflow((Node("first", "device"), Node("second", "device"))),
+                idempotency_key="accepted",
+            )
+            assert calls == ["first"]
+            assert engine.get_run_by_key("accepted") is run
+            assert (await run.wait(1)).status is RunStatus.NEEDS_ATTENTION
+            snapshot = engine.scheduler_snapshot()
+            assert snapshot["closed"]
+            assert snapshot["running_actions"] == 1
+            assert snapshot["draining_adapters"] == 1
+            assert snapshot["resources"]["arm"]["used"] == 1
+            with pytest.raises(RuntimeError, match="still draining"):
+                engine.confirm_quiescent(
+                    run.operation_id("first"), evidence="cleanup pending"
+                )
+            release.set()
+            await engine.aclose(1)
+            assert engine.scheduler_snapshot()["running_actions"] == 0
+            engine.confirm_quiescent(
+                run.operation_id("first"), evidence="handler exited; controller idle"
+            )
+            assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
+        finally:
+            release.set()
+            loop.set_task_factory(previous_factory)
+            await engine.aclose(2)
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("timeout", [None, 1e-9, 1.0])

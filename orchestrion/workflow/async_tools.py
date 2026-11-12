@@ -25,6 +25,18 @@ class AsyncFailure:
         )
 
 
+def find_task_owner(coroutine: Coroutine[Any, Any, Any]) -> Optional[asyncio.Task]:
+    """Recover a still-active owner when a factory fails after creating it."""
+    return next(
+        (
+            candidate
+            for candidate in asyncio.all_tasks()
+            if candidate.get_coro() is coroutine
+        ),
+        None,
+    )
+
+
 def start_task(coroutine: Coroutine[Any, Any, Any]) -> Union[asyncio.Task, AsyncFailure]:
     """Close a rejected coroutine, including when its factory cancels startup."""
     task = None
@@ -36,10 +48,7 @@ def start_task(coroutine: Coroutine[Any, Any, Any]) -> Union[asyncio.Task, Async
         # A custom factory may create/start a task and then fail before returning
         # it (for example, its own logging fails). Recover that owner so callers
         # can drain it instead of closing an actively owned coroutine.
-        pending_task = next(
-            (candidate for candidate in asyncio.all_tasks()
-             if candidate.get_coro() is coroutine), None,
-        )
+        pending_task = find_task_owner(coroutine)
         return AsyncFailure(
             exception_description(exc), type(exc),
             not_started=inspect.getcoroutinestate(coroutine) == inspect.CORO_CREATED,
