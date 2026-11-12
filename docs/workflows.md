@@ -165,7 +165,8 @@ quarantine blockers. `engine.scheduler_snapshot()` shows counts, owners, queue
 heads and errors without device calls. A scheduler fault closes admission,
 fails unstarted work and requests running work to stop; cleanup still retains
 claims until confirmed quiescent. Failure while admitting a successor also stops
-the remaining graph and logs the error, preserving already confirmed outcomes.
+the remaining graph and logs the error, committing already confirmed outcomes
+even when queue preparation fails. Durable recovery sees consistent final states.
 
 ## Submission identity and retention
 
@@ -285,8 +286,8 @@ python -m examples.benchmark_workflow_runtime --counts 512 2048 --repeats 3
 It prints JSON with median validation/preview times for static inputs and output
 references, cancellation callback delay and cancellation processing time, graph
 execution with zero or 64 other waiting runs, with and without workflow deadlines,
-and the number of SDK feedback and checkpoint captures. It also measures eager graphs that run
-to completion without cancellation. Node construction is outside the validation
+and the number of SDK feedback and checkpoint captures. It also measures eager
+graphs that run to completion without cancellation. Node construction is outside the validation
 measurements; graph submission and execution times are reported separately.
 Zero-waiter probes also report time through engine draining, including worker done
 callbacks that can follow an eager run's final result. It starts no worker pool

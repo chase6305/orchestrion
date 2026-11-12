@@ -8,13 +8,14 @@
   stable output-reference scans during validation while rechecking custom schemas.
 - Roll back failed initial queue preparation, recheck admission after input
   preparation, and retain real worker owners after partial task-factory failures.
-  Completion queue faults log and stop pending work without rewriting success.
+  Completion queue faults log and stop pending work while committing confirmed
+  outcomes so durable recovery stays consistent.
 - Capture primitive resource quantities and timer budgets before asynchronous
   arithmetic; preserve integral durable fingerprints. Isolate native cancellation
   raised by log sinks and SDK exception formatters from operation accounting.
 - Ignore completed inner nodes' late progress, isolate rejected scope checkpoint
-  updates, capture successful SDK progress and checkpoint data once and release checkpoints
-  after scope cleanup.
+  updates, capture successful SDK progress and checkpoint data once, and release
+  checkpoints after scope cleanup.
 
 - Log and drop invalid or oversized optional workflow progress instead of raising
   into device handlers. Count these reports and contain cancelled progress sinks
