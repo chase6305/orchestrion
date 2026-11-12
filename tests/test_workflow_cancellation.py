@@ -301,6 +301,39 @@ def test_delayed_timer_does_not_report_success_after_elapsed_budget(scope):
     asyncio.run(scenario())
 
 
+def test_delayed_workflow_timer_expires_before_new_resource_reservations():
+    async def scenario():
+        calls = []
+
+        async def record(context, inputs):
+            calls.append(context.node_id)
+
+        async with WorkflowEngine(
+            [Action("record", record, (ResourceClaim("arm"),))], [Resource("arm")]
+        ) as engine:
+            run = engine.submit(
+                Workflow(
+                    (Node("first", "record"), Node("second", "record")), timeout=0.001
+                )
+            )
+            # The driver is ready before the due timer. Neither may run until the
+            # caller yields, after this deliberately elapsed workflow budget.
+            time.sleep(0.01)
+            result = await run.wait(1)
+            assert result.status is RunStatus.FAILED
+            assert all(
+                node.status is NodeStatus.TIMED_OUT for node in result.nodes.values()
+            )
+            assert all(node.started_at is None for node in result.nodes.values())
+            assert calls == []
+            assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
+            followup = engine.submit(Workflow((Node("next", "record"),)))
+            assert (await followup.wait(1)).status is RunStatus.SUCCEEDED
+            assert calls == ["next"]
+
+    asyncio.run(scenario())
+
+
 def test_successful_run_cancels_its_budget_timer():
     async def scenario():
         async def echo(context, inputs):

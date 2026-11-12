@@ -153,7 +153,6 @@ class WorkflowEngine:
         self._quarantined: Dict[str, Tuple[WorkflowRun, str]] = {}
         self._runs: Dict[str, WorkflowRun] = {}
         self._finished_runs: OrderedDict[str, WorkflowRun] = OrderedDict()
-        self._deadline_runs: Dict[str, WorkflowRun] = {}
         self._workers = set()
         self._running_count = 0
         self._ready_sequence = 0
@@ -446,8 +445,6 @@ class WorkflowEngine:
         run = WorkflowRun(self, workflow, compiled, idempotency_key)
         self._record_journal("_admit", run, compiled, fingerprint, strict=True)
         self._runs[run.run_id] = run
-        if run._deadline is not None:
-            self._deadline_runs[run.run_id] = run
         self._idle.clear()
         if idempotency_key is not None:
             self._submissions[idempotency_key] = (fingerprint, run)
@@ -684,7 +681,6 @@ class WorkflowEngine:
         )
 
     def _stop_run(self, run: WorkflowRun, reason: str) -> None:
-        self._deadline_runs.pop(run.run_id, None)
         if run._deadline_timer is not None:
             run._deadline_timer.cancel()
         run._status = RunStatus.CANCELLING
@@ -857,7 +853,6 @@ class WorkflowEngine:
 
     def _finish_run(self, run: WorkflowRun) -> None:
         self._finished_runs.pop(run.run_id, None)
-        self._deadline_runs.pop(run.run_id, None)
         if run._deadline_timer is not None:
             run._deadline_timer.cancel()
         statuses = {result.status for result in run._results.values()}
@@ -913,8 +908,6 @@ class WorkflowEngine:
 
     def _advance_scheduler(self) -> bool:
         """Advance a bounded turn; report whether ready work needs another turn."""
-        for run in tuple(self._deadline_runs.values()):
-            self._check_run_deadline(run)
         self._finish_completed_runs()
 
         if self._journal_error is not None:
@@ -931,6 +924,9 @@ class WorkflowEngine:
             entry = heapq.heappop(self._ready_heap)
             self._ready_queued.discard(entry[1])
             _, _, run, item = entry
+            # Waiting graphs have their own timers. Check only this candidate
+            # before reserving anything, even if the loop delayed its timer.
+            self._check_run_deadline(run)
             if not self._is_ready(entry) or not self._can_start(entry):
                 continue
             node_id = item.node.node_id

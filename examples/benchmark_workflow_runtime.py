@@ -136,7 +136,7 @@ async def _checkpoint_capture():
         }
 
 
-async def _with_idle_runs(count, idle_runs, *, eager=False):
+async def _with_idle_runs(count, idle_runs, *, eager=False, deadline=False):
     loop = asyncio.get_running_loop()
     factory = getattr(asyncio, "eager_task_factory", None)
     if eager and factory is None:
@@ -159,12 +159,15 @@ async def _with_idle_runs(count, idle_runs, *, eager=False):
         max_nodes_per_run=count,
         max_events_per_run=10,
     )
-    workflow = Workflow(tuple(Node(str(index), "noop") for index in range(count)))
+    budget = 60 if deadline else None
+    workflow = Workflow(
+        tuple(Node(str(index), "noop") for index in range(count)), timeout=budget
+    )
     try:
         if eager:
             loop.set_task_factory(factory)
         for _ in range(idle_runs):
-            engine.submit(Workflow((Node("hold", "hold"),)))
+            engine.submit(Workflow((Node("hold", "hold"),), timeout=budget))
         if idle_runs:
             await asyncio.wait_for(entered.wait(), 5)
         before = time.perf_counter()
@@ -177,6 +180,7 @@ async def _with_idle_runs(count, idle_runs, *, eager=False):
             "supported": True,
             "eager": eager,
             "idle_runs": idle_runs,
+            "deadline_seconds": budget,
             "submit_seconds": submitted - before,
             "run_seconds": completed - submitted,
             "total_seconds": completed - before,
@@ -208,12 +212,18 @@ async def benchmark(counts, payload_items, repeats, idle_runs):
                 sample["calls_before_cancel"] for sample in samples
             )
         cancellation.append(row)
-        for held in (0, idle_runs):
-            samples = [await _with_idle_runs(count, held) for _ in range(repeats)]
-            row = dict(samples[0])
-            for metric in ("submit_seconds", "run_seconds", "total_seconds"):
-                row[metric] = statistics.median(sample[metric] for sample in samples)
-            active_runs.append(row)
+        for deadline in (False, True):
+            for held in (0, idle_runs):
+                samples = [
+                    await _with_idle_runs(count, held, deadline=deadline)
+                    for _ in range(repeats)
+                ]
+                row = dict(samples[0])
+                for metric in ("submit_seconds", "run_seconds", "total_seconds"):
+                    row[metric] = statistics.median(
+                        sample[metric] for sample in samples
+                    )
+                active_runs.append(row)
         samples = [await _with_idle_runs(count, 0, eager=True) for _ in range(repeats)]
         row = dict(samples[0])
         if row["supported"]:

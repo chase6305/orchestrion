@@ -1,6 +1,6 @@
 name: Bounded workflow runtime comparison
 
-# Fourth probe: include complete eager bursts and traced allocation peaks.
+# Fifth probe: compare waiting graphs both with and without workflow deadlines.
 
 on:
   push:
@@ -34,8 +34,8 @@ jobs:
         run: |
           git fetch --depth=1 origin f1f35cb28eaee2a6d043c2181f9605f057a63e10
           git worktree add --detach /tmp/orchestrion-runtime-baseline FETCH_HEAD
-          git fetch --depth=1 origin a94500834883fdd8e1ee8791815400fed33164e6
-          git worktree add --detach /tmp/orchestrion-runtime-before-bookkeeping FETCH_HEAD
+          git fetch --depth=1 origin 12433fed6834fc1ecd03abdff7d602fa5a811b5e
+          git worktree add --detach /tmp/orchestrion-runtime-before-deadline-checks FETCH_HEAD
       - name: Measure the baseline sequentially
         working-directory: /tmp/orchestrion-runtime-baseline
         env:
@@ -43,13 +43,13 @@ jobs:
         run: |
           nice -n 10 timeout 75s python "$GITHUB_WORKSPACE/examples/benchmark_workflow_runtime.py" --counts 512 2048 --payload-items 128 --repeats 3 --label baseline > "$GITHUB_WORKSPACE/runtime-baseline.json"
           cat "$GITHUB_WORKSPACE/runtime-baseline.json"
-      - name: Measure the runtime before completed-run bookkeeping
-        working-directory: /tmp/orchestrion-runtime-before-bookkeeping
+      - name: Measure the runtime before removing deadline scans
+        working-directory: /tmp/orchestrion-runtime-before-deadline-checks
         env:
-          PYTHONPATH: /tmp/orchestrion-runtime-before-bookkeeping
+          PYTHONPATH: /tmp/orchestrion-runtime-before-deadline-checks
         run: |
-          nice -n 10 timeout 75s python "$GITHUB_WORKSPACE/examples/benchmark_workflow_runtime.py" --counts 512 2048 --payload-items 128 --repeats 3 --label before-bookkeeping > "$GITHUB_WORKSPACE/runtime-before-bookkeeping.json"
-          cat "$GITHUB_WORKSPACE/runtime-before-bookkeeping.json"
+          nice -n 10 timeout 75s python "$GITHUB_WORKSPACE/examples/benchmark_workflow_runtime.py" --counts 512 2048 --payload-items 128 --repeats 3 --label before-deadline-checks > "$GITHUB_WORKSPACE/runtime-before-deadline-checks.json"
+          cat "$GITHUB_WORKSPACE/runtime-before-deadline-checks.json"
       - name: Measure the proposed runtime sequentially
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -90,7 +90,7 @@ jobs:
           '''
           for label, repository in (
               ("baseline", "/tmp/orchestrion-runtime-baseline"),
-              ("before-bookkeeping", "/tmp/orchestrion-runtime-before-bookkeeping"),
+              ("before-deadline-checks", "/tmp/orchestrion-runtime-before-deadline-checks"),
               ("proposed", os.environ["GITHUB_WORKSPACE"]),
           ):
               subprocess.run(

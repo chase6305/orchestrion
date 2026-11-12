@@ -204,8 +204,10 @@ class Node:
         if isinstance(self.priority, bool) or not isinstance(self.priority, int):
             raise TypeError("priority must be an integer")
         object.__setattr__(self, "priority", int.__int__(self.priority))
-        object.__setattr__(self, "timeout", _timeout(self.timeout))
-        object.__setattr__(self, "stop_timeout", _timeout(self.stop_timeout))
+        if self.timeout is not None:
+            object.__setattr__(self, "timeout", _timeout(self.timeout))
+        if self.stop_timeout is not None:
+            object.__setattr__(self, "stop_timeout", _timeout(self.stop_timeout))
 
 
 @dataclass(frozen=True)
@@ -219,7 +221,8 @@ class Workflow:
         if not self.nodes or any(not isinstance(node, Node) for node in self.nodes):
             raise ValueError("workflow requires at least one Node")
         object.__setattr__(self, "failure_policy", FailurePolicy(self.failure_policy))
-        object.__setattr__(self, "timeout", _timeout(self.timeout))
+        if self.timeout is not None:
+            object.__setattr__(self, "timeout", _timeout(self.timeout))
 
 
 class NodeStatus(str, Enum):

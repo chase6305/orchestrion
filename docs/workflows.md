@@ -58,7 +58,9 @@ yield to cancellation callbacks and timers. Follow-up submissions from an action
 reuse the scheduler being started rather than recursively starting another one.
 Completed graphs retire through a FIFO queue, so unrelated waiting adapters do
 not add a full active-run scan to every completion. Their live workers still
-consume concurrency until cleanup exits.
+consume concurrency until cleanup exits. Workflow deadline timers expire waiting
+graphs; candidate deadlines are checked before new resource reservations, including
+when a blocked event loop delayed timer delivery.
 
 Unexpected coroutine cancellation also keeps a running `BlockingAction` in
 engine accounting until its SDK call exits. Its cancellation token prevents queued
@@ -280,7 +282,8 @@ python -m examples.benchmark_workflow_runtime --counts 512 2048 --repeats 3
 
 It prints JSON with median validation/preview times for static inputs and output
 references, cancellation callback delay and cancellation processing time, graph
-execution with zero or 64 other waiting runs, and the number of SDK checkpoint
+execution with zero or 64 other waiting runs, with and without workflow deadlines,
+and the number of SDK checkpoint
 captures. It also measures eager graphs that run to completion without cancellation.
 Node construction is outside the validation measurements; graph
 submission and execution times are reported separately. It starts no worker pool
