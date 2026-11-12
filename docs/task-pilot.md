@@ -36,6 +36,9 @@ Adapter request IDs and movement counters must be Python integers; boolean and f
 aliases are rejected. The `-1` movement sentinel means no move yet. Invalid
 submission counters reject new requests; invalid completion counters fail waiting
 requests before a peripheral is invoked.
+Function tasks capture integer subclasses as plain IDs before history updates
+and SDK invocation. Pilot service names, idempotency keys, priorities and captured
+movement IDs similarly use plain string/integer values.
 
 Submission captures a validated copy of the synchronization option, including
 mutable options changed after construction. Rejected options log and return `-1`
