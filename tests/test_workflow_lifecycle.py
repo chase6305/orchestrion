@@ -20,6 +20,7 @@ from orchestrion.workflow import (
     Resource,
     ResourceClaim,
     RunStatus,
+    SQLiteJournal,
     Workflow,
     WorkflowEngine,
 )
@@ -31,8 +32,9 @@ async def echo(context, inputs):
 
 @pytest.mark.parametrize("eager", [False, True])
 @pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+@pytest.mark.parametrize("durable", [False, True])
 def test_completion_queue_failure_logs_and_finishes_without_losing_confirmed_success(
-    eager, failure, monkeypatch, caplog
+    eager, failure, durable, monkeypatch, caplog, tmp_path
 ):
     if eager and not hasattr(asyncio, "eager_task_factory"):
         pytest.skip("requires eager task support")
@@ -46,8 +48,10 @@ def test_completion_queue_failure_logs_and_finishes_without_losing_confirmed_suc
         async def record(context, inputs):
             calls.append(context.node_id)
 
+        journal = SQLiteJournal(tmp_path / "cell.db") if durable else None
         engine = WorkflowEngine(
-            [Action("record", record, (ResourceClaim("arm"),))], [Resource("arm")]
+            [Action("record", record, (ResourceClaim("arm"),))], [Resource("arm")],
+            journal=journal,
         )
         original_ready = engine._make_ready
 
@@ -86,13 +90,32 @@ def test_completion_queue_failure_logs_and_finishes_without_losing_confirmed_suc
             assert diagnostic in caplog.text
             await asyncio.sleep(0)
             assert unhandled == []
+            if journal is not None:
+                recorded = journal.get_run(run.run_id)
+                assert [node["status"] for node in recorded["nodes"]] == [
+                    "succeeded", "failed"
+                ]
+                assert all(not node["lease_active"] for node in recorded["nodes"])
         finally:
             monkeypatch.setattr(engine, "_make_ready", original_ready)
             loop.set_task_factory(previous_factory)
             await engine.aclose(2)
             loop.set_exception_handler(previous_handler)
+            if journal is not None:
+                journal.close()
 
     asyncio.run(scenario())
+    if durable:
+        async def restart():
+            with SQLiteJournal(tmp_path / "cell.db") as journal:
+                async with WorkflowEngine([], [Resource("arm")], journal=journal) as engine:
+                    recovered = await engine.get_run_by_key("once").wait(1)
+                    assert recovered.status is RunStatus.FAILED
+                    assert recovered.nodes["first"].status is NodeStatus.SUCCEEDED
+                    assert recovered.nodes["second"].status is NodeStatus.FAILED
+                    assert not engine.resource_snapshot()["quarantined"]
+
+        asyncio.run(restart())
 
 
 @pytest.mark.parametrize("stage", ["_schedule", "_execute"])
