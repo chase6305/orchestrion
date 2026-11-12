@@ -586,6 +586,60 @@ def test_eager_reentrant_replay_does_not_confuse_previous_completed_driver():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("eager", [False, True])
+def test_reentrant_followup_submissions_do_not_recursively_start_schedulers(eager):
+    if eager and not hasattr(asyncio, "eager_task_factory"):
+        pytest.skip("requires eager task support")
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        previous_factory = loop.get_task_factory()
+        finished = asyncio.Event()
+        runs, calls = [], []
+        count = 100
+
+        async def submit_followup(context, inputs):
+            index = inputs["index"]
+            calls.append(index)
+            if index + 1 < count:
+                runs.append(
+                    engine.submit(
+                        Workflow((Node("n", "followup", {"index": index + 1}),)),
+                        idempotency_key=str(index + 1),
+                    )
+                )
+            else:
+                finished.set()
+
+        engine = WorkflowEngine(
+            [Action("followup", submit_followup)],
+            max_concurrency=128,
+            max_active_runs=128,
+        )
+        try:
+            if eager:
+                loop.set_task_factory(asyncio.eager_task_factory)
+            runs.append(
+                engine.submit(
+                    Workflow((Node("n", "followup", {"index": 0}),)),
+                    idempotency_key="0",
+                )
+            )
+            await asyncio.wait_for(finished.wait(), 2)
+            results = await asyncio.gather(*(run.wait(2) for run in runs))
+            assert calls == list(range(count))
+            assert len(results) == count
+            assert all(result.status is RunStatus.SUCCEEDED for result in results)
+            assert len({run.run_id for run in runs}) == count
+            assert engine.scheduler_snapshot()["scheduler_error"] is None
+            assert engine.scheduler_snapshot()["running_actions"] == 0
+        finally:
+            loop.set_task_factory(previous_factory)
+            await engine.aclose(2)
+
+    asyncio.run(scenario())
+
+
 def test_driver_cancelled_during_worker_startup_releases_unstarted_reservation():
     async def scenario():
         loop = asyncio.get_running_loop()
