@@ -351,6 +351,79 @@ def test_schema_mutated_output_reference_is_rechecked_before_admission():
     asyncio.run(scenario())
 
 
+def test_schema_rewritten_binding_waits_for_its_final_source():
+    class RebindingSchema(RequestSchema):
+        def validate_template(self, values, *, is_deferred):
+            values["source"] = OutputRef("new")
+
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def delayed(context, inputs):
+            entered.set()
+            await release.wait()
+            return {"tag": "new"}
+
+        async with WorkflowEngine(
+            [
+                Action("echo", echo), Action("delayed", delayed),
+                Action("sink", echo, input_schema=RebindingSchema({}, allow_extra=True)),
+            ]
+        ) as engine:
+            workflow = Workflow(
+                (
+                    Node("old", "echo", {"tag": "old"}),
+                    Node("sink", "sink", {"source": OutputRef("old")}),
+                    Node("new", "delayed"),
+                )
+            )
+            try:
+                preview = engine.validate(workflow)
+                assert next(node for node in preview["nodes"] if node["node_id"] == "sink")[
+                    "after"
+                ] == ["new"]
+                run = engine.submit(workflow)
+                await asyncio.wait_for(entered.wait(), 1)
+                assert run.snapshot().nodes["sink"].status is NodeStatus.PENDING
+                release.set()
+                result = await run.wait(1)
+                assert result.status is RunStatus.SUCCEEDED
+                assert result.nodes["sink"].output == {"source": {"tag": "new"}}
+            finally:
+                release.set()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("source, diagnostic", [("sink", "cycle"), ("missing", "unknown dependency")])
+def test_schema_binding_rewrites_are_revalidated_before_key_and_device_admission(
+    source, diagnostic
+):
+    class RebindingSchema(RequestSchema):
+        def validate_template(self, values, *, is_deferred):
+            values["source"] = OutputRef(source)
+
+    async def scenario():
+        calls = []
+
+        async def record(context, inputs):
+            calls.append(context.node_id)
+
+        async with WorkflowEngine(
+            [Action("source", record), Action("sink", record, input_schema=RebindingSchema({}))]
+        ) as engine:
+            with pytest.raises(ValueError, match=diagnostic):
+                engine.submit(
+                    Workflow(
+                        (Node("old", "source"), Node("sink", "sink", {"source": OutputRef("old")}))
+                    ), idempotency_key="schema-binding",
+                )
+            assert engine.get_run_by_key("schema-binding") is None
+            assert calls == []
+
+    asyncio.run(scenario())
+
+
 def test_valid_output_binds_to_downstream_and_contracts_are_defensive():
     async def scenario():
         schema = pose_schema()
