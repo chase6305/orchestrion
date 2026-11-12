@@ -1,6 +1,6 @@
 name: Bounded workflow runtime comparison
 
-# Third probe: isolate completed-run bookkeeping from the earlier compiler change.
+# Fourth probe: include complete eager bursts and traced allocation peaks.
 
 on:
   push:
@@ -56,6 +56,48 @@ jobs:
         run: |
           nice -n 10 timeout 75s python examples/benchmark_workflow_runtime.py --counts 512 2048 --payload-items 128 --repeats 3 --label proposed > runtime-proposed.json
           cat runtime-proposed.json
+      - name: Compare peak allocations for complete eager bursts
+        run: |
+          nice -n 10 timeout 75s python - <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          script = '''
+          import asyncio
+          import json
+          import os
+          import platform
+          import runpy
+          import sys
+          import tracemalloc
+          from pathlib import Path
+
+          workspace = os.environ["GITHUB_WORKSPACE"]
+          probe = runpy.run_path(workspace + "/examples/benchmark_workflow_runtime.py")
+          tracemalloc.start()
+          asyncio.run(probe["_with_idle_runs"](2048, 0, eager=True))
+          _, peak = tracemalloc.get_traced_memory()
+          tracemalloc.stop()
+          result = {
+              "python": platform.python_version(),
+              "label": sys.argv[1],
+              "eager_memory": {"nodes": 2048, "peak_traced_bytes": peak},
+          }
+          output = json.dumps(result, indent=2)
+          Path(workspace, "runtime-memory-" + sys.argv[1] + ".json").write_text(output)
+          print(output)
+          '''
+          for label, repository in (
+              ("baseline", "/tmp/orchestrion-runtime-baseline"),
+              ("before-bookkeeping", "/tmp/orchestrion-runtime-before-bookkeeping"),
+              ("proposed", os.environ["GITHUB_WORKSPACE"]),
+          ):
+              subprocess.run(
+                  [sys.executable, "-c", script, label], cwd=repository,
+                  env={**os.environ, "PYTHONPATH": repository}, timeout=20, check=True,
+              )
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: workflow-runtime-comparison

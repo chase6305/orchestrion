@@ -136,7 +136,12 @@ async def _checkpoint_capture():
         }
 
 
-async def _with_idle_runs(count, idle_runs):
+async def _with_idle_runs(count, idle_runs, *, eager=False):
+    loop = asyncio.get_running_loop()
+    factory = getattr(asyncio, "eager_task_factory", None)
+    if eager and factory is None:
+        return {"nodes": count, "supported": False}
+    previous_factory = loop.get_task_factory()
     entered, release = asyncio.Event(), asyncio.Event()
     started = 0
 
@@ -156,6 +161,8 @@ async def _with_idle_runs(count, idle_runs):
     )
     workflow = Workflow(tuple(Node(str(index), "noop") for index in range(count)))
     try:
+        if eager:
+            loop.set_task_factory(factory)
         for _ in range(idle_runs):
             engine.submit(Workflow((Node("hold", "hold"),)))
         if idle_runs:
@@ -167,18 +174,23 @@ async def _with_idle_runs(count, idle_runs):
         completed = time.perf_counter()
         return {
             "nodes": count,
+            "supported": True,
+            "eager": eager,
             "idle_runs": idle_runs,
             "submit_seconds": submitted - before,
             "run_seconds": completed - submitted,
             "total_seconds": completed - before,
         }
     finally:
+        if eager:
+            loop.set_task_factory(previous_factory)
         release.set()
         await engine.aclose(5)
 
 
 async def benchmark(counts, payload_items, repeats, idle_runs):
     compilation, cancellation, active_runs = [], [], []
+    eager_completion = []
     for count in counts:
         for references in (False, True):
             compilation.append(_compilation(count, payload_items, references, repeats))
@@ -202,12 +214,19 @@ async def benchmark(counts, payload_items, repeats, idle_runs):
             for metric in ("submit_seconds", "run_seconds", "total_seconds"):
                 row[metric] = statistics.median(sample[metric] for sample in samples)
             active_runs.append(row)
+        samples = [await _with_idle_runs(count, 0, eager=True) for _ in range(repeats)]
+        row = dict(samples[0])
+        if row["supported"]:
+            for metric in ("submit_seconds", "run_seconds", "total_seconds"):
+                row[metric] = statistics.median(sample[metric] for sample in samples)
+        eager_completion.append(row)
     return {
         "python": platform.python_version(),
         "repeats": repeats,
         "compilation": compilation,
         "cancellation": cancellation,
         "active_runs": active_runs,
+        "eager_completion": eager_completion,
         "scoped_checkpoint": await _checkpoint_capture(),
     }
 
