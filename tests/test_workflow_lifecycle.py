@@ -28,6 +28,66 @@ async def echo(context, inputs):
     return inputs
 
 
+@pytest.mark.parametrize("eager", [False, True])
+def test_completion_queue_failure_logs_and_finishes_without_losing_confirmed_success(
+    eager, monkeypatch, caplog
+):
+    if eager and not hasattr(asyncio, "eager_task_factory"):
+        pytest.skip("requires eager task support")
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        previous_factory = loop.get_task_factory()
+        previous_handler = loop.get_exception_handler()
+        calls, unhandled = [], []
+
+        async def record(context, inputs):
+            calls.append(context.node_id)
+
+        engine = WorkflowEngine(
+            [Action("record", record, (ResourceClaim("arm"),))], [Resource("arm")]
+        )
+        original_ready = engine._make_ready
+
+        def fail_successor(run, item):
+            if item.node.node_id == "second":
+                raise RuntimeError("completion queue preparation failed")
+            original_ready(run, item)
+
+        workflow = Workflow(
+            (Node("first", "record"), Node("second", "record", after=("first",)))
+        )
+        loop.set_exception_handler(lambda loop, detail: unhandled.append(detail))
+        monkeypatch.setattr(engine, "_make_ready", fail_successor)
+        try:
+            if eager:
+                loop.set_task_factory(asyncio.eager_task_factory)
+            run = engine.submit(workflow, idempotency_key="once")
+            result = await run.wait(1)
+            assert result.status is RunStatus.FAILED
+            assert result.nodes["first"].status is NodeStatus.SUCCEEDED
+            assert result.nodes["second"].status is NodeStatus.FAILED
+            assert calls == ["first"]
+            assert engine.get_run_by_key("once") is run
+            snapshot = engine.scheduler_snapshot()
+            assert snapshot["closed"]
+            assert "completion queue preparation failed" in snapshot["scheduler_error"]
+            assert snapshot["running_actions"] == 0
+            assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
+            with pytest.raises(RuntimeError, match="closed"):
+                engine.submit(workflow)
+            assert "completion queue preparation failed" in caplog.text
+            await asyncio.sleep(0)
+            assert unhandled == []
+        finally:
+            monkeypatch.setattr(engine, "_make_ready", original_ready)
+            loop.set_task_factory(previous_factory)
+            await engine.aclose(2)
+            loop.set_exception_handler(previous_handler)
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("stage", ["_schedule", "_execute"])
 @pytest.mark.parametrize("eager", [False, True])
 def test_factory_failure_after_task_creation_keeps_the_real_owner_in_accounting(

@@ -986,6 +986,13 @@ class WorkflowEngine:
             self._wake.set()
         exception = None if worker.cancelled() else worker.exception()
         if run._results[item.node.node_id].status.terminal:
+            if exception is not None:
+                # The action outcome can be confirmed before successor admission
+                # fails. Preserve that outcome and stop the remaining scheduler
+                # work rather than leaving a graph waiting with no wake source.
+                error = "action completion failed: " + _error_text(exception)
+                log_error("%s", error)
+                self._fail_scheduler(error)
             return
         # A task cancelled before its coroutine starts cannot run its finally
         # block. No device was invoked in that case, so the reservation is free.
