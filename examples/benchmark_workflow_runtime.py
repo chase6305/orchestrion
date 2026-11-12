@@ -120,6 +120,7 @@ async def _cancel_burst(count):
 
 async def _checkpoint_capture():
     captures = []
+    progress_captures = []
 
     class SDKRecord(dict):
         def items(self):
@@ -127,7 +128,13 @@ async def _checkpoint_capture():
             captures.append(ticket)
             return {"ticket": ticket}.items()
 
+    class SDKProgress(dict):
+        def items(self):
+            progress_captures.append(len(progress_captures) + 1)
+            return {"sdk_capture": progress_captures[-1]}.items()
+
     async def device(context, inputs):
+        context.report(SDKProgress())
         context.checkpoint(SDKRecord())
 
     scoped = workflow_action(
@@ -141,6 +148,12 @@ async def _checkpoint_capture():
             "recorded_ticket": result.nodes["scope"].checkpoint["scope_nodes"][
                 "device"
             ]["ticket"],
+            "sdk_progress_reads": len(progress_captures),
+            "recorded_progress": next(
+                event.detail["feedback"]["sdk_capture"]
+                for event in run.events()
+                if event.kind == "feedback" and "feedback" in event.detail
+            ),
         }
 
 

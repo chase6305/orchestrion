@@ -149,6 +149,10 @@ class ActionContext:
 
     def report(self, feedback: Any) -> None:
         """Report JSON; invalid or undeliverable optional progress logs and drops."""
+        self._report_feedback(feedback)
+
+    def _report_feedback(self, feedback: Any) -> Any:
+        """Report once and return captured JSON for enclosing scopes."""
         if not self._active:
             return
         try:
@@ -169,11 +173,11 @@ class ActionContext:
                 if not deliver_feedback(self._feedback, snapshot):
                     with self._feedback_lock:
                         self._direct_feedback_dropped += 1
-            return
+            return snapshot
         channel = self._feedback_channel
         if channel is not None:
             channel.post(snapshot)
-            return
+            return snapshot
         with self._feedback_lock:
             if not self._active:
                 return
@@ -186,6 +190,7 @@ class ActionContext:
                 )
             channel = self._feedback_channel
         channel.post(snapshot)
+        return snapshot
 
     def checkpoint(self, data: Any) -> None:
         """Record small recovery metadata on the event loop before continuing I/O.

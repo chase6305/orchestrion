@@ -259,7 +259,9 @@ can publish `UNKNOWN` while that cleanup continues; the outer worker remains
 counted and reconciliation remains blocked until cleanup finishes.
 
 Completed inner contexts ignore late progress, including SDK snapshots that
-overlap completion. Scoped checkpoints reuse the delegate's first captured JSON
+overlap completion. Successful progress reuses its first captured SDK snapshot
+when mirrored through nested scopes; each context retains its own limits and drop
+accounting. Scoped checkpoints reuse the delegate's first captured JSON
 snapshot. A rejected parent checkpoint leaves the accepted accumulator unchanged,
 so an oversized update cannot poison later valid updates. Recovery data stays
 available during draining and is released when the scoped adapter actually exits,
@@ -283,7 +285,7 @@ python -m examples.benchmark_workflow_runtime --counts 512 2048 --repeats 3
 It prints JSON with median validation/preview times for static inputs and output
 references, cancellation callback delay and cancellation processing time, graph
 execution with zero or 64 other waiting runs, with and without workflow deadlines,
-and the number of SDK checkpoint captures. It also measures eager graphs that run
+and the number of SDK feedback and checkpoint captures. It also measures eager graphs that run
 to completion without cancellation. Node construction is outside the validation
 measurements; graph submission and execution times are reported separately.
 Zero-waiter probes also report time through engine draining, including worker done

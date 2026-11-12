@@ -99,11 +99,17 @@ class _ScopedContext(ActionContext):
     def report(self, feedback: Any) -> None:
         if not self._delegate._active:
             return
-        self._delegate.report(feedback)
+        snapshot = self._delegate._report_feedback(feedback)
         # An SDK-thread snapshot can overlap the inner node finishing.
         if self._delegate._active:
             _report_optional(
-                self._parent, {"scope_node": self.node_id, "feedback": feedback}
+                self._parent,
+                {
+                    "scope_node": self.node_id,
+                    # Successful capture must not invoke SDK hooks a second time.
+                    # Rejected progress keeps independent parent drop accounting.
+                    "feedback": feedback if snapshot is None else snapshot,
+                },
             )
 
     def _thread_cancellation(self):

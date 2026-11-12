@@ -13,7 +13,8 @@
   arithmetic; preserve integral durable fingerprints. Isolate native cancellation
   raised by log sinks and SDK exception formatters from operation accounting.
 - Ignore completed inner nodes' late progress, isolate rejected scope checkpoint
-  updates, capture SDK checkpoint data once and release it after scope cleanup.
+  updates, capture successful SDK progress and checkpoint data once and release checkpoints
+  after scope cleanup.
 
 - Log and drop invalid or oversized optional workflow progress instead of raising
   into device handlers. Count these reports and contain cancelled progress sinks
