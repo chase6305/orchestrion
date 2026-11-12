@@ -296,6 +296,7 @@ class WorkflowEngine:
             return
         self._driver_error = error
         self._closed = True
+        log_error("Workflow scheduler failed: %s", error)
         for run in tuple(self._runs.values()):
             self._stop_run(run, "scheduler_failed")
             for node_id, context in tuple(run._contexts.items()):
@@ -476,9 +477,10 @@ class WorkflowEngine:
                     "scheduler startup failed after work was reserved: "
                     + _error_text(exc)
                 )
-                log_error("%s", error)
                 if self._runs:
                     self._fail_scheduler(error)
+                else:
+                    log_error("%s", error)
                 return run
             self._stop_run(run, "scheduler_start_failed")
             self._finish_run(run)
@@ -1008,7 +1010,6 @@ class WorkflowEngine:
                     if worker.cancelled()
                     else "action completion failed: " + _error_text(exception)
                 )
-                log_error("%s", error)
                 self._fail_scheduler(error)
             return
         # A task cancelled before its coroutine starts cannot run its finally
@@ -1118,7 +1119,6 @@ class WorkflowEngine:
                 if isinstance(exc, asyncio.CancelledError)
                 else "action completion failed: " + _error_text(exc)
             )
-            log_error("%s", error)
             self._fail_scheduler(error)
 
     async def _invoke_action(

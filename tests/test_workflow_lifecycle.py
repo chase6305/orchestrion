@@ -1319,7 +1319,7 @@ def test_driver_failure_drains_active_actions_and_never_starts_queued_work(
 
 
 @pytest.mark.parametrize("kind", ["exception", "early_return"])
-def test_unexpected_driver_exit_is_observed_without_unhandled_task_exception(kind):
+def test_unexpected_driver_exit_is_observed_without_unhandled_task_exception(kind, caplog):
     async def scenario():
         errors = []
         loop = asyncio.get_running_loop()
@@ -1337,6 +1337,7 @@ def test_unexpected_driver_exit_is_observed_without_unhandled_task_exception(kin
             assert (await run.wait(1)).status == RunStatus.FAILED
             error = engine.scheduler_snapshot()["scheduler_error"]
             assert ("injected" if kind == "exception" else "active runs") in error
+            assert "Workflow scheduler failed: " + error in caplog.text
             await engine.aclose(1)
             assert not errors
         finally:
