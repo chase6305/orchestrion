@@ -136,8 +136,49 @@ async def _checkpoint_capture():
         }
 
 
-async def benchmark(counts, payload_items, repeats):
-    compilation, cancellation = [], []
+async def _with_idle_runs(count, idle_runs):
+    entered, release = asyncio.Event(), asyncio.Event()
+    started = 0
+
+    async def hold(context, inputs):
+        nonlocal started
+        started += 1
+        if started == idle_runs:
+            entered.set()
+        await release.wait()
+
+    engine = WorkflowEngine(
+        [Action("hold", hold), Action("noop", _noop)],
+        max_concurrency=idle_runs + 1,
+        max_active_runs=idle_runs + 2,
+        max_nodes_per_run=count,
+        max_events_per_run=10,
+    )
+    workflow = Workflow(tuple(Node(str(index), "noop") for index in range(count)))
+    try:
+        for _ in range(idle_runs):
+            engine.submit(Workflow((Node("hold", "hold"),)))
+        if idle_runs:
+            await asyncio.wait_for(entered.wait(), 5)
+        before = time.perf_counter()
+        run = engine.submit(workflow)
+        submitted = time.perf_counter()
+        await run.wait(30)
+        completed = time.perf_counter()
+        return {
+            "nodes": count,
+            "idle_runs": idle_runs,
+            "submit_seconds": submitted - before,
+            "run_seconds": completed - submitted,
+            "total_seconds": completed - before,
+        }
+    finally:
+        release.set()
+        await engine.aclose(5)
+
+
+async def benchmark(counts, payload_items, repeats, idle_runs):
+    compilation, cancellation, active_runs = [], [], []
     for count in counts:
         for references in (False, True):
             compilation.append(_compilation(count, payload_items, references, repeats))
@@ -155,11 +196,18 @@ async def benchmark(counts, payload_items, repeats):
                 sample["calls_before_cancel"] for sample in samples
             )
         cancellation.append(row)
+        for held in (0, idle_runs):
+            samples = [await _with_idle_runs(count, held) for _ in range(repeats)]
+            row = dict(samples[0])
+            for metric in ("submit_seconds", "run_seconds", "total_seconds"):
+                row[metric] = statistics.median(sample[metric] for sample in samples)
+            active_runs.append(row)
     return {
         "python": platform.python_version(),
         "repeats": repeats,
         "compilation": compilation,
         "cancellation": cancellation,
+        "active_runs": active_runs,
         "scoped_checkpoint": await _checkpoint_capture(),
     }
 
@@ -169,17 +217,20 @@ def main():
     parser.add_argument("--counts", type=int, nargs="+", default=[512, 2048])
     parser.add_argument("--payload-items", type=int, default=128)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--idle-runs", type=int, default=64)
+    parser.add_argument("--label", default=None)
     args = parser.parse_args()
     if args.repeats < 1 or any(count < 1 for count in args.counts):
         parser.error("counts and repeats must be positive")
     if args.payload_items < 0:
         parser.error("payload-items must be nonnegative")
-    print(
-        json.dumps(
-            asyncio.run(benchmark(args.counts, args.payload_items, args.repeats)),
-            indent=2,
-        )
+    if args.idle_runs < 0:
+        parser.error("idle-runs must be nonnegative")
+    result = asyncio.run(
+        benchmark(args.counts, args.payload_items, args.repeats, args.idle_runs)
     )
+    result["label"] = args.label
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":

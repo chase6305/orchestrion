@@ -1,6 +1,6 @@
 name: Bounded workflow runtime comparison
 
-# Second probe: compare stable reference reuse and separate callback latency.
+# Third probe: isolate completed-run bookkeeping from the earlier compiler change.
 
 on:
   push:
@@ -34,18 +34,27 @@ jobs:
         run: |
           git fetch --depth=1 origin f1f35cb28eaee2a6d043c2181f9605f057a63e10
           git worktree add --detach /tmp/orchestrion-runtime-baseline FETCH_HEAD
+          git fetch --depth=1 origin a94500834883fdd8e1ee8791815400fed33164e6
+          git worktree add --detach /tmp/orchestrion-runtime-before-bookkeeping FETCH_HEAD
       - name: Measure the baseline sequentially
         working-directory: /tmp/orchestrion-runtime-baseline
         env:
           PYTHONPATH: /tmp/orchestrion-runtime-baseline
         run: |
-          nice -n 10 timeout 90s python "$GITHUB_WORKSPACE/examples/benchmark_workflow_runtime.py" --counts 512 2048 --payload-items 128 --repeats 3 > "$GITHUB_WORKSPACE/runtime-baseline.json"
+          nice -n 10 timeout 75s python "$GITHUB_WORKSPACE/examples/benchmark_workflow_runtime.py" --counts 512 2048 --payload-items 128 --repeats 3 --label baseline > "$GITHUB_WORKSPACE/runtime-baseline.json"
           cat "$GITHUB_WORKSPACE/runtime-baseline.json"
+      - name: Measure the runtime before completed-run bookkeeping
+        working-directory: /tmp/orchestrion-runtime-before-bookkeeping
+        env:
+          PYTHONPATH: /tmp/orchestrion-runtime-before-bookkeeping
+        run: |
+          nice -n 10 timeout 75s python "$GITHUB_WORKSPACE/examples/benchmark_workflow_runtime.py" --counts 512 2048 --payload-items 128 --repeats 3 --label before-bookkeeping > "$GITHUB_WORKSPACE/runtime-before-bookkeeping.json"
+          cat "$GITHUB_WORKSPACE/runtime-before-bookkeeping.json"
       - name: Measure the proposed runtime sequentially
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          nice -n 10 timeout 90s python examples/benchmark_workflow_runtime.py --counts 512 2048 --payload-items 128 --repeats 3 > runtime-proposed.json
+          nice -n 10 timeout 75s python examples/benchmark_workflow_runtime.py --counts 512 2048 --payload-items 128 --repeats 3 --label proposed > runtime-proposed.json
           cat runtime-proposed.json
       - uses: actions/upload-artifact@v4
         with:

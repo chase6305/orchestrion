@@ -860,7 +860,10 @@ def test_eager_reentrant_replay_does_not_confuse_previous_completed_driver():
 
 
 @pytest.mark.parametrize("eager", [False, True])
-def test_reentrant_followup_submissions_do_not_recursively_start_schedulers(eager):
+@pytest.mark.parametrize("active_limit", [4, 128])
+def test_reentrant_followup_submissions_do_not_recursively_start_schedulers(
+    eager, active_limit
+):
     if eager and not hasattr(asyncio, "eager_task_factory"):
         pytest.skip("requires eager task support")
 
@@ -887,7 +890,7 @@ def test_reentrant_followup_submissions_do_not_recursively_start_schedulers(eage
         engine = WorkflowEngine(
             [Action("followup", submit_followup)],
             max_concurrency=128,
-            max_active_runs=128,
+            max_active_runs=active_limit,
         )
         try:
             if eager:

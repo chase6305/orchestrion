@@ -141,6 +141,8 @@ class WorkflowEngine:
         self._leases: Dict[str, Tuple[ResourceClaim, ...]] = {}
         self._quarantined: Dict[str, Tuple[WorkflowRun, str]] = {}
         self._runs: Dict[str, WorkflowRun] = {}
+        self._finished_runs: Dict[str, WorkflowRun] = {}
+        self._deadline_runs: Dict[str, WorkflowRun] = {}
         self._workers = set()
         self._running_count = 0
         self._ready_sequence = 0
@@ -404,6 +406,10 @@ class WorkflowEngine:
                     "max_idempotency_keys reached; explicitly prune completed keys"
                 )
         if len(self._runs) >= self._max_active_runs:
+            # Eager follow-ups may submit before the next scheduler turn retires
+            # earlier terminal runs. They no longer consume active-run capacity.
+            self._finish_completed_runs()
+        if len(self._runs) >= self._max_active_runs:
             raise RuntimeError(
                 "max_active_runs reached; wait for an active run to finish"
             )
@@ -418,6 +424,8 @@ class WorkflowEngine:
         run = WorkflowRun(self, workflow, compiled, idempotency_key)
         self._record_journal("_admit", run, compiled, fingerprint, strict=True)
         self._runs[run.run_id] = run
+        if run._deadline is not None:
+            self._deadline_runs[run.run_id] = run
         self._idle.clear()
         if idempotency_key is not None:
             self._submissions[idempotency_key] = (fingerprint, run)
@@ -654,6 +662,7 @@ class WorkflowEngine:
         )
 
     def _stop_run(self, run: WorkflowRun, reason: str) -> None:
+        self._deadline_runs.pop(run.run_id, None)
         if run._deadline_timer is not None:
             run._deadline_timer.cancel()
         run._status = RunStatus.CANCELLING
@@ -785,6 +794,8 @@ class WorkflowEngine:
             settlements.append(run._results[node_id])
         run._unfinished -= 1
         if not propagate:
+            if run._unfinished == 0:
+                self._finished_runs[run.run_id] = run
             if not deferred and settlements:
                 self._record_settlements(run, settlements)
             return
@@ -811,6 +822,8 @@ class WorkflowEngine:
                         settlements.append(run._results[successor])
                     run._unfinished -= 1
                     completed.append(successor)
+        if run._unfinished == 0:
+            self._finished_runs[run.run_id] = run
         if not deferred and settlements:
             self._record_settlements(run, settlements)
 
@@ -821,6 +834,8 @@ class WorkflowEngine:
             self._record_journal("_settle_many", run.run_id, results)
 
     def _finish_run(self, run: WorkflowRun) -> None:
+        self._finished_runs.pop(run.run_id, None)
+        self._deadline_runs.pop(run.run_id, None)
         if run._deadline_timer is not None:
             run._deadline_timer.cancel()
         statuses = {result.status for result in run._results.values()}
@@ -846,6 +861,11 @@ class WorkflowEngine:
         if not self._runs:
             self._idle.set()
 
+    def _finish_completed_runs(self) -> None:
+        """Retire terminal graphs without scanning unrelated running adapters."""
+        for run in tuple(self._finished_runs.values()):
+            self._finish_run(run)
+
     async def _schedule(self) -> None:
         while self._runs:
             self._wake.clear()
@@ -868,10 +888,9 @@ class WorkflowEngine:
 
     def _advance_scheduler(self) -> bool:
         """Advance a bounded turn; report whether ready work needs another turn."""
-        for run in tuple(self._runs.values()):
+        for run in tuple(self._deadline_runs.values()):
             self._check_run_deadline(run)
-            if run._unfinished == 0:
-                self._finish_run(run)
+        self._finish_completed_runs()
 
         if self._journal_error is not None:
             return False
