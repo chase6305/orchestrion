@@ -149,6 +149,49 @@ def test_integer_subclass_priority_is_captured_before_scheduler_admission():
     asyncio.run(scenario())
 
 
+def test_resource_quantities_capture_base_integers_before_reservation_arithmetic():
+    class Quantity(int):
+        def __int__(self):
+            raise RuntimeError("custom integer conversion")
+
+        def __add__(self, other):
+            raise RuntimeError("custom reservation arithmetic")
+
+        __radd__ = __sub__ = __rsub__ = __add__
+
+    async def scenario():
+        calls = []
+
+        async def record(context, inputs):
+            calls.append(context.node_id)
+
+        resource = Resource("arm", Quantity(2))
+        claim = ResourceClaim("arm", Quantity(1))
+        override = ResourceClaim("arm", Quantity(2))
+        async with WorkflowEngine(
+            [Action("record", record, (claim,))], [resource], max_concurrency=1
+        ) as engine:
+            assert type(resource.capacity) is int
+            assert type(claim.units) is int
+            assert type(override.units) is int
+            run = engine.submit(
+                Workflow(
+                    (
+                        Node("first", "record"),
+                        Node("second", "record", claims=(override,)),
+                    )
+                ),
+                idempotency_key="captured-claims",
+            )
+            assert (await run.wait(1)).status is RunStatus.SUCCEEDED
+            assert calls == ["first", "second"]
+            assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
+            assert engine.scheduler_snapshot()["running_actions"] == 0
+            assert engine.scheduler_snapshot()["scheduler_error"] is None
+
+    asyncio.run(scenario())
+
+
 def test_schema_mutated_output_reference_is_rechecked_before_admission():
     class MutatingSchema(RequestSchema):
         def validate_template(self, values, *, is_deferred):

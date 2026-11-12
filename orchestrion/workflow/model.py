@@ -44,6 +44,7 @@ class Resource:
     def __post_init__(self) -> None:
         _name(self.name, "resource name")
         _positive_int(self.capacity, "resource capacity")
+        object.__setattr__(self, "capacity", int.__int__(self.capacity))
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ class ResourceClaim:
     def __post_init__(self) -> None:
         _name(self.resource, "claimed resource")
         _positive_int(self.units, "claim units")
+        object.__setattr__(self, "units", int.__int__(self.units))
 
 
 @dataclass(frozen=True)
