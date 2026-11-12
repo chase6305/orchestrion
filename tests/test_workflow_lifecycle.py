@@ -29,8 +29,9 @@ async def echo(context, inputs):
 
 
 @pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
 def test_completion_queue_failure_logs_and_finishes_without_losing_confirmed_success(
-    eager, monkeypatch, caplog
+    eager, failure, monkeypatch, caplog
 ):
     if eager and not hasattr(asyncio, "eager_task_factory"):
         pytest.skip("requires eager task support")
@@ -51,7 +52,7 @@ def test_completion_queue_failure_logs_and_finishes_without_losing_confirmed_suc
 
         def fail_successor(run, item):
             if item.node.node_id == "second":
-                raise RuntimeError("completion queue preparation failed")
+                raise failure("completion queue preparation failed")
             original_ready(run, item)
 
         workflow = Workflow(
@@ -71,12 +72,17 @@ def test_completion_queue_failure_logs_and_finishes_without_losing_confirmed_suc
             assert engine.get_run_by_key("once") is run
             snapshot = engine.scheduler_snapshot()
             assert snapshot["closed"]
-            assert "completion queue preparation failed" in snapshot["scheduler_error"]
+            diagnostic = (
+                "action completion interrupted"
+                if failure is asyncio.CancelledError
+                else "completion queue preparation failed"
+            )
+            assert diagnostic in snapshot["scheduler_error"]
             assert snapshot["running_actions"] == 0
             assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
             with pytest.raises(RuntimeError, match="closed"):
                 engine.submit(workflow)
-            assert "completion queue preparation failed" in caplog.text
+            assert diagnostic in caplog.text
             await asyncio.sleep(0)
             assert unhandled == []
         finally:
