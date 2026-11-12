@@ -33,8 +33,9 @@ async def echo(context, inputs):
 @pytest.mark.parametrize("eager", [False, True])
 @pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
 @pytest.mark.parametrize("durable", [False, True])
+@pytest.mark.parametrize("factory_failure", [False, True])
 def test_completion_queue_failure_logs_and_finishes_without_losing_confirmed_success(
-    eager, failure, durable, monkeypatch, caplog, tmp_path
+    eager, failure, durable, factory_failure, monkeypatch, caplog, tmp_path
 ):
     if eager and not hasattr(asyncio, "eager_task_factory"):
         pytest.skip("requires eager task support")
@@ -55,6 +56,16 @@ def test_completion_queue_failure_logs_and_finishes_without_losing_confirmed_suc
         )
         original_ready = engine._make_ready
 
+        def factory(loop, coroutine, **kwargs):
+            task = (
+                asyncio.eager_task_factory(loop, coroutine, **kwargs)
+                if eager
+                else asyncio.Task(coroutine, loop=loop, **kwargs)
+            )
+            if factory_failure and coroutine.cr_code.co_name == "_execute":
+                raise RuntimeError("instrumentation failed after creating the worker")
+            return task
+
         def fail_successor(run, item):
             if item.node.node_id == "second":
                 raise failure("completion queue preparation failed")
@@ -66,8 +77,8 @@ def test_completion_queue_failure_logs_and_finishes_without_losing_confirmed_suc
         loop.set_exception_handler(lambda loop, detail: unhandled.append(detail))
         monkeypatch.setattr(engine, "_make_ready", fail_successor)
         try:
-            if eager:
-                loop.set_task_factory(asyncio.eager_task_factory)
+            if eager or factory_failure:
+                loop.set_task_factory(factory)
             run = engine.submit(workflow, idempotency_key="once")
             result = await run.wait(1)
             assert result.status is RunStatus.FAILED

@@ -213,7 +213,7 @@ class WorkflowEngine:
             return
         try:
             getattr(self._journal, method)(*args)
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             self._journal_error = _error_text(exc)
             self._closed = True
             # Defer stop transitions until the current accounting update ends.
@@ -820,30 +820,34 @@ class WorkflowEngine:
         completed = deque([node_id])
         # Visit affected graph edges once, rather than rescanning an entire DAG
         # after each completion. Iteration also supports very deep workflows.
-        while completed:
-            predecessor = completed.popleft()
-            succeeded = run._results[predecessor].status == NodeStatus.SUCCEEDED
-            for successor in run._successors[predecessor]:
-                if run._results[successor].status != NodeStatus.PENDING:
-                    continue
-                if succeeded:
-                    run._remaining_dependencies[successor] -= 1
-                    if run._remaining_dependencies[successor] == 0:
-                        self._make_ready(run, run._by_id[successor])
-                else:
-                    run._transition(
-                        successor,
-                        NodeStatus.SKIPPED,
-                        error="dependency did not succeed",
-                    )
-                    if self._journal is not None:
-                        settlements.append(run._results[successor])
-                    run._unfinished -= 1
-                    completed.append(successor)
-        if run._unfinished == 0:
-            self._finished_runs[run.run_id] = run
-        if not deferred and settlements:
-            self._record_settlements(run, settlements)
+        try:
+            while completed:
+                predecessor = completed.popleft()
+                succeeded = run._results[predecessor].status == NodeStatus.SUCCEEDED
+                for successor in run._successors[predecessor]:
+                    if run._results[successor].status != NodeStatus.PENDING:
+                        continue
+                    if succeeded:
+                        run._remaining_dependencies[successor] -= 1
+                        if run._remaining_dependencies[successor] == 0:
+                            self._make_ready(run, run._by_id[successor])
+                    else:
+                        run._transition(
+                            successor,
+                            NodeStatus.SKIPPED,
+                            error="dependency did not succeed",
+                        )
+                        if self._journal is not None:
+                            settlements.append(run._results[successor])
+                        run._unfinished -= 1
+                        completed.append(successor)
+        finally:
+            # Confirmed outcomes must reach disk even if successor admission
+            # fails. Recovery must not see a finished run with running nodes.
+            if run._unfinished == 0:
+                self._finished_runs[run.run_id] = run
+            if not deferred and settlements:
+                self._record_settlements(run, settlements)
 
     def _record_settlements(self, run: WorkflowRun, results) -> None:
         if len(results) == 1:
@@ -1091,20 +1095,31 @@ class WorkflowEngine:
             # A failing custom schema can mutate its diagnostic data.
             try:
                 output = _snapshot(output, max_bytes=self._max_output_bytes)
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 output = None
 
         # An adapter that monopolizes the loop can postpone timers; completion
         # still has to respect the elapsed budget. This cannot provide hard stop.
-        self._check_run_deadline(run)
-        if node_deadline is not None and self._loop.time() >= node_deadline:
-            self._expire_node(run, node.node_id)
-        if (
-            context._stop_deadline is not None
-            and self._loop.time() >= context._stop_deadline
-        ):
-            self._stop_confirmation_expired(run, node.node_id, context)
-        self._settle(run, item, context, status, output=output, error=error)
+        try:
+            self._check_run_deadline(run)
+            if node_deadline is not None and self._loop.time() >= node_deadline:
+                self._expire_node(run, node.node_id)
+            if (
+                context._stop_deadline is not None
+                and self._loop.time() >= context._stop_deadline
+            ):
+                self._stop_confirmation_expired(run, node.node_id, context)
+            self._settle(run, item, context, status, output=output, error=error)
+        except (Exception, asyncio.CancelledError) as exc:
+            # Keep accounting faults inside the owned coroutine. In particular,
+            # an eager factory can fail before returning its already-done Task.
+            error = (
+                "CancelledError: action completion interrupted"
+                if isinstance(exc, asyncio.CancelledError)
+                else "action completion failed: " + _error_text(exc)
+            )
+            log_error("%s", error)
+            self._fail_scheduler(error)
 
     async def _invoke_action(
         self,
