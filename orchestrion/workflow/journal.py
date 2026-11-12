@@ -101,7 +101,7 @@ class SQLiteJournal:
         if str(path) == ":memory:":
             raise ValueError("a durable journal requires a filesystem path")
         self.path = str(Path(path).expanduser().resolve())
-        self._event_limit = max_events_per_run
+        self._event_limit = int.__int__(max_events_per_run)
         self._pid = os.getpid()
         self._owner = None
         self._bound = False

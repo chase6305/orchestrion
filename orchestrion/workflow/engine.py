@@ -96,9 +96,21 @@ class WorkflowEngine:
         ):
             if limit is not None:
                 _positive_int(limit, label)
-        self._max_input_bytes = max_input_bytes_per_node
-        self._max_output_bytes = max_output_bytes_per_node
-        self._max_feedback_bytes = max_feedback_bytes_per_report
+        self._max_input_bytes = (
+            None
+            if max_input_bytes_per_node is None
+            else int.__int__(max_input_bytes_per_node)
+        )
+        self._max_output_bytes = (
+            None
+            if max_output_bytes_per_node is None
+            else int.__int__(max_output_bytes_per_node)
+        )
+        self._max_feedback_bytes = (
+            None
+            if max_feedback_bytes_per_report is None
+            else int.__int__(max_feedback_bytes_per_report)
+        )
         for label, value in (
             ("max_concurrency", max_concurrency),
             ("max_active_runs", max_active_runs),
@@ -129,12 +141,12 @@ class WorkflowEngine:
                 input_schema=copy.deepcopy(action.input_schema),
                 output_schema=copy.deepcopy(action.output_schema),
             )
-        self._max_concurrency = max_concurrency
-        self._max_active_runs = max_active_runs
-        self._max_nodes = max_nodes_per_run
-        self._max_events = max_events_per_run
-        self._max_idempotency_keys = max_idempotency_keys
-        self._max_pending_feedback = max_pending_feedback_per_action
+        self._max_concurrency = int.__int__(max_concurrency)
+        self._max_active_runs = int.__int__(max_active_runs)
+        self._max_nodes = int.__int__(max_nodes_per_run)
+        self._max_events = int.__int__(max_events_per_run)
+        self._max_idempotency_keys = int.__int__(max_idempotency_keys)
+        self._max_pending_feedback = int.__int__(max_pending_feedback_per_action)
         self._submissions: Dict[str, Tuple[str, WorkflowRun]] = {}
         self._used = dict.fromkeys(self._resources, 0)
         self._leases: Dict[str, Tuple[ResourceClaim, ...]] = {}

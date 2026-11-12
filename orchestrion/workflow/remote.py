@@ -118,7 +118,7 @@ class TicketAction:
         self._poll_interval = budgets["poll_interval"]
         self._rpc_timeout = budgets["rpc_timeout"]
         self._stop_timeout = budgets["stop_timeout"]
-        self._max_query_errors = max_query_errors
+        self._max_query_errors = int.__int__(max_query_errors)
 
     async def _query(self, context: ActionContext, ticket: str, budget: float, on_stop):
         """Interrupt a read when stop is requested, without cancelling submit.

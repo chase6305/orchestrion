@@ -1,6 +1,7 @@
 """Workflow definitions, input/output contracts, and downstream data binding."""
 
 import asyncio
+import threading
 
 import pytest
 
@@ -239,6 +240,51 @@ def test_timer_budgets_capture_plain_numbers_without_changing_integral_types(
             assert engine.submit(workflow, idempotency_key="captured-budgets") is run
         finally:
             await engine.aclose(Budget(1))
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_concurrency",
+        "max_pending_feedback_per_action",
+        "max_input_bytes_per_node",
+        "max_output_bytes_per_node",
+        "max_feedback_bytes_per_report",
+    ],
+)
+def test_async_limits_capture_base_integers_before_comparing_or_charging(field):
+    class Limit(int):
+        def __int__(self):
+            raise RuntimeError("custom limit conversion")
+
+        def __gt__(self, other):
+            raise RuntimeError("custom limit operation")
+
+        __eq__ = __sub__ = __gt__
+
+    async def scenario():
+        async def record(context, inputs):
+            producer = threading.Thread(target=lambda: context.report({"ok": True}))
+            producer.start()
+            producer.join(1)
+            assert not producer.is_alive()
+            return inputs
+
+        value = 1 if field == "max_pending_feedback_per_action" else 1024
+        async with WorkflowEngine(
+            [Action("record", record)], **{field: Limit(value)}
+        ) as engine:
+            run = engine.submit(Workflow((Node("record", "record", {"ok": True}),)))
+            result = await run.wait(1)
+            assert result.status is RunStatus.SUCCEEDED
+            assert result.nodes["record"].output == {"ok": True}
+            assert result.nodes["record"].feedback_dropped == 0
+            assert [
+                event.detail for event in run.events() if event.kind == "feedback"
+            ] == [{"ok": True}]
+            assert engine.scheduler_snapshot()["scheduler_error"] is None
 
     asyncio.run(scenario())
 

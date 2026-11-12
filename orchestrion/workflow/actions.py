@@ -88,10 +88,12 @@ class ActionContext:
         self._cancel_reason: Optional[str] = None
         self._feedback = feedback
         self._feedback_overflow = feedback_overflow
-        self._feedback_limit = max_pending_feedback
+        self._feedback_limit = int.__int__(max_pending_feedback)
         if max_feedback_bytes is not None:
             _positive_int(max_feedback_bytes, "max_feedback_bytes")
-        self._max_feedback_bytes = max_feedback_bytes
+        self._max_feedback_bytes = (
+            None if max_feedback_bytes is None else int.__int__(max_feedback_bytes)
+        )
         self._checkpoint = checkpoint
         self._late_checkpoint = False
         self._feedback_lock = threading.Lock()
