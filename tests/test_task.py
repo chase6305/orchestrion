@@ -517,6 +517,38 @@ def test_function_tasks_reject_invalid_request_ids(request_id, function_task, ca
     assert task.invoke_async(0, {"value": 1})
 
 
+def test_function_task_submission_uses_plain_integer_ids(function_task):
+    class RequestId(int):
+        __hash__ = None
+
+        def __int__(self):
+            raise RuntimeError("custom ID conversion")
+
+        def __lt__(self, other):
+            raise RuntimeError("custom ID comparison")
+
+        def __divmod__(self, other):
+            raise RuntimeError("custom ID history lookup")
+
+    task, completed = function_task
+    observed = []
+
+    def call(request_id, content):
+        observed.append(request_id)
+        assert type(request_id) is int
+        return content
+
+    task._call_fn = call
+    assert task.invoke_async(RequestId(-1)) is False
+    assert task.peek_status()["latest_request_id"] == -1
+    assert task.invoke_async(RequestId(0), {"ok": True})
+    assert completed.wait(1)
+    assert task.peek_response(0).content == {"ok": True}
+    assert not task.invoke_async(0, {"duplicate": True})
+    assert observed == [0]
+    assert type(task.peek_status()["latest_request_id"]) is int
+
+
 def test_out_of_order_request_does_not_mark_gap_as_flushed():
     task = InPlaceTaskStub()
     assert task.invoke_async(2, {"value": 2})

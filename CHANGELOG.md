@@ -35,6 +35,16 @@
   Motion input copy failures log and reject before allocating any movement IDs;
   failed robot workers still cancel queued motion when log handlers fail.
 
+- Validate and capture mutable motion synchronization options before admission;
+  share bad completion snapshots across dependent requests within each pass.
+  Contain pilot scheduler failures, close admission, cancel local pending results
+  and attempt all device cleanup even when logging fails.
+  Log changed transient main-state query errors and reset suppression on recovery.
+  Capture plain scalar request identifiers and priorities before asynchronous
+  admission so subclass hooks cannot fail after reserving an ID.
+  Avoid waiting on the lifecycle lock when an inline callback initializes a pilot
+  that an external caller is stopping and joining.
+
 - Reduce JSON snapshot overhead with direct string encoding and one-pass
   dictionary copying. Count actual copied entries and ignore custom string lengths
   when enforcing workflow payload budgets.
