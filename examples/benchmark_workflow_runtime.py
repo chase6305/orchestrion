@@ -1,0 +1,177 @@
+"""Measure input compilation, eager cancellation and scoped checkpoint capture.
+
+Run with Python 3.12 for eager cancellation measurements:
+python -m examples.benchmark_workflow_runtime --counts 512 2048 --repeats 3
+No device SDK, worker pool or network service is started by these probes.
+"""
+
+import argparse
+import asyncio
+import json
+import platform
+import statistics
+import time
+
+from orchestrion.workflow import (
+    Action,
+    Node,
+    OutputRef,
+    Resource,
+    ResourceClaim,
+    Workflow,
+    WorkflowEngine,
+    workflow_action,
+)
+
+
+async def _noop(context, inputs):
+    return None
+
+
+def _compilation(count, payload_items, references, repeats):
+    payload = {"values": list(range(payload_items))}
+    nodes = [Node("source", "noop")] if references else []
+    for index in range(count):
+        inputs = dict(payload)
+        if references:
+            inputs["source"] = OutputRef("source")
+        nodes.append(Node(str(index), "noop", inputs))
+    workflow = Workflow(tuple(nodes))
+    engine = WorkflowEngine([Action("noop", _noop)], max_nodes_per_run=len(nodes))
+    samples = []
+    for _ in range(repeats):
+        started = time.perf_counter()
+        engine.validate(workflow)
+        samples.append(time.perf_counter() - started)
+    return {
+        "nodes": count,
+        "payload_items": payload_items,
+        "output_references": references,
+        "median_seconds": statistics.median(samples),
+    }
+
+
+async def _cancel_burst(count):
+    loop = asyncio.get_running_loop()
+    factory = getattr(asyncio, "eager_task_factory", None)
+    if factory is None:
+        return {"nodes": count, "supported": False}
+    previous_factory = loop.get_task_factory()
+    calls, cancellation = [], []
+    first_call_at = None
+
+    async def device(context, inputs):
+        nonlocal first_call_at
+        calls.append(context.node_id)
+        if len(calls) == 1:
+            first_call_at = time.perf_counter()
+            run = engine.get_run_by_key("burst")
+
+            def cancel():
+                cancellation.append(
+                    {
+                        "accepted": run.cancel(),
+                        "response_seconds": time.perf_counter() - first_call_at,
+                    }
+                )
+
+            loop.call_soon(cancel)
+
+    engine = WorkflowEngine(
+        [Action("device", device, (ResourceClaim("arm"),))],
+        [Resource("arm")],
+        max_concurrency=1,
+        max_nodes_per_run=count,
+        max_events_per_run=10,
+    )
+    try:
+        loop.set_task_factory(factory)
+        run = engine.submit(
+            Workflow(tuple(Node(str(index), "device") for index in range(count))),
+            idempotency_key="burst",
+        )
+        result = await run.wait(30)
+        await asyncio.sleep(0)
+        return {
+            "nodes": count,
+            "supported": True,
+            "calls_before_cancel": len(calls),
+            "status": result.status.value,
+            **cancellation[0],
+        }
+    finally:
+        loop.set_task_factory(previous_factory)
+        await engine.aclose(5)
+
+
+async def _checkpoint_capture():
+    captures = []
+
+    class SDKRecord(dict):
+        def items(self):
+            ticket = "capture-" + str(len(captures) + 1)
+            captures.append(ticket)
+            return {"ticket": ticket}.items()
+
+    async def device(context, inputs):
+        context.checkpoint(SDKRecord())
+
+    scoped = workflow_action(
+        "scope", Workflow((Node("device", "device"),)), [Action("device", device)]
+    )
+    async with WorkflowEngine([scoped]) as engine:
+        run = engine.submit(Workflow((Node("scope", "scope"),)))
+        result = await run.wait(5)
+        return {
+            "sdk_snapshot_reads": len(captures),
+            "recorded_ticket": result.nodes["scope"].checkpoint["scope_nodes"][
+                "device"
+            ]["ticket"],
+        }
+
+
+async def benchmark(counts, payload_items, repeats):
+    compilation, cancellation = [], []
+    for count in counts:
+        for references in (False, True):
+            compilation.append(_compilation(count, payload_items, references, repeats))
+            await asyncio.sleep(0)
+        samples = [await _cancel_burst(count) for _ in range(repeats)]
+        row = dict(samples[0])
+        if row["supported"]:
+            row["response_seconds"] = statistics.median(
+                sample["response_seconds"] for sample in samples
+            )
+            row["calls_before_cancel"] = statistics.median(
+                sample["calls_before_cancel"] for sample in samples
+            )
+        cancellation.append(row)
+    return {
+        "python": platform.python_version(),
+        "repeats": repeats,
+        "compilation": compilation,
+        "cancellation": cancellation,
+        "scoped_checkpoint": await _checkpoint_capture(),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--counts", type=int, nargs="+", default=[512, 2048])
+    parser.add_argument("--payload-items", type=int, default=128)
+    parser.add_argument("--repeats", type=int, default=3)
+    args = parser.parse_args()
+    if args.repeats < 1 or any(count < 1 for count in args.counts):
+        parser.error("counts and repeats must be positive")
+    if args.payload_items < 0:
+        parser.error("payload-items must be nonnegative")
+    print(
+        json.dumps(
+            asyncio.run(benchmark(args.counts, args.payload_items, args.repeats)),
+            indent=2,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

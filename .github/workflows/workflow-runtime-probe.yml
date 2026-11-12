@@ -1,0 +1,51 @@
+name: Bounded workflow runtime comparison
+
+on:
+  push:
+    branches: [optimize-async-resource-lifecycle-20261112]
+    paths: [.github/workflows/workflow-runtime-probe.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workflow-runtime-probe
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      RAYON_NUM_THREADS: "2"
+      MAX_JOBS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prepare the merged baseline
+        run: |
+          git fetch --depth=1 origin f1f35cb28eaee2a6d043c2181f9605f057a63e10
+          git worktree add --detach /tmp/orchestrion-runtime-baseline FETCH_HEAD
+      - name: Measure the baseline sequentially
+        working-directory: /tmp/orchestrion-runtime-baseline
+        env:
+          PYTHONPATH: /tmp/orchestrion-runtime-baseline
+        run: |
+          nice -n 10 timeout 90s python "$GITHUB_WORKSPACE/examples/benchmark_workflow_runtime.py" --counts 512 2048 --payload-items 128 --repeats 3 > "$GITHUB_WORKSPACE/runtime-baseline.json"
+          cat "$GITHUB_WORKSPACE/runtime-baseline.json"
+      - name: Measure the proposed runtime sequentially
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          nice -n 10 timeout 90s python examples/benchmark_workflow_runtime.py --counts 512 2048 --payload-items 128 --repeats 3 > runtime-proposed.json
+          cat runtime-proposed.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: workflow-runtime-comparison
+          path: runtime-*.json
