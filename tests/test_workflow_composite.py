@@ -3,13 +3,17 @@
 import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 
 import pytest
 
 from orchestrion.workflow import (
     Action,
+    ActionContext,
+    ActionOutcome,
     BlockingAction,
     ExecutionUncertain,
+    JournalInUse,
     Node,
     NodeStatus,
     OutputRef,
@@ -195,6 +199,81 @@ def test_scope_cancellation_retains_all_resources_until_inner_cleanup(uncertain)
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("depth", [1, 3])
+@pytest.mark.parametrize("durable", [False, True])
+def test_repeated_scope_task_cancellation_keeps_inner_cleanup_in_accounting(
+    depth, durable, tmp_path
+):
+    async def scenario():
+        entered, stopping, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def device(context, inputs):
+            entered.set()
+            await context.wait_cancelled()
+            stopping.set()
+            await release.wait()
+            return ActionOutcome.cancelled(context.cancel_reason)
+
+        scoped = Action("device", device, (ResourceClaim("arm"),))
+        for _ in range(depth):
+            scoped = workflow_action(
+                "scope",
+                Workflow((Node("device", scoped.name),)),
+                [scoped],
+                [Resource("arm")],
+            )
+        storage = SQLiteJournal(tmp_path / "scope.db") if durable else nullcontext(None)
+        with storage as journal:
+            async with WorkflowEngine(
+                [scoped], [Resource("arm")], stop_timeout=0.01, journal=journal
+            ) as engine:
+                run = engine.submit(Workflow((Node("scope", "scope"),)))
+                try:
+                    await asyncio.wait_for(entered.wait(), 1)
+                    worker = next(iter(engine._workers))
+                    worker.cancel()
+                    await asyncio.wait_for(stopping.wait(), 1)
+                    assert (await run.wait(1)).status == RunStatus.NEEDS_ATTENTION
+                    if journal is not None:
+                        with pytest.raises(asyncio.TimeoutError):
+                            await engine.aclose(0.001)
+                    for _ in range(3):
+                        worker.cancel()
+                        await asyncio.sleep(0)
+                        assert not worker.done()
+                        snapshot = engine.scheduler_snapshot()
+                        assert snapshot["draining_adapters"] == 1
+                        assert snapshot["running_actions"] == 1
+                        assert snapshot["resources"]["arm"]["used"] == 1
+                        with pytest.raises(RuntimeError, match="still draining"):
+                            engine.confirm_quiescent(
+                                run.operation_id("scope"),
+                                evidence="unconfirmed cleanup",
+                            )
+                        if journal is not None:
+                            with pytest.raises(JournalInUse, match="drain"):
+                                journal.close()
+                            record = journal.get_run(run.run_id)["nodes"][0]
+                            assert record["status"] == "unknown"
+                            assert record["lease_active"]
+                finally:
+                    release.set()
+                await asyncio.wait_for(asyncio.shield(worker), 1)
+                # The done callback runs after the task's last step.
+                await asyncio.sleep(0)
+                assert engine.scheduler_snapshot()["draining_adapters"] == 0
+                assert engine.scheduler_snapshot()["running_actions"] == 0
+                assert run.snapshot().nodes["scope"].status == NodeStatus.UNKNOWN
+                engine.confirm_quiescent(
+                    run.operation_id("scope"), evidence="all scoped handlers exited"
+                )
+                assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
+                if journal is not None:
+                    assert not journal.get_run(run.run_id)["nodes"][0]["lease_active"]
+
+    asyncio.run(scenario())
+
+
 def test_scope_failure_stops_siblings_and_exposes_diagnostics():
     async def scenario():
         async def bad(context, inputs):
@@ -345,6 +424,79 @@ def test_small_feedback_budget_cannot_turn_uncertain_scope_into_released_failure
             run = engine.submit(Workflow((Node("scope", "scope"),)))
             assert (await run.wait(1)).status == RunStatus.NEEDS_ATTENTION
             assert engine.resource_snapshot()["resources"]["arm"]["used"] == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("depth", [1, 3])
+def test_scope_cancellation_reaches_nested_devices_before_returning(depth):
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        contexts, tokens = [], []
+
+        async def device(context, inputs):
+            contexts.append(context)
+            tokens.append(context._thread_cancellation())
+            entered.set()
+            await context.wait_cancelled()
+            await release.wait()
+            return ActionOutcome.cancelled(context.cancel_reason)
+
+        scoped = Action("device", device, (ResourceClaim("arm"),))
+        for _ in range(depth):
+            scoped = workflow_action(
+                "scope", Workflow((Node("device", scoped.name),)),
+                [scoped], [Resource("arm")],
+            )
+        async with WorkflowEngine([scoped], [Resource("arm")]) as engine:
+            try:
+                run = engine.submit(Workflow((Node("scope", "scope"),)))
+                await asyncio.wait_for(entered.wait(), 1)
+                run.cancel()
+                assert contexts[0].cancel_requested
+                assert tokens[0].is_set()
+                assert contexts[0].cancel_reason == "cancelled"
+                assert engine.resource_snapshot()["resources"]["arm"]["used"] == 1
+            finally:
+                release.set()
+            assert (await run.wait(1)).status == RunStatus.CANCELLED
+            assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_scoped_context_propagates_internal_cancellation_to_its_delegate():
+    async def scenario():
+        observed = []
+
+        async def device(context, inputs):
+            token = context._thread_cancellation()
+            assert context._request_cancel("adapter_interrupted")
+            observed.append((context.cancel_requested, context.cancel_reason, token.is_set()))
+            return ActionOutcome.cancelled(context.cancel_reason)
+
+        scoped = workflow_action(
+            "scope", Workflow((Node("device", "device"),)), [Action("device", device)]
+        )
+        async with WorkflowEngine([scoped]) as engine:
+            run = engine.submit(Workflow((Node("scope", "scope"),)))
+            assert (await run.wait(1)).status == RunStatus.CANCELLED
+            assert observed == [(True, "adapter_interrupted", True)]
+
+    asyncio.run(scenario())
+
+
+def test_deep_scope_cancellation_callbacks_do_not_require_recursive_stack_growth():
+    async def scenario():
+        contexts = [ActionContext("run", str(i), lambda value: None) for i in range(1500)]
+        try:
+            for parent, child in zip(contexts, contexts[1:]):
+                parent._add_cancel_callback(lambda c=child: c._request_cancel("cancelled"))
+            contexts[0]._request_cancel("cancelled")
+            assert all(context.cancel_requested for context in contexts)
+        finally:
+            for context in contexts:
+                context._finish()
 
     asyncio.run(scenario())
 

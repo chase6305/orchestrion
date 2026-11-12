@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Log and drop invalid or oversized optional workflow progress instead of raising
+  into device handlers. Count these reports and contain cancelled progress sinks
+  without changing action outcomes or releasing uncertain device claims.
+- Drain nested workflow cleanup through repeated adapter cancellation; keep the
+  outer worker counted and block reconciliation until all inner handlers exit.
+
+- Drain owned remote RPC and cancellation-monitor tasks through startup failures,
+  timeouts and repeated caller cancellation. Close rejected coroutines, recover
+  tasks created by failing factories, preserve late accepted tickets and distinguish
+  unstarted submission failures from uncertain device effects.
+- Keep interrupted blocking SDK calls in engine accounting until they exit. Apply
+  stop-confirmation budgets to adapter interruption, and keep their concurrency
+  slots and resource claims quarantined while draining.
+- Isolate optional feedback callback and notification failures with logged return
+  paths. Count lost reports, recover notification delivery, flush in-flight batches
+  in order during reentrant completion, and release retired scalar values outside
+  queue locks. Scoped contexts forward cancellation to their owning context.
+
 - Return explicit `TaskFailure` and `ActionOutcome` values for asynchronous
   failures, cooperative cancellation and uncertain device states. Built-in task,
   blocking, ticket and composite adapters contain SDK errors; workflow UNKNOWN

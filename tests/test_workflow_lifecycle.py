@@ -286,6 +286,7 @@ def test_interrupted_executor_wait_prevents_queued_sdk_io_and_observes_late_fail
                         ),
                     ],
                     [Resource("arm")],
+                    stop_timeout=0.005,
                 ) as engine:
                     try:
                         run = engine.submit(Workflow((Node("sdk", "sdk"),)))
@@ -300,6 +301,7 @@ def test_interrupted_executor_wait_prevents_queued_sdk_io_and_observes_late_fail
                     await asyncio.wait_for(
                         asyncio.wrap_future(executor.submit(lambda: None)), 1
                     )
+                    await engine.aclose(1)
                     assert not calls
                     engine.confirm_quiescent(
                         run.run_id + "/sdk",
@@ -351,6 +353,53 @@ def test_executor_shutdown_cancels_queued_calls_without_quarantining_the_device(
                     assert not calls
                 finally:
                     release.set()
+
+    asyncio.run(scenario())
+
+
+def test_interrupted_blocking_action_keeps_live_sdk_in_draining_accounting():
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        entered, release = asyncio.Event(), threading.Event()
+        finished = threading.Event()
+        calls = []
+
+        def sdk(inputs):
+            loop.call_soon_threadsafe(entered.set)
+            try:
+                assert release.wait(3)
+                calls.append("device stopped")
+            finally:
+                finished.set()
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            engine = WorkflowEngine(
+                [Action("sdk", BlockingAction(sdk, executor), (ResourceClaim("arm"),))],
+                [Resource("arm")], stop_timeout=0.005,
+            )
+            try:
+                run = engine.submit(Workflow((Node("sdk", "sdk"),)))
+                await asyncio.wait_for(entered.wait(), 1)
+                worker = next(iter(engine._workers))
+                worker.cancel()
+                assert (await run.wait(1)).status == RunStatus.NEEDS_ATTENTION
+                snapshot = engine.scheduler_snapshot()
+                assert snapshot["draining_adapters"] == 1
+                assert snapshot["running_actions"] == 1
+                assert snapshot["resources"]["arm"]["used"] == 1
+                with pytest.raises(RuntimeError, match="still draining"):
+                    engine.confirm_quiescent(run.operation_id("sdk"), evidence="controller idle")
+                worker.cancel()
+                with pytest.raises(asyncio.TimeoutError):
+                    await engine.aclose(0.005)
+                assert not finished.is_set()
+            finally:
+                release.set()
+                await engine.aclose(1)
+            assert finished.is_set() and calls == ["device stopped"]
+            assert engine.scheduler_snapshot()["draining_adapters"] == 0
+            assert engine.resource_snapshot()["resources"]["arm"]["used"] == 1
+            engine.confirm_quiescent(run.operation_id("sdk"), evidence="SDK drained; controller idle")
 
     asyncio.run(scenario())
 

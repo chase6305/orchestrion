@@ -53,6 +53,12 @@ already-started calls drain while retaining claims. Async handlers must keep the
 event loop free. Express ordering through graph dependencies: an action cannot
 wait on a run or close its own engine.
 
+Unexpected coroutine cancellation also keeps a running `BlockingAction` in
+engine accounting until its SDK call exits. Its cancellation token prevents queued
+wrappers from entering device I/O. Configure `stop_timeout` to report `UNKNOWN`
+after a bounded stop wait; the still-draining SDK call keeps its concurrency slot
+and resource claims, and `confirm_quiescent()` remains blocked until it exits.
+
 ## Contracts and bounds
 
 Actions accept `input_schema` and `output_schema` using `RequestSchema` and
@@ -75,6 +81,15 @@ delivered immediately; SDK-thread reports use a per-action bounded queue
 (`max_pending_feedback_per_action=128` by default). Overflow drops the oldest
 pending report and increments `NodeResult.feedback_dropped`. Late reports are
 dropped. Required results belong in final outputs or the device protocol.
+Invalid JSON and oversized reports also log and count as dropped feedback;
+`report()` returns without interrupting the device handler or SDK callback.
+
+Optional progress callback failures are logged and counted in
+`feedback_dropped`; they cannot rewrite an action result or release its device
+claims. A failed loop notification drops and counts the pending batch, then the
+next SDK report retries notification. Repeated notification failures log once
+until notification recovers. Completion flushes accepted progress, including
+the remainder of an in-flight delivery batch, before the final state.
 
 ## Cancellation and diagnostics
 
@@ -199,12 +214,27 @@ confirmation become `UNKNOWN`. Backend I/O must be bounded. Checkpoints replace
 previous metadata and have a 64 KiB compact ASCII JSON limit; a draining adapter
 can persist a late ticket without changing the outcome or releasing its lease.
 
+RPC helper tasks close rejected coroutines and drain accepted work before
+returning an error outcome, including when cancellation interrupts cleanup again.
+An unstarted submit task is a known failure with no device effects; a factory
+failure after submit started remains `UNKNOWN`. Accepted tickets returned during
+timeout cancellation cleanup are still checkpointed. A failed cancellation RPC
+can be retried idempotently while final device observations remain authoritative.
+
 ## Composite capabilities
 
 `workflow_action(name, inner_workflow, actions, resources)` wraps a fixed DAG as
 one action. It reserves each listed resource's full capacity before any inner
 step and keeps continuous ownership. Inner steps follow their own dependencies
 and capacity constraints; an unknown step quarantines the whole scope.
+
+Cancellation reaches nested scopes synchronously through loop-local callbacks;
+it does not depend on starting a forwarding task. Deep nesting uses an iterative
+dispatch queue. Inner handlers recheck parent cancellation before device entry,
+and callbacks are released when the scope finishes. Repeated native cancellation
+of the outer adapter still waits for every inner handler to exit. A stop deadline
+can publish `UNKNOWN` while that cleanup continues; the outer worker remains
+counted and reconciliation remains blocked until cleanup finishes.
 
 The output contains `nodes[step_id]` with `status`, `output` and `error`. Use
 `run.operation_id(node_id)` for encoded scoped IDs. Inner plans, action versions
