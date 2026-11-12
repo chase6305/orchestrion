@@ -92,6 +92,15 @@ class _ScopedContext(ActionContext):
     def _thread_cancellation(self):
         return self._delegate._thread_cancellation()
 
+    def _request_cancel(self, reason: str) -> bool:
+        return self._delegate._request_cancel(reason)
+
+    def _add_cancel_callback(self, callback) -> None:
+        self._delegate._add_cancel_callback(callback)
+
+    def _remove_cancel_callback(self, callback) -> None:
+        self._delegate._remove_cancel_callback(callback)
+
     def checkpoint(self, data: Any) -> None:
         self._delegate.checkpoint(data)
         self._scope_checkpoint(self.node_id, data)
@@ -190,9 +199,13 @@ class _WorkflowAction:
 
         def wrap(action):
             async def invoke(inner_context, inner_inputs):
+                if context.cancel_requested:
+                    return ActionOutcome.cancelled(context.cancel_reason)
                 _report_optional(
                     context, {"scope_node": inner_context.node_id, "kind": "started"}
                 )
+                if context.cancel_requested:
+                    return ActionOutcome.cancelled(context.cancel_reason)
                 return await action.handler(
                     _ScopedContext(inner_context, context, checkpoint), inner_inputs
                 )
@@ -207,13 +220,11 @@ class _WorkflowAction:
         try:
             failure = None
             async with engine:
+                if context.cancel_requested:
+                    return ActionOutcome.cancelled(context.cancel_reason)
                 run = engine.submit(self._workflow)
-
-                async def forward_cancel():
-                    await context.wait_cancelled()
-                    run.cancel()
-
-                cancellation = asyncio.create_task(forward_cancel())
+                cancel_inner = run.cancel
+                context._add_cancel_callback(cancel_inner)
                 try:
                     result = await run.wait()
                 except asyncio.CancelledError as exc:
@@ -225,8 +236,7 @@ class _WorkflowAction:
                     run.cancel()
                     failure = ActionOutcome.failed(exception_description(exc))
                 finally:
-                    cancellation.cancel()
-                    await asyncio.gather(cancellation, return_exceptions=True)
+                    context._remove_cancel_callback(cancel_inner)
             if failure is not None:
                 if engine.resource_snapshot()["quarantined"]:
                     return ActionOutcome.unknown(

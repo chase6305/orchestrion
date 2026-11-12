@@ -8,6 +8,8 @@ import pytest
 
 from orchestrion.workflow import (
     Action,
+    ActionContext,
+    ActionOutcome,
     BlockingAction,
     ExecutionUncertain,
     Node,
@@ -345,6 +347,79 @@ def test_small_feedback_budget_cannot_turn_uncertain_scope_into_released_failure
             run = engine.submit(Workflow((Node("scope", "scope"),)))
             assert (await run.wait(1)).status == RunStatus.NEEDS_ATTENTION
             assert engine.resource_snapshot()["resources"]["arm"]["used"] == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("depth", [1, 3])
+def test_scope_cancellation_reaches_nested_devices_before_returning(depth):
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        contexts, tokens = [], []
+
+        async def device(context, inputs):
+            contexts.append(context)
+            tokens.append(context._thread_cancellation())
+            entered.set()
+            await context.wait_cancelled()
+            await release.wait()
+            return ActionOutcome.cancelled(context.cancel_reason)
+
+        scoped = Action("device", device, (ResourceClaim("arm"),))
+        for _ in range(depth):
+            scoped = workflow_action(
+                "scope", Workflow((Node("device", scoped.name),)),
+                [scoped], [Resource("arm")],
+            )
+        async with WorkflowEngine([scoped], [Resource("arm")]) as engine:
+            try:
+                run = engine.submit(Workflow((Node("scope", "scope"),)))
+                await asyncio.wait_for(entered.wait(), 1)
+                run.cancel()
+                assert contexts[0].cancel_requested
+                assert tokens[0].is_set()
+                assert contexts[0].cancel_reason == "cancelled"
+                assert engine.resource_snapshot()["resources"]["arm"]["used"] == 1
+            finally:
+                release.set()
+            assert (await run.wait(1)).status == RunStatus.CANCELLED
+            assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_scoped_context_propagates_internal_cancellation_to_its_delegate():
+    async def scenario():
+        observed = []
+
+        async def device(context, inputs):
+            token = context._thread_cancellation()
+            assert context._request_cancel("adapter_interrupted")
+            observed.append((context.cancel_requested, context.cancel_reason, token.is_set()))
+            return ActionOutcome.cancelled(context.cancel_reason)
+
+        scoped = workflow_action(
+            "scope", Workflow((Node("device", "device"),)), [Action("device", device)]
+        )
+        async with WorkflowEngine([scoped]) as engine:
+            run = engine.submit(Workflow((Node("scope", "scope"),)))
+            assert (await run.wait(1)).status == RunStatus.CANCELLED
+            assert observed == [(True, "adapter_interrupted", True)]
+
+    asyncio.run(scenario())
+
+
+def test_deep_scope_cancellation_callbacks_do_not_require_recursive_stack_growth():
+    async def scenario():
+        contexts = [ActionContext("run", str(i), lambda value: None) for i in range(1500)]
+        try:
+            for parent, child in zip(contexts, contexts[1:]):
+                parent._add_cancel_callback(lambda c=child: c._request_cancel("cancelled"))
+            contexts[0]._request_cancel("cancelled")
+            assert all(context.cancel_requested for context in contexts)
+        finally:
+            for context in contexts:
+                context._finish()
 
     asyncio.run(scenario())
 

@@ -563,20 +563,26 @@ class WorkflowEngine:
                 error=reason,
                 settlements=settlements,
             )
-        elif context._request_cancel(reason):
-            run._transition(node_id, NodeStatus.CANCELLING, error=reason)
-            budget = run._by_id[node_id].node.stop_timeout
-            if budget is None:
-                budget = self._stop_timeout
-            if budget is not None:
-                context._stop_deadline = self._loop.time() + budget
-                self._stop_timers[context.operation_id] = self._loop.call_at(
-                    context._stop_deadline,
-                    self._stop_confirmation_expired,
-                    run,
-                    node_id,
-                    context,
-                )
+        else:
+            context._request_cancel(reason)
+        self._wake.set()
+
+    def _context_cancelled(
+        self, run: WorkflowRun, node_id: str, context: ActionContext, reason: str
+    ) -> None:
+        """Arm the same stop budget for engine and adapter interruption requests."""
+        if run._results[node_id].status.terminal:
+            return
+        run._transition(node_id, NodeStatus.CANCELLING, error=reason)
+        budget = run._by_id[node_id].node.stop_timeout
+        if budget is None:
+            budget = self._stop_timeout
+        if budget is not None:
+            context._stop_deadline = self._loop.time() + budget
+            self._stop_timers[context.operation_id] = self._loop.call_at(
+                context._stop_deadline, self._stop_confirmation_expired,
+                run, node_id, context,
+            )
         self._wake.set()
 
     def _stop_confirmation_expired(
@@ -839,6 +845,7 @@ class WorkflowEngine:
                 ),
             )
             run._contexts[node_id] = context
+            context._cancel_observer = partial(self._context_cancelled, run, node_id, context)
             self._leases[context.operation_id] = item.claims
             for claim in item.claims:
                 self._used[claim.resource] += claim.units
