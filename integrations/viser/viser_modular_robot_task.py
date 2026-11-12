@@ -16,7 +16,7 @@ from orchestrion.tasks.function_call_task import (
     CallResult,
     TaskFailure,
     ThreadedPoolFunctionCallTask,
-    _accept_request_id,
+    _submission_request_id,
 )
 from orchestrion.tasks.modular_reduced_robot_task import (
     ModularReducedRobotTask,
@@ -98,7 +98,8 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
         self._finished_sequences = set()
 
     def invoke_async(self, request_id: int, content: Optional[Dict] = None) -> bool:
-        if not _accept_request_id(request_id):
+        request_id = _submission_request_id(request_id)
+        if request_id is None:
             return False
         # Reserve sequence numbers and submit atomically. Otherwise two concurrent
         # calls (or a duplicate ID) can overwrite a queued request's sequence.
