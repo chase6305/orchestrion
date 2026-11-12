@@ -1,6 +1,6 @@
 name: Bounded workflow runtime comparison
 
-# Fifth probe: compare waiting graphs both with and without workflow deadlines.
+# Sixth probe: include completion accounting in eager throughput comparisons.
 
 on:
   push:

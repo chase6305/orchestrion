@@ -23,6 +23,14 @@ from orchestrion.workflow import (
     workflow_action,
 )
 
+_TIMING_FIELDS = (
+    "submit_seconds",
+    "run_seconds",
+    "total_seconds",
+    "drain_seconds",
+    "total_including_drain_seconds",
+)
+
 
 async def _noop(context, inputs):
     return None
@@ -175,7 +183,13 @@ async def _with_idle_runs(count, idle_runs, *, eager=False, deadline=False):
         submitted = time.perf_counter()
         await run.wait(30)
         completed = time.perf_counter()
-        return {
+        drained = None
+        if not idle_runs:
+            # Eager completion can publish results before worker done callbacks
+            # run. Include those callbacks when comparing completed throughput.
+            await engine.aclose(5)
+            drained = time.perf_counter()
+        result = {
             "nodes": count,
             "supported": True,
             "eager": eager,
@@ -185,6 +199,10 @@ async def _with_idle_runs(count, idle_runs, *, eager=False, deadline=False):
             "run_seconds": completed - submitted,
             "total_seconds": completed - before,
         }
+        if drained is not None:
+            result["drain_seconds"] = drained - completed
+            result["total_including_drain_seconds"] = drained - before
+        return result
     finally:
         if eager:
             loop.set_task_factory(previous_factory)
@@ -219,16 +237,18 @@ async def benchmark(counts, payload_items, repeats, idle_runs):
                     for _ in range(repeats)
                 ]
                 row = dict(samples[0])
-                for metric in ("submit_seconds", "run_seconds", "total_seconds"):
-                    row[metric] = statistics.median(
-                        sample[metric] for sample in samples
-                    )
+                for metric in _TIMING_FIELDS:
+                    if metric in row:
+                        row[metric] = statistics.median(
+                            sample[metric] for sample in samples
+                        )
                 active_runs.append(row)
         samples = [await _with_idle_runs(count, 0, eager=True) for _ in range(repeats)]
         row = dict(samples[0])
         if row["supported"]:
-            for metric in ("submit_seconds", "run_seconds", "total_seconds"):
-                row[metric] = statistics.median(sample[metric] for sample in samples)
+            for metric in _TIMING_FIELDS:
+                if metric in row:
+                    row[metric] = statistics.median(sample[metric] for sample in samples)
         eager_completion.append(row)
     return {
         "python": platform.python_version(),

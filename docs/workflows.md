@@ -283,10 +283,11 @@ python -m examples.benchmark_workflow_runtime --counts 512 2048 --repeats 3
 It prints JSON with median validation/preview times for static inputs and output
 references, cancellation callback delay and cancellation processing time, graph
 execution with zero or 64 other waiting runs, with and without workflow deadlines,
-and the number of SDK checkpoint
-captures. It also measures eager graphs that run to completion without cancellation.
-Node construction is outside the validation measurements; graph
-submission and execution times are reported separately. It starts no worker pool
+and the number of SDK checkpoint captures. It also measures eager graphs that run
+to completion without cancellation. Node construction is outside the validation
+measurements; graph submission and execution times are reported separately.
+Zero-waiter probes also report time through engine draining, including worker done
+callbacks that can follow an eager run's final result. It starts no worker pool
 or network service. Use the same script, parameters and environment for paired
 comparisons; these synthetic workloads do not predict device latency or general
 application throughput.
