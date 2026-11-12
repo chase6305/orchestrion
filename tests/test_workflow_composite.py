@@ -17,6 +17,7 @@ from orchestrion.workflow import (
     Node,
     NodeStatus,
     OutputRef,
+    PayloadLimitError,
     Resource,
     ResourceClaim,
     RunStatus,
@@ -296,6 +297,106 @@ def test_scope_failure_stops_siblings_and_exposes_diagnostics():
                 event.detail for event in run.events() if event.kind == "feedback"
             ]
             assert reports[-1]["scope_result"]["nodes"]["after"]["status"] == "skipped"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("threaded", [False, True])
+def test_completed_inner_context_does_not_mirror_late_feedback_into_an_active_scope(
+    threaded,
+):
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        contexts = []
+
+        async def first(context, inputs):
+            contexts.append(context)
+            context.report({"accepted": True})
+
+        async def hold(context, inputs):
+            entered.set()
+            await release.wait()
+
+        scoped = workflow_action(
+            "scope",
+            Workflow((Node("first", "first"), Node("hold", "hold", after=("first",)))),
+            [Action("first", first), Action("hold", hold)],
+        )
+        async with WorkflowEngine([scoped]) as engine:
+            run = engine.submit(Workflow((Node("scope", "scope"),)))
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                if threaded:
+                    producer = threading.Thread(
+                        target=lambda: contexts[0].report({"late": True})
+                    )
+                    producer.start()
+                    producer.join(1)
+                    assert not producer.is_alive()
+                    await asyncio.sleep(0)
+                else:
+                    contexts[0].report({"late": True})
+                feedback = [
+                    event.detail for event in run.events() if event.kind == "feedback"
+                ]
+                assert {
+                    "scope_node": "first",
+                    "feedback": {"accepted": True},
+                } in feedback
+                assert {
+                    "scope_node": "first",
+                    "feedback": {"late": True},
+                } not in feedback
+            finally:
+                release.set()
+            assert (await run.wait(1)).status is RunStatus.SUCCEEDED
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("durable", [False, True])
+def test_rejected_scope_checkpoint_does_not_poison_later_accepted_updates(
+    durable, tmp_path
+):
+    async def scenario():
+        rejected = []
+
+        async def update(context, inputs):
+            value = {"a": "x" * (28 * 1024), "b": "y" * (40 * 1024), "c": "ok"}[
+                context.node_id
+            ]
+            try:
+                context.checkpoint({"value": value})
+            except PayloadLimitError:
+                rejected.append(context.node_id)
+            return {"updated": context.node_id}
+
+        scoped = workflow_action(
+            "scope",
+            Workflow(
+                (
+                    Node("a", "update"),
+                    Node("b", "update", after=("a",)),
+                    Node("c", "update", after=("b",)),
+                )
+            ),
+            [Action("update", update)],
+        )
+        storage = SQLiteJournal(tmp_path / "scope.db") if durable else nullcontext(None)
+        with storage as journal:
+            async with WorkflowEngine([scoped], journal=journal) as engine:
+                run = engine.submit(Workflow((Node("scope", "scope"),)))
+                result = await run.wait(2)
+                assert result.status is RunStatus.SUCCEEDED
+                assert rejected == ["b"]
+                checkpoint = result.nodes["scope"].checkpoint
+                assert set(checkpoint["scope_nodes"]) == {"a", "c"}
+                assert checkpoint["scope_nodes"]["c"] == {"value": "ok"}
+                if journal is not None:
+                    assert (
+                        journal.get_run(run.run_id)["nodes"][0]["checkpoint"]
+                        == checkpoint
+                    )
 
     asyncio.run(scenario())
 
