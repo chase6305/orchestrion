@@ -6,7 +6,7 @@ import heapq
 import inspect
 import time
 import weakref
-from collections import deque
+from collections import OrderedDict, deque
 from contextvars import ContextVar
 from dataclasses import replace
 from functools import partial
@@ -141,7 +141,7 @@ class WorkflowEngine:
         self._leases: Dict[str, Tuple[ResourceClaim, ...]] = {}
         self._quarantined: Dict[str, Tuple[WorkflowRun, str]] = {}
         self._runs: Dict[str, WorkflowRun] = {}
-        self._finished_runs: Dict[str, WorkflowRun] = {}
+        self._finished_runs: OrderedDict[str, WorkflowRun] = OrderedDict()
         self._deadline_runs: Dict[str, WorkflowRun] = {}
         self._workers = set()
         self._running_count = 0
@@ -317,6 +317,20 @@ class WorkflowEngine:
         ):
             self._driver_done(self._driver)
 
+    def _check_admission_open(self) -> None:
+        self._check_driver()
+        if self._closed:
+            raise RuntimeError("WorkflowEngine is closed")
+
+    def _check_active_run_capacity(self) -> None:
+        if len(self._runs) >= self._max_active_runs:
+            # Eager follow-ups can arrive before the scheduler's next turn.
+            self._finish_completed_runs()
+        if len(self._runs) >= self._max_active_runs:
+            raise RuntimeError(
+                "max_active_runs reached; wait for an active run to finish"
+            )
+
     def describe(self) -> Dict[str, Any]:
         """Return a side-effect-free capability catalog for planners and tooling."""
         return {
@@ -378,9 +392,7 @@ class WorkflowEngine:
         self._check_loop()
         # A completed task's callback may still be queued. Observe failure before
         # admitting another command or replacing the driver reference.
-        self._check_driver()
-        if self._closed:
-            raise RuntimeError("WorkflowEngine is closed")
+        self._check_admission_open()
         if idempotency_key is not None:
             _name(idempotency_key, "idempotency_key")
         compiled = None
@@ -393,6 +405,7 @@ class WorkflowEngine:
                 self._max_nodes,
                 self._max_input_bytes,
             )
+            self._check_admission_open()
             fingerprint = submission_fingerprint(workflow, compiled)
             retained = self._submissions.get(idempotency_key)
             if retained is not None:
@@ -405,14 +418,7 @@ class WorkflowEngine:
                 raise RuntimeError(
                     "max_idempotency_keys reached; explicitly prune completed keys"
                 )
-        if len(self._runs) >= self._max_active_runs:
-            # Eager follow-ups may submit before the next scheduler turn retires
-            # earlier terminal runs. They no longer consume active-run capacity.
-            self._finish_completed_runs()
-        if len(self._runs) >= self._max_active_runs:
-            raise RuntimeError(
-                "max_active_runs reached; wait for an active run to finish"
-            )
+        self._check_active_run_capacity()
         if compiled is None:
             compiled = compile_workflow(
                 workflow,
@@ -421,6 +427,9 @@ class WorkflowEngine:
                 self._max_nodes,
                 self._max_input_bytes,
             )
+            # A validator can invoke lifecycle APIs or submit follow-up work.
+            self._check_admission_open()
+            self._check_active_run_capacity()
         run = WorkflowRun(self, workflow, compiled, idempotency_key)
         self._record_journal("_admit", run, compiled, fingerprint, strict=True)
         self._runs[run.run_id] = run
@@ -863,7 +872,10 @@ class WorkflowEngine:
 
     def _finish_completed_runs(self) -> None:
         """Retire terminal graphs without scanning unrelated running adapters."""
-        for run in tuple(self._finished_runs.values()):
+        while self._finished_runs:
+            # Remove first: releasing SDK inputs can reenter admission and finish
+            # other queued graphs before this call resumes.
+            _, run = self._finished_runs.popitem(last=False)
             self._finish_run(run)
 
     async def _schedule(self) -> None:

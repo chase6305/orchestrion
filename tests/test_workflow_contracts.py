@@ -40,6 +40,88 @@ async def echo(context, inputs):
     return inputs
 
 
+@pytest.mark.skipif(
+    not hasattr(asyncio, "eager_task_factory"), reason="requires eager task support"
+)
+@pytest.mark.parametrize("key", [None, "prepared"])
+def test_submission_rechecks_closure_after_input_preparation(key):
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        previous_factory = loop.get_task_factory()
+        closers, calls = [], []
+
+        class ClosingSchema(RequestSchema):
+            def validate(self, content):
+                closers.append(asyncio.create_task(engine.aclose()))
+                return super().validate(content)
+
+        async def record(context, inputs):
+            calls.append(context.node_id)
+
+        engine = WorkflowEngine(
+            [Action("record", record, input_schema=ClosingSchema({}))]
+        )
+        try:
+            loop.set_task_factory(asyncio.eager_task_factory)
+            with pytest.raises(RuntimeError, match="closed"):
+                engine.submit(
+                    Workflow((Node("rejected", "record"),)), idempotency_key=key
+                )
+            await asyncio.wait_for(asyncio.gather(*closers), 1)
+            assert calls == []
+            assert engine.scheduler_snapshot()["active_runs"] == 0
+            assert engine.get_run_by_key("prepared") is None
+        finally:
+            loop.set_task_factory(previous_factory)
+            await engine.aclose(1)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("key", [None, "prepared"])
+def test_submission_rechecks_capacity_after_reentrant_input_preparation(key):
+    async def scenario():
+        release, entered = asyncio.Event(), asyncio.Event()
+        admitted, calls = [], []
+
+        class SubmittingSchema(RequestSchema):
+            def validate(self, content):
+                if not admitted:
+                    admitted.append(engine.submit(Workflow((Node("held", "hold"),))))
+                return super().validate(content)
+
+        async def hold(context, inputs):
+            entered.set()
+            await release.wait()
+
+        async def record(context, inputs):
+            calls.append(context.node_id)
+
+        engine = WorkflowEngine(
+            [
+                Action("hold", hold),
+                Action("record", record, input_schema=SubmittingSchema({})),
+            ],
+            max_active_runs=1,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="max_active_runs"):
+                engine.submit(
+                    Workflow((Node("rejected", "record"),)), idempotency_key=key
+                )
+            await asyncio.wait_for(entered.wait(), 1)
+            assert engine.scheduler_snapshot()["active_runs"] == 1
+            assert engine.get_run_by_key("prepared") is None
+            assert calls == []
+            release.set()
+            assert (await admitted[0].wait(1)).status is RunStatus.SUCCEEDED
+        finally:
+            release.set()
+            await engine.aclose(1)
+
+    asyncio.run(scenario())
+
+
 def test_integer_subclass_priority_is_captured_before_scheduler_admission():
     class Priority(int):
         def __neg__(self):
