@@ -54,7 +54,7 @@ def _dispatch_cancellation(callbacks: Iterable[Callable[[], Any]]) -> None:
             callback = pending.popleft()
             try:
                 callback()
-            except Exception as exc:
+            except (Exception, asyncio.CancelledError) as exc:
                 log_error("Scope cancellation callback failed: %s", exception_description(exc))
     finally:
         _cancellation_dispatch.pending = None

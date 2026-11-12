@@ -73,7 +73,7 @@ def _notify_cancel(callback: Optional[Callable[[], Any]]) -> None:
     if callback is not None:
         try:
             callback()
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             log_error("Helper cancellation observer failed: %s", exception_description(exc))
 
 
