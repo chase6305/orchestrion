@@ -1044,6 +1044,62 @@ def test_retiring_inputs_can_reenter_admission_without_finishing_a_graph_twice()
     asyncio.run(scenario())
 
 
+@pytest.mark.skipif(
+    not hasattr(asyncio, "eager_task_factory"), reason="requires eager task support"
+)
+@pytest.mark.parametrize("key", [None, "new-operation"])
+def test_capacity_retirement_rechecks_closure_requested_by_an_sdk_finalizer(key):
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        previous_factory = loop.get_task_factory()
+        entered, release = asyncio.Event(), asyncio.Event()
+        closers, calls = [], []
+
+        class CloseOnRelease(str):
+            def __del__(self):
+                closers.append(asyncio.create_task(engine.aclose()))
+
+        async def noop(context, inputs):
+            calls.append(context.node_id)
+
+        async def hold(context, inputs):
+            entered.set()
+            await release.wait()
+
+        engine = WorkflowEngine(
+            [Action("noop", noop), Action("hold", hold)], max_active_runs=1
+        )
+        try:
+            first = engine.submit(
+                Workflow(
+                    (
+                        Node("source", "noop", {"input": CloseOnRelease("SDK input")}),
+                        Node("hold", "hold", after=("source",)),
+                    )
+                )
+            )
+            await asyncio.wait_for(entered.wait(), 1)
+            release.set()
+            await asyncio.sleep(0)
+            loop.set_task_factory(asyncio.eager_task_factory)
+            with pytest.raises(RuntimeError, match="closed"):
+                engine.submit(
+                    Workflow((Node("rejected", "noop"),)), idempotency_key=key
+                )
+            assert len(closers) == 1
+            await asyncio.wait_for(closers[0], 1)
+            assert (await first.wait(1)).status is RunStatus.SUCCEEDED
+            assert calls == ["source"]
+            assert engine.get_run_by_key("new-operation") is None
+            assert engine.scheduler_snapshot()["active_runs"] == 0
+        finally:
+            release.set()
+            loop.set_task_factory(previous_factory)
+            await engine.aclose(2)
+
+    asyncio.run(scenario())
+
+
 def test_driver_cancelled_during_worker_startup_releases_unstarted_reservation():
     async def scenario():
         loop = asyncio.get_running_loop()

@@ -326,6 +326,8 @@ class WorkflowEngine:
         if len(self._runs) >= self._max_active_runs:
             # Eager follow-ups can arrive before the scheduler's next turn.
             self._finish_completed_runs()
+            # Retiring inputs can invoke SDK finalizers that close the engine.
+            self._check_admission_open()
         if len(self._runs) >= self._max_active_runs:
             raise RuntimeError(
                 "max_active_runs reached; wait for an active run to finish"
