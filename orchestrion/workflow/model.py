@@ -19,7 +19,7 @@ def _operation_id(run_id: str, node_id: str) -> str:
 
 
 def _positive_int(value: int, label: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+    if isinstance(value, bool) or not isinstance(value, int) or int.__int__(value) < 1:
         raise ValueError("{} must be a positive integer".format(label))
 
 
