@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 try:
@@ -23,6 +24,6 @@ def log_error(message: str, *args: object) -> None:
     """Report asynchronous failures without letting a log sink break completion."""
     try:
         logger.error(message, *args)
-    except Exception:
+    except (Exception, asyncio.CancelledError):
         # Application-owned handlers may fail; error state remains in the result.
         return

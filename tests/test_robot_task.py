@@ -1,5 +1,6 @@
 """Shared motion contracts and lifecycle races for the built-in robot backends."""
 
+import asyncio
 import concurrent.futures
 import threading
 import weakref
@@ -185,8 +186,9 @@ def test_worker_failure_cancels_queued_motion_and_wakes_waiters(robot, monkeypat
 
 
 @pytest.mark.parametrize("observer_fails", [False, True])
+@pytest.mark.parametrize("logging_failure", [RuntimeError, asyncio.CancelledError])
 def test_worker_logging_failure_discards_queued_motion_before_restart(
-    robot, monkeypatch, observer_fails
+    robot, monkeypatch, observer_fails, logging_failure
 ):
     simulated = isinstance(robot, SimulatedRobotTask)
     step_name = "_run_next_trajectory" if simulated else "_process_motion"
@@ -196,7 +198,7 @@ def test_worker_logging_failure_discards_queued_motion_before_restart(
         raise ValueError("device failure")
 
     def fail_log(*args, **kwargs):
-        raise RuntimeError("log sink unavailable")
+        raise logging_failure("log sink unavailable")
 
     def fail_observer():
         raise ValueError("state observer failed")

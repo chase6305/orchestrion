@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from orchestrion.utils.errors import exception_message
 from orchestrion.workflow import (
     Action,
     ActionOutcome,
@@ -518,11 +519,16 @@ def test_worker_cancelled_before_start_does_not_leave_a_lease_or_pending_run():
     asyncio.run(scenario())
 
 
-def test_malformed_sdk_exception_does_not_strand_the_workflow():
+@pytest.mark.parametrize("formatter_failure", [ValueError, asyncio.CancelledError])
+def test_malformed_sdk_exception_does_not_strand_the_workflow(formatter_failure):
     async def scenario():
         class MalformedError(Exception):
             def __str__(self):
-                raise ValueError("formatter failed")
+                raise formatter_failure("formatter failed")
+
+        assert exception_message(MalformedError()) == (
+            "MalformedError: exception message is unavailable"
+        )
 
         async def fail(context, inputs):
             raise MalformedError()
@@ -541,6 +547,43 @@ def test_malformed_sdk_exception_does_not_strand_the_workflow():
                 == "MalformedError: exception message is unavailable"
             )
             assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("logging_failure", [RuntimeError, asyncio.CancelledError])
+def test_logging_failure_does_not_cancel_completion_or_close_admission(
+    logging_failure, monkeypatch
+):
+    def fail_log(*args, **kwargs):
+        raise logging_failure("logging transport interrupted")
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        unhandled = []
+        loop.set_exception_handler(lambda loop, detail: unhandled.append(detail))
+
+        async def fail(context, inputs):
+            return ActionOutcome.failed("device confirmed failure and stopped")
+
+        engine = WorkflowEngine(
+            [Action("fail", fail, (ResourceClaim("arm"),)), Action("echo", echo)],
+            [Resource("arm")],
+        )
+        monkeypatch.setattr("orchestrion.utils.logger.logger.error", fail_log)
+        try:
+            run = engine.submit(Workflow((Node("fail", "fail"),)))
+            assert (await run.wait(1)).status is RunStatus.FAILED
+            followup = engine.submit(Workflow((Node("next", "echo"),)))
+            assert (await followup.wait(1)).status is RunStatus.SUCCEEDED
+            await asyncio.sleep(0)
+            assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
+            assert engine.scheduler_snapshot()["scheduler_error"] is None
+            assert unhandled == []
+        finally:
+            await engine.aclose(1)
+            loop.set_exception_handler(previous_handler)
 
     asyncio.run(scenario())
 
