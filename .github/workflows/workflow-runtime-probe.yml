@@ -1,6 +1,6 @@
 name: Bounded workflow runtime comparison
 
-# Final verification: scheduler faults stay inside the owned coroutine too.
+# Final verification: retire quiescent contexts while long graphs keep running.
 
 on:
   push:

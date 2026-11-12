@@ -4,6 +4,7 @@ import asyncio
 import gc
 import threading
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -28,6 +29,84 @@ from orchestrion.workflow import (
 
 async def echo(context, inputs):
     return inputs
+
+
+@pytest.mark.parametrize("draining", [False, True])
+def test_quiescent_contexts_are_released_while_other_work_keeps_running(draining):
+    async def scenario():
+        held, release_hold, release_sdk, sdk_exited = (
+            asyncio.Event() for _ in range(4)
+        )
+        references = []
+
+        async def device(context, inputs):
+            references.append(weakref.ref(context))
+            context.report(object())
+            if draining:
+                context._request_cancel("adapter_interrupted")
+                await release_sdk.wait()
+                context.checkpoint({"ticket": "late-accepted"})
+                sdk_exited.set()
+                return ActionOutcome.cancelled("SDK exited")
+
+        async def hold(context, inputs):
+            held.set()
+            await release_hold.wait()
+
+        engine = WorkflowEngine(
+            [Action("device", device, (ResourceClaim("arm"),)), Action("hold", hold)],
+            [Resource("arm")],
+            stop_timeout=0.001,
+        )
+        try:
+            run = engine.submit(
+                Workflow(
+                    (Node("device", "device"), Node("hold", "hold")),
+                    failure_policy=FailurePolicy.CONTINUE_INDEPENDENT,
+                )
+            )
+            await asyncio.wait_for(held.wait(), 1)
+            if draining:
+
+                async def expired():
+                    while (
+                        run.snapshot().nodes["device"].status is not NodeStatus.UNKNOWN
+                    ):
+                        await asyncio.sleep(0.001)
+
+                await asyncio.wait_for(expired(), 1)
+                assert references[0]() is not None
+                assert engine.scheduler_snapshot()["running_actions"] == 2
+                with pytest.raises(RuntimeError, match="still draining"):
+                    engine.confirm_quiescent(
+                        run.operation_id("device"), evidence="pending"
+                    )
+                release_sdk.set()
+                await asyncio.wait_for(sdk_exited.wait(), 1)
+            await asyncio.sleep(0)
+            gc.collect()
+            assert references[0]() is None
+            assert not run.done
+            assert engine.scheduler_snapshot()["running_actions"] == 1
+            assert run.explain("device")["feedback"] == {"pending": 0, "dropped": 1}
+            if draining:
+                assert run.snapshot().nodes["device"].checkpoint == {
+                    "ticket": "late-accepted"
+                }
+                assert engine.resource_snapshot()["resources"]["arm"]["used"] == 1
+                engine.confirm_quiescent(
+                    run.operation_id("device"), evidence="SDK and arm idle"
+                )
+            release_hold.set()
+            assert (await run.wait(1)).status is (
+                RunStatus.NEEDS_ATTENTION if draining else RunStatus.SUCCEEDED
+            )
+        finally:
+            release_sdk.set()
+            release_hold.set()
+            await engine.aclose(1)
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.skipif(

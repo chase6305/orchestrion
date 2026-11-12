@@ -468,7 +468,7 @@ class WorkflowEngine:
                 self._driver.add_done_callback(self._driver_done)
         except BaseException as exc:
             if isinstance(exc, (Exception, asyncio.CancelledError)) and (
-                run.done or run._contexts
+                run.done or run._contexts or run._unfinished < len(run._results)
             ):
                 # An eager factory may run the driver before throwing. Existing
                 # reservations or results belong to an accepted operation; its
@@ -1005,6 +1005,7 @@ class WorkflowEngine:
         if context.operation_id in self._draining:
             self._draining.remove(context.operation_id)
             context._finish()
+            run._contexts.pop(item.node.node_id, None)
             self._running_count -= 1
             run._emit(item.node.node_id, "adapter_drained")
             self._wake.set()
@@ -1242,6 +1243,8 @@ class WorkflowEngine:
             error=error,
             feedback_dropped=feedback_dropped,
         )
+        if not draining:
+            run._contexts.pop(node.node_id, None)
         if (
             status
             in {
