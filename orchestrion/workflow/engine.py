@@ -390,10 +390,10 @@ class WorkflowEngine:
         self._idle.clear()
         if idempotency_key is not None:
             self._submissions[idempotency_key] = (fingerprint, run)
-        for item in compiled:
-            if not item.dependencies:
-                self._make_ready(run, item)
         try:
+            for item in compiled:
+                if not item.dependencies:
+                    self._make_ready(run, item)
             if run._deadline is not None:
                 run._deadline_timer = self._loop.call_at(
                     run._deadline, self._expire_run, run

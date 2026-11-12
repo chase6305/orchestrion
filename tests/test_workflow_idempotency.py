@@ -342,6 +342,58 @@ def test_failed_submission_does_not_reserve_a_key_or_exhaust_retention():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("failure_at", [1, 2])
+def test_ready_queue_preparation_failure_releases_admission_and_allows_key_reuse(
+    failure_at, monkeypatch
+):
+    async def scenario():
+        calls = []
+
+        async def record(context, inputs):
+            calls.append(context.node_id)
+
+        workflow = Workflow(
+            (
+                Node("first", "record"),
+                Node("second", "record"),
+                Node("dependent", "record", after=("second",)),
+            )
+        )
+        engine = WorkflowEngine(
+            [Action("record", record, (ResourceClaim("arm"),))], [Resource("arm")]
+        )
+        attempts = []
+        prepare = engine._make_ready
+
+        def fail_preparation(run, item):
+            prepare(run, item)
+            attempts.append(item.node.node_id)
+            if len(attempts) == failure_at:
+                raise RuntimeError("ready queue preparation failed")
+
+        try:
+            with monkeypatch.context() as failure:
+                failure.setattr(engine, "_make_ready", fail_preparation)
+                with pytest.raises(
+                    RuntimeError, match="ready queue preparation failed"
+                ):
+                    engine.submit(workflow, idempotency_key="retry")
+            assert calls == []
+            assert engine.get_run_by_key("retry") is None
+            snapshot = engine.scheduler_snapshot()
+            assert snapshot["active_runs"] == 0
+            assert snapshot["running_actions"] == 0
+            assert snapshot["resources"]["arm"]["waiting"] == 0
+            assert snapshot["resources"]["arm"]["used"] == 0
+            retry = engine.submit(workflow, idempotency_key="retry")
+            assert (await retry.wait(1)).status is RunStatus.SUCCEEDED
+            assert calls == ["first", "second", "dependent"]
+        finally:
+            await engine.aclose(1)
+
+    asyncio.run(scenario())
+
+
 def test_unkeyed_submissions_are_not_deduplicated_or_retained():
     async def scenario():
         engine = WorkflowEngine([Action("echo", echo)], max_idempotency_keys=1)

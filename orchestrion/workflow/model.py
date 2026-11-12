@@ -200,6 +200,7 @@ class Node:
             raise TypeError("claims must contain ResourceClaim objects")
         if isinstance(self.priority, bool) or not isinstance(self.priority, int):
             raise TypeError("priority must be an integer")
+        object.__setattr__(self, "priority", int.__int__(self.priority))
         _timeout(self.timeout)
         _timeout(self.stop_timeout)
 

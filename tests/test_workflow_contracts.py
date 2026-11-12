@@ -40,6 +40,33 @@ async def echo(context, inputs):
     return inputs
 
 
+def test_integer_subclass_priority_is_captured_before_scheduler_admission():
+    class Priority(int):
+        def __neg__(self):
+            raise RuntimeError("custom queue priority")
+
+        def __int__(self):
+            raise RuntimeError("custom integer conversion")
+
+    async def scenario():
+        calls = []
+
+        async def record(context, inputs):
+            calls.append(context.node_id)
+
+        urgent = Node("urgent", "record", priority=Priority(7))
+        workflow = Workflow((Node("normal", "record"), urgent))
+        async with WorkflowEngine(
+            [Action("record", record)], max_concurrency=1
+        ) as engine:
+            assert type(urgent.priority) is int
+            run = engine.submit(workflow, idempotency_key="captured-priority")
+            assert (await run.wait(1)).status is RunStatus.SUCCEEDED
+            assert calls == ["urgent", "normal"]
+
+    asyncio.run(scenario())
+
+
 def test_valid_output_binds_to_downstream_and_contracts_are_defensive():
     async def scenario():
         schema = pose_schema()

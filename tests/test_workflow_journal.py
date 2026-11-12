@@ -641,8 +641,11 @@ def test_uninitialized_durable_snapshot_does_not_claim_resources_are_free(tmp_pa
         asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("failure_at", ["driver", "ready_queue"])
 def test_scheduler_start_failure_releases_idempotency_key_on_disk_and_in_memory(
     tmp_path,
+    monkeypatch,
+    failure_at,
 ):
     async def scenario():
         loop = asyncio.get_running_loop()
@@ -658,12 +661,22 @@ def test_scheduler_start_failure_releases_idempotency_key_on_disk_and_in_memory(
                 [Action("echo", echo)], journal=journal
             ) as engine:
                 workflow = Workflow((Node("n", "echo"),))
-                loop.set_task_factory(refuse)
-                try:
-                    with pytest.raises(RuntimeError, match="startup failed"):
-                        engine.submit(workflow, idempotency_key="key")
-                finally:
-                    loop.set_task_factory(original_factory)
+                prepare = engine._make_ready
+
+                def refuse_ready(run, item):
+                    prepare(run, item)
+                    raise RuntimeError("scheduler startup failed")
+
+                with monkeypatch.context() as failure:
+                    if failure_at == "driver":
+                        loop.set_task_factory(refuse)
+                    else:
+                        failure.setattr(engine, "_make_ready", refuse_ready)
+                    try:
+                        with pytest.raises(RuntimeError, match="startup failed"):
+                            engine.submit(workflow, idempotency_key="key")
+                    finally:
+                        loop.set_task_factory(original_factory)
                 assert engine.get_run_by_key("key") is None
                 assert not journal._load()
                 good = engine.submit(workflow, idempotency_key="key")
