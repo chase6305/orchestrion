@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, Iterable, Optional
 
 from orchestrion.schema import RequestSchema
 from orchestrion.utils.errors import exception_description
+from orchestrion.utils.logger import log_error
 
 from .actions import Action, ActionContext
 from .compiler import compile_workflow, submission_fingerprint
@@ -27,9 +28,9 @@ from .model import (
 def _report_optional(context: ActionContext, feedback: Any) -> None:
     try:
         context.report(feedback)
-    except Exception:
+    except (Exception, asyncio.CancelledError) as exc:
         # Mirrored progress cannot decide whether a device has stopped.
-        pass
+        log_error("Scoped feedback delivery failed: %s", exception_description(exc))
 
 
 async def _close_scope(

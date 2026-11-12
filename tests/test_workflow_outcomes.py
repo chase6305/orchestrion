@@ -188,6 +188,37 @@ def test_logging_failure_cannot_interrupt_workflow_accounting(monkeypatch):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+def test_scope_feedback_delivery_failure_logs_and_preserves_device_execution(
+    failure, monkeypatch, caplog
+):
+    def broken_report(context, feedback):
+        raise failure("optional progress transport interrupted")
+
+    async def scenario():
+        calls = []
+
+        async def device(context, inputs):
+            calls.append(context.node_id)
+            context.report({"progress": 1})
+            return ActionOutcome.unknown("controller stop remains unconfirmed")
+
+        scoped = workflow_action(
+            "scope", Workflow((Node("device", "device"),)),
+            [Action("device", device)], [Resource("arm")],
+        )
+        monkeypatch.setattr(ActionContext, "report", broken_report)
+        async with WorkflowEngine([scoped], [Resource("arm")]) as engine:
+            run = engine.submit(Workflow((Node("scope", "scope"),)))
+            assert (await run.wait(1)).status is RunStatus.NEEDS_ATTENTION
+            assert calls == ["device"]
+            assert "optional progress transport interrupted" in caplog.text
+            assert engine.resource_snapshot()["resources"]["arm"]["used"] == 1
+            engine.confirm_quiescent(run.operation_id("scope"), evidence="arm idle")
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "status",
     [OperationStatus.FAILED, OperationStatus.CANCELLED, OperationStatus.UNKNOWN],
