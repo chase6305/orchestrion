@@ -108,13 +108,25 @@ def test_explicit_success_still_checks_schema_and_copies_output(value, expected)
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("invalid", [float("nan"), object(), "x" * 100])
-def test_invalid_unknown_diagnostics_cannot_release_device_leases(tmp_path, invalid):
+class CancelledDiagnostic(dict):
+    def items(self):
+        raise asyncio.CancelledError("diagnostic capture interrupted")
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [float("nan"), object(), "x" * 100, CancelledDiagnostic()],
+    ids=["nonfinite", "non-json", "oversized", "cancelled-snapshot"],
+)
+@pytest.mark.parametrize(
+    "status", [NodeStatus.UNKNOWN, NodeStatus.FAILED, NodeStatus.CANCELLED]
+)
+def test_invalid_diagnostics_preserve_confirmed_outcomes_and_device_leases(
+    tmp_path, invalid, status
+):
     async def scenario():
         async def device(context, inputs):
-            return ActionOutcome(
-                NodeStatus.UNKNOWN, {"value": invalid}, "lost stop acknowledgement"
-            )
+            return ActionOutcome(status, {"value": invalid}, "controller outcome")
 
         with SQLiteJournal(tmp_path / "cell.db") as journal:
             async with WorkflowEngine(
@@ -125,15 +137,28 @@ def test_invalid_unknown_diagnostics_cannot_release_device_leases(tmp_path, inva
             ) as engine:
                 run = engine.submit(Workflow((Node("device", "device"),)))
                 result = await run.wait(1)
-                assert result.status == RunStatus.NEEDS_ATTENTION
-                assert result.nodes["device"].output is None
-                assert result.nodes["device"].error == "lost stop acknowledgement"
-                stored = journal.get_run(run.run_id)["nodes"][0]
-                assert stored["status"] == "unknown" and stored["lease_active"]
-                assert stored["output"] is None
-                engine.confirm_quiescent(
-                    run.operation_id("device"), evidence="controller idle"
+                assert (
+                    result.status
+                    is {
+                        NodeStatus.UNKNOWN: RunStatus.NEEDS_ATTENTION,
+                        NodeStatus.FAILED: RunStatus.FAILED,
+                        NodeStatus.CANCELLED: RunStatus.CANCELLED,
+                    }[status]
                 )
+                assert result.nodes["device"].status is status
+                assert result.nodes["device"].output is None
+                assert result.nodes["device"].error == "controller outcome"
+                stored = journal.get_run(run.run_id)["nodes"][0]
+                assert stored["status"] == status.value
+                assert stored["lease_active"] == (status is NodeStatus.UNKNOWN)
+                assert stored["output"] is None
+                assert engine.resource_snapshot()["resources"]["arm"]["used"] == int(
+                    status is NodeStatus.UNKNOWN
+                )
+                if status is NodeStatus.UNKNOWN:
+                    engine.confirm_quiescent(
+                        run.operation_id("device"), evidence="controller idle"
+                    )
 
     asyncio.run(scenario())
 
@@ -159,6 +184,39 @@ def test_logging_failure_cannot_interrupt_workflow_accounting(monkeypatch):
             run = engine.submit(Workflow((Node("echo", "echo", {"ok": True}),)))
             assert (await run.wait(1)).status == RunStatus.SUCCEEDED
             assert engine.scheduler_snapshot()["running_actions"] == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+def test_scope_feedback_delivery_failure_logs_and_preserves_device_execution(
+    failure, monkeypatch, caplog
+):
+    def broken_report(context, feedback):
+        raise failure("optional progress transport interrupted")
+
+    async def scenario():
+        calls = []
+
+        async def device(context, inputs):
+            calls.append(context.node_id)
+            context.report({"progress": 1})
+            return ActionOutcome.unknown("controller stop remains unconfirmed")
+
+        scoped = workflow_action(
+            "scope",
+            Workflow((Node("device", "device"),)),
+            [Action("device", device)],
+            [Resource("arm")],
+        )
+        monkeypatch.setattr(ActionContext, "report", broken_report)
+        async with WorkflowEngine([scoped], [Resource("arm")]) as engine:
+            run = engine.submit(Workflow((Node("scope", "scope"),)))
+            assert (await run.wait(1)).status is RunStatus.NEEDS_ATTENTION
+            assert calls == ["device"]
+            assert "optional progress transport interrupted" in caplog.text
+            assert engine.resource_snapshot()["resources"]["arm"]["used"] == 1
+            engine.confirm_quiescent(run.operation_id("scope"), evidence="arm idle")
 
     asyncio.run(scenario())
 

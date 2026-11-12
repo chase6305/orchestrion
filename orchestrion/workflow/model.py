@@ -19,19 +19,20 @@ def _operation_id(run_id: str, node_id: str) -> str:
 
 
 def _positive_int(value: int, label: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+    if isinstance(value, bool) or not isinstance(value, int) or int.__int__(value) < 1:
         raise ValueError("{} must be a positive integer".format(label))
 
 
-def _timeout(value: Optional[float]) -> None:
-    if value is not None and (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or value <= 0
-        or value > 1e12
-        or not math.isfinite(value)
-    ):
-        raise ValueError("timeout must be finite, positive, at most 1e12, or None")
+def _timeout(value: Optional[float]) -> Optional[float]:
+    """Capture a primitive budget before it reaches event-loop timer arithmetic."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # Preserve integral JSON fingerprints used by existing durable keys.
+        value = int.__int__(value) if isinstance(value, int) else float.__float__(value)
+        if 0 < value <= 1e12 and math.isfinite(value):
+            return value
+    raise ValueError("timeout must be finite, positive, at most 1e12, or None")
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ class Resource:
     def __post_init__(self) -> None:
         _name(self.name, "resource name")
         _positive_int(self.capacity, "resource capacity")
+        object.__setattr__(self, "capacity", int.__int__(self.capacity))
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,7 @@ class ResourceClaim:
     def __post_init__(self) -> None:
         _name(self.resource, "claimed resource")
         _positive_int(self.units, "claim units")
+        object.__setattr__(self, "units", int.__int__(self.units))
 
 
 @dataclass(frozen=True)
@@ -200,8 +203,11 @@ class Node:
             raise TypeError("claims must contain ResourceClaim objects")
         if isinstance(self.priority, bool) or not isinstance(self.priority, int):
             raise TypeError("priority must be an integer")
-        _timeout(self.timeout)
-        _timeout(self.stop_timeout)
+        object.__setattr__(self, "priority", int.__int__(self.priority))
+        if self.timeout is not None:
+            object.__setattr__(self, "timeout", _timeout(self.timeout))
+        if self.stop_timeout is not None:
+            object.__setattr__(self, "stop_timeout", _timeout(self.stop_timeout))
 
 
 @dataclass(frozen=True)
@@ -215,7 +221,8 @@ class Workflow:
         if not self.nodes or any(not isinstance(node, Node) for node in self.nodes):
             raise ValueError("workflow requires at least one Node")
         object.__setattr__(self, "failure_policy", FailurePolicy(self.failure_policy))
-        _timeout(self.timeout)
+        if self.timeout is not None:
+            object.__setattr__(self, "timeout", _timeout(self.timeout))
 
 
 class NodeStatus(str, Enum):

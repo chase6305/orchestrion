@@ -92,10 +92,20 @@ def test_remote_completion_uses_protocol_key_and_durable_ticket_checkpoint(tmp_p
     asyncio.run(scenario())
 
 
-def test_cancel_acceptance_does_not_release_resource_before_final_stop():
+@pytest.mark.parametrize(
+    "captured_budget", [None, "poll_interval", "rpc_timeout", "stop_timeout"]
+)
+def test_cancel_acceptance_does_not_release_resource_before_final_stop(captured_budget):
+    class Budget(float):
+        def __radd__(self, other):
+            raise RuntimeError("custom remote budget arithmetic")
+
     async def scenario():
         backend = FakeBackend(OperationStatus.RUNNING)
-        adapter = TicketAction(backend, poll_interval=0.001, stop_timeout=1)
+        options = {"poll_interval": 0.001, "rpc_timeout": 1, "stop_timeout": 1}
+        if captured_budget is not None:
+            options[captured_budget] = Budget(options[captured_budget])
+        adapter = TicketAction(backend, **options)
         async with WorkflowEngine(
             [Action("remote", adapter, (ResourceClaim("tool"),))], [Resource("tool")]
         ) as engine:
@@ -448,8 +458,19 @@ def test_final_remote_outcomes_map_to_execution_and_resource_states(status, expe
     asyncio.run(scenario())
 
 
-def test_query_retries_are_bounded_and_reset_after_successful_observations():
+@pytest.mark.parametrize("captured_limit", [False, True])
+def test_query_retries_are_bounded_and_reset_after_successful_observations(
+    captured_limit,
+):
+    class Limit(int):
+        def __le__(self, other):
+            raise RuntimeError("custom query-error comparison")
+
+        def __int__(self):
+            raise RuntimeError("custom query-error conversion")
+
     async def scenario():
+        limit = Limit(2) if captured_limit else 2
         backend = FakeBackend()
         backend.query_effects = [
             ConnectionError("transient"),
@@ -461,7 +482,7 @@ def test_query_retries_are_bounded_and_reset_after_successful_observations():
             [
                 Action(
                     "remote",
-                    TicketAction(backend, poll_interval=0.001, max_query_errors=2),
+                    TicketAction(backend, poll_interval=0.001, max_query_errors=limit),
                 )
             ]
         ) as engine:
@@ -474,14 +495,20 @@ def test_query_retries_are_bounded_and_reset_after_successful_observations():
             [
                 Action(
                     "remote",
-                    TicketAction(backend, poll_interval=0.001, max_query_errors=2),
+                    TicketAction(backend, poll_interval=0.001, max_query_errors=limit),
+                    (ResourceClaim("tool"),),
                 )
-            ]
+            ],
+            [Resource("tool")],
         ) as engine:
             run = engine.submit(Workflow((Node("remote", "remote"),)))
             assert (await run.wait(1)).status == RunStatus.NEEDS_ATTENTION
             assert backend.queries == 2
             assert len(backend.submissions) == 1
+            assert engine.resource_snapshot()["resources"]["tool"]["used"] == 1
+            engine.confirm_quiescent(
+                run.operation_id("remote"), evidence="tool stopped"
+            )
 
     asyncio.run(scenario())
 

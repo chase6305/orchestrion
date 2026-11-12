@@ -208,8 +208,9 @@ def test_intent_is_committed_before_device_io_and_completion_before_wait_returns
 
 
 @pytest.mark.parametrize("stage", ["_admit", "_start", "_settle", "_finish"])
+@pytest.mark.parametrize("error_type", [JournalError, asyncio.CancelledError])
 def test_journal_failure_closes_admission_and_preserves_conservative_recovery(
-    tmp_path, stage
+    tmp_path, stage, error_type
 ):
     path = tmp_path / "cell.db"
     calls = []
@@ -222,9 +223,7 @@ def test_journal_failure_closes_admission_and_preserves_conservative_recovery(
         with SQLiteJournal(path) as journal:
             engine = WorkflowEngine([Action("record", record)], journal=journal)
             async with engine:
-                with patch.object(
-                    journal, stage, side_effect=JournalError("disk full")
-                ):
+                with patch.object(journal, stage, side_effect=error_type("disk full")):
                     if stage == "_admit":
                         with pytest.raises(JournalError, match="disk full"):
                             engine.submit(Workflow((Node("n", "record"),)))
@@ -641,8 +640,11 @@ def test_uninitialized_durable_snapshot_does_not_claim_resources_are_free(tmp_pa
         asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("failure_at", ["driver", "ready_queue"])
 def test_scheduler_start_failure_releases_idempotency_key_on_disk_and_in_memory(
     tmp_path,
+    monkeypatch,
+    failure_at,
 ):
     async def scenario():
         loop = asyncio.get_running_loop()
@@ -658,12 +660,22 @@ def test_scheduler_start_failure_releases_idempotency_key_on_disk_and_in_memory(
                 [Action("echo", echo)], journal=journal
             ) as engine:
                 workflow = Workflow((Node("n", "echo"),))
-                loop.set_task_factory(refuse)
-                try:
-                    with pytest.raises(RuntimeError, match="startup failed"):
-                        engine.submit(workflow, idempotency_key="key")
-                finally:
-                    loop.set_task_factory(original_factory)
+                prepare = engine._make_ready
+
+                def refuse_ready(run, item):
+                    prepare(run, item)
+                    raise RuntimeError("scheduler startup failed")
+
+                with monkeypatch.context() as failure:
+                    if failure_at == "driver":
+                        loop.set_task_factory(refuse)
+                    else:
+                        failure.setattr(engine, "_make_ready", refuse_ready)
+                    try:
+                        with pytest.raises(RuntimeError, match="startup failed"):
+                            engine.submit(workflow, idempotency_key="key")
+                    finally:
+                        loop.set_task_factory(original_factory)
                 assert engine.get_run_by_key("key") is None
                 assert not journal._load()
                 good = engine.submit(workflow, idempotency_key="key")

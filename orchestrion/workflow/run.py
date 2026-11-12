@@ -185,7 +185,7 @@ class WorkflowRun:
     async def wait(self, timeout: Optional[float] = None) -> RunResult:
         """Return an isolated result; caller timeouts never cancel device work."""
         self._engine._check_loop()
-        _timeout(timeout)
+        timeout = _timeout(timeout)
         if self.done:
             return self.snapshot()
         self._engine._check_external_wait()

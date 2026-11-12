@@ -54,7 +54,7 @@ def _dispatch_cancellation(callbacks: Iterable[Callable[[], Any]]) -> None:
             callback = pending.popleft()
             try:
                 callback()
-            except Exception as exc:
+            except (Exception, asyncio.CancelledError) as exc:
                 log_error("Scope cancellation callback failed: %s", exception_description(exc))
     finally:
         _cancellation_dispatch.pending = None
@@ -88,10 +88,12 @@ class ActionContext:
         self._cancel_reason: Optional[str] = None
         self._feedback = feedback
         self._feedback_overflow = feedback_overflow
-        self._feedback_limit = max_pending_feedback
+        self._feedback_limit = int.__int__(max_pending_feedback)
         if max_feedback_bytes is not None:
             _positive_int(max_feedback_bytes, "max_feedback_bytes")
-        self._max_feedback_bytes = max_feedback_bytes
+        self._max_feedback_bytes = (
+            None if max_feedback_bytes is None else int.__int__(max_feedback_bytes)
+        )
         self._checkpoint = checkpoint
         self._late_checkpoint = False
         self._feedback_lock = threading.Lock()
@@ -135,7 +137,7 @@ class ActionContext:
     async def sleep(self, delay: float) -> None:
         """An interruptible positive delay, useful for cooperative adapters."""
         self._check_loop()
-        _timeout(delay)
+        delay = _timeout(delay)
         if delay is None:
             raise ValueError("delay must be positive")
         self.raise_if_cancelled()
@@ -147,6 +149,10 @@ class ActionContext:
 
     def report(self, feedback: Any) -> None:
         """Report JSON; invalid or undeliverable optional progress logs and drops."""
+        self._report_feedback(feedback)
+
+    def _report_feedback(self, feedback: Any) -> Any:
+        """Report once and return captured JSON for enclosing scopes."""
         if not self._active:
             return
         try:
@@ -167,11 +173,11 @@ class ActionContext:
                 if not deliver_feedback(self._feedback, snapshot):
                     with self._feedback_lock:
                         self._direct_feedback_dropped += 1
-            return
+            return snapshot
         channel = self._feedback_channel
         if channel is not None:
             channel.post(snapshot)
-            return
+            return snapshot
         with self._feedback_lock:
             if not self._active:
                 return
@@ -184,6 +190,7 @@ class ActionContext:
                 )
             channel = self._feedback_channel
         channel.post(snapshot)
+        return snapshot
 
     def checkpoint(self, data: Any) -> None:
         """Record small recovery metadata on the event loop before continuing I/O.
@@ -195,6 +202,10 @@ class ActionContext:
         A still-draining adapter may record a late ticket after a stop deadline;
         this does not change UNKNOWN or release its resources.
         """
+        self._record_checkpoint(data)
+
+    def _record_checkpoint(self, data: Any) -> Any:
+        """Record once and return the owned snapshot for enclosing scopes."""
         if not self._active and not self._late_checkpoint:
             raise RuntimeError("ActionContext has already completed")
         if asyncio.get_running_loop() is not self._loop:
@@ -204,6 +215,7 @@ class ActionContext:
         snapshot = _snapshot(data, max_bytes=65536)
         if self._checkpoint is not None:
             self._checkpoint(snapshot)
+        return snapshot
 
     def _check_loop(self) -> None:
         if not self._active:

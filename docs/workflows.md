@@ -53,6 +53,17 @@ already-started calls drain while retaining claims. Async handlers must keep the
 event loop free. Express ordering through graph dependencies: an action cannot
 wait on a run or close its own engine.
 
+Dispatch runs in bounded turns so large ready batches, including eager tasks,
+yield to cancellation callbacks and timers. Follow-up submissions from an action
+reuse the scheduler being started rather than recursively starting another one.
+Completed graphs retire through a FIFO queue, so unrelated waiting adapters do
+not add a full active-run scan to every completion. Their live workers still
+consume concurrency until cleanup exits. Workflow deadline timers expire waiting
+graphs; candidate deadlines are checked before new resource reservations, including
+when a blocked event loop delayed timer delivery.
+The engine retires its references to quiescent contexts during long graphs;
+draining contexts stay available for late recovery tickets until SDK cleanup exits.
+
 Unexpected coroutine cancellation also keeps a running `BlockingAction` in
 engine accounting until its SDK call exits. Its cancellation token prevents queued
 wrappers from entering device I/O. Configure `stop_timeout` to report `UNKNOWN`
@@ -68,6 +79,9 @@ full validation immediately before dispatch. Output violations fail the producer
 with `ActionOutputError` and skip its dependants; retained JSON remains available
 for diagnosis. Optional or dynamic data still requires runtime validation.
 
+If a custom schema rewrites an input binding, compilation derives dependencies
+from the final template and checks source nodes, paths and cycles before admission.
+
 Optional engine limits `max_input_bytes_per_node`, `max_output_bytes_per_node`
 and `max_feedback_bytes_per_report` measure compact ASCII JSON. Inputs are checked
 before admission and again after schema validation of resolved bindings. Final
@@ -75,6 +89,11 @@ schema payloads are isolated finite JSON objects and remain subject to byte limi
 Oversized outputs fail before retention or downstream dispatch. Keep images and
 point clouds in artifact storage and pass references; these limits do not bound
 total process memory.
+
+Resource quantities, priorities and timer budgets capture their base numeric
+values before asynchronous scheduling. Numeric subclass hooks cannot interrupt
+resource arithmetic or timer setup. Integral timeout values keep their JSON type
+so existing durable submission identities remain compatible.
 
 `context.report()` accepts JSON progress. Reports on the owning event loop are
 delivered immediately; SDK-thread reports use a per-action bounded queue
@@ -150,7 +169,13 @@ Use `run.explain(node_id)` for dependency, concurrency, resource, queue, stop or
 quarantine blockers. `engine.scheduler_snapshot()` shows counts, owners, queue
 heads and errors without device calls. A scheduler fault closes admission,
 fails unstarted work and requests running work to stop; cleanup still retains
-claims until confirmed quiescent.
+claims until confirmed quiescent. Failure while admitting a successor also stops
+the remaining graph and logs the error, committing already confirmed outcomes
+even when queue preparation fails. Durable recovery sees consistent final states.
+Cancellation callback failures log and leave the remaining scope notifications
+and owned transport cleanup running until they finish.
+Scheduler and completion faults log inside their owned coroutines, including when
+a task factory fails after eager completion.
 
 ## Submission identity and retention
 
@@ -159,6 +184,13 @@ for identical submissions, including failed or cancelled results. Changed
 execution snapshots raise `ValueError`. Validation happens before reserving a
 key; replay does not restart deadlines. Retrieve handles with
 `engine.get_run_by_key(key)`.
+
+Admission rechecks closure and active-run capacity after preparing inputs, since
+custom validation can invoke lifecycle APIs or submit other work. Failed initial
+queue preparation rolls back admission and its key. If a task factory fails after
+starting work, the engine keeps the accepted handle, real worker and resource
+claims in accounting; a startup error cannot make an active operation's key
+available for resubmission.
 
 `max_idempotency_keys` defaults to 1024. Explicitly use
 `engine.prune_idempotency_keys(keep_last=...)` to forget settled keys; active and
@@ -236,9 +268,38 @@ of the outer adapter still waits for every inner handler to exit. A stop deadlin
 can publish `UNKNOWN` while that cleanup continues; the outer worker remains
 counted and reconciliation remains blocked until cleanup finishes.
 
+Completed inner contexts ignore late progress, including SDK snapshots that
+overlap completion. Successful progress reuses its first captured SDK snapshot
+when mirrored through nested scopes; each context retains its own limits and drop
+accounting. Scoped checkpoints reuse the delegate's first captured JSON
+snapshot. A rejected parent checkpoint leaves the accepted accumulator unchanged,
+so an oversized update cannot poison later valid updates. Recovery data stays
+available during draining and is released when the scoped adapter actually exits,
+even if the SDK retains its old context.
+
 The output contains `nodes[step_id]` with `status`, `output` and `error`. Use
 `run.operation_id(node_id)` for encoded scoped IDs. Inner plans, action versions
 and limits contribute to the composite version. Bind parameters when constructing
 the inner graph; dynamic node inputs are not supported. Outer concurrency counts
 composites and inner concurrency counts steps. Use shared resource claims to
 enforce aggregate capacity across scopes.
+
+## Runtime probe
+
+Run the bounded, hardware-free probe on Python 3.12 to include eager cancellation:
+
+```bash
+python -m examples.benchmark_workflow_runtime --counts 512 2048 --repeats 3
+```
+
+It prints JSON with median validation/preview times for static inputs and output
+references, cancellation callback delay and cancellation processing time, graph
+execution with zero or 64 other waiting runs, with and without workflow deadlines,
+and the number of SDK feedback and checkpoint captures. It also measures eager
+graphs that run to completion without cancellation. Node construction is outside
+the validation measurements; graph submission and execution times are reported separately.
+Zero-waiter probes also report time through engine draining, including worker done
+callbacks that can follow an eager run's final result. It starts no worker pool
+or network service. Use the same script, parameters and environment for paired
+comparisons; these synthetic workloads do not predict device latency or general
+application throughput.

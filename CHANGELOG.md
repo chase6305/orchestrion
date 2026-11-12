@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Bound workflow scheduling turns so eager action bursts yield to cancellation
+  and timers; reuse the starting scheduler for reentrant follow-up submissions.
+- Retire completed graphs without scanning unrelated waiting adapters, and reuse
+  stable output-reference scans during validation while rechecking custom schemas.
+  Recompile schema-rewritten bindings before dependency and cycle checks.
+- Release quiescent node contexts during long graphs while preserving feedback
+  counters, draining adapter accounting and late ticket checkpoints.
+- Roll back failed initial queue preparation, recheck admission after input
+  preparation, and retain real worker owners after partial task-factory failures.
+  Completion queue faults log and stop pending work while committing confirmed
+  outcomes so durable recovery stays consistent.
+- Capture primitive resource quantities and timer budgets before asynchronous
+  arithmetic; preserve integral durable fingerprints. Isolate native cancellation
+  raised by log sinks and SDK exception formatters from operation accounting.
+- Ignore completed inner nodes' late progress, isolate rejected scope checkpoint
+  updates, capture successful SDK progress and checkpoint data once, and release
+  checkpoints after scope cleanup.
+
 - Log and drop invalid or oversized optional workflow progress instead of raising
   into device handlers. Count these reports and contain cancelled progress sinks
   without changing action outcomes or releasing uncertain device claims.
