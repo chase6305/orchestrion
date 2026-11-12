@@ -208,7 +208,9 @@ def test_resource_quantities_capture_base_integers_before_reservation_arithmetic
     ],
     ids=["capacity", "claim", "concurrency", "payload-limit"],
 )
-def test_integer_comparison_hooks_cannot_bypass_positive_quantity_checks(value, definition):
+def test_integer_comparison_hooks_cannot_bypass_positive_quantity_checks(
+    value, definition
+):
     class FalsePositive(int):
         def __lt__(self, other):
             return False
@@ -366,8 +368,11 @@ def test_schema_rewritten_binding_waits_for_its_final_source():
 
         async with WorkflowEngine(
             [
-                Action("echo", echo), Action("delayed", delayed),
-                Action("sink", echo, input_schema=RebindingSchema({}, allow_extra=True)),
+                Action("echo", echo),
+                Action("delayed", delayed),
+                Action(
+                    "sink", echo, input_schema=RebindingSchema({}, allow_extra=True)
+                ),
             ]
         ) as engine:
             workflow = Workflow(
@@ -379,9 +384,9 @@ def test_schema_rewritten_binding_waits_for_its_final_source():
             )
             try:
                 preview = engine.validate(workflow)
-                assert next(node for node in preview["nodes"] if node["node_id"] == "sink")[
-                    "after"
-                ] == ["new"]
+                assert next(
+                    node for node in preview["nodes"] if node["node_id"] == "sink"
+                )["after"] == ["new"]
                 run = engine.submit(workflow)
                 await asyncio.wait_for(entered.wait(), 1)
                 assert run.snapshot().nodes["sink"].status is NodeStatus.PENDING
@@ -395,7 +400,9 @@ def test_schema_rewritten_binding_waits_for_its_final_source():
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("source, diagnostic", [("sink", "cycle"), ("missing", "unknown dependency")])
+@pytest.mark.parametrize(
+    "source, diagnostic", [("sink", "cycle"), ("missing", "unknown dependency")]
+)
 def test_schema_binding_rewrites_are_revalidated_before_key_and_device_admission(
     source, diagnostic
 ):
@@ -410,13 +417,20 @@ def test_schema_binding_rewrites_are_revalidated_before_key_and_device_admission
             calls.append(context.node_id)
 
         async with WorkflowEngine(
-            [Action("source", record), Action("sink", record, input_schema=RebindingSchema({}))]
+            [
+                Action("source", record),
+                Action("sink", record, input_schema=RebindingSchema({})),
+            ]
         ) as engine:
             with pytest.raises(ValueError, match=diagnostic):
                 engine.submit(
                     Workflow(
-                        (Node("old", "source"), Node("sink", "sink", {"source": OutputRef("old")}))
-                    ), idempotency_key="schema-binding",
+                        (
+                            Node("old", "source"),
+                            Node("sink", "sink", {"source": OutputRef("old")}),
+                        )
+                    ),
+                    idempotency_key="schema-binding",
                 )
             assert engine.get_run_by_key("schema-binding") is None
             assert calls == []

@@ -6,6 +6,7 @@
   and timers; reuse the starting scheduler for reentrant follow-up submissions.
 - Retire completed graphs without scanning unrelated waiting adapters, and reuse
   stable output-reference scans during validation while rechecking custom schemas.
+  Recompile schema-rewritten bindings before dependency and cycle checks.
 - Roll back failed initial queue preparation, recheck admission after input
   preparation, and retain real worker owners after partial task-factory failures.
   Completion queue faults log and stop pending work while committing confirmed

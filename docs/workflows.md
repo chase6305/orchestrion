@@ -77,6 +77,9 @@ full validation immediately before dispatch. Output violations fail the producer
 with `ActionOutputError` and skip its dependants; retained JSON remains available
 for diagnosis. Optional or dynamic data still requires runtime validation.
 
+If a custom schema rewrites an input binding, compilation derives dependencies
+from the final template and checks source nodes, paths and cycles before admission.
+
 Optional engine limits `max_input_bytes_per_node`, `max_output_bytes_per_node`
 and `max_feedback_bytes_per_report` measure compact ASCII JSON. Inputs are checked
 before admission and again after schema validation of resolved bindings. Final

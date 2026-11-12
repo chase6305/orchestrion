@@ -109,17 +109,28 @@ def compile_workflow(
     successors = {node_id: [] for node_id in nodes}
     indegree = {}
     for node_id, compiled in nodes.items():
+        if actions[compiled.node.action].input_schema is None:
+            references = stable_references.get(node_id, ())
+        else:
+            # Validators can rewrite bindings, including in an earlier template.
+            # Compile dependencies and paths from the final owned inputs.
+            references = tuple(_output_references(compiled.node.inputs))
+            dependencies = tuple(
+                dict.fromkeys(
+                    (
+                        *compiled.node.after,
+                        *(reference.node_id for reference in references),
+                    )
+                )
+            )
+            if dependencies != compiled.dependencies:
+                compiled = replace(compiled, dependencies=dependencies)
+                nodes[node_id] = compiled
         indegree[node_id] = len(compiled.dependencies)
         for dependency in compiled.dependencies:
             if dependency not in nodes:
                 raise ValueError("unknown dependency: " + dependency)
             successors[dependency].append(node_id)
-        if actions[compiled.node.action].input_schema is None:
-            references = stable_references.get(node_id, ())
-        else:
-            # Custom validators can mutate the supplied template. Preserve the
-            # final path checks against that template rather than a stale cache.
-            references = _output_references(compiled.node.inputs)
         for reference in references:
             schema = actions[nodes[reference.node_id].node.action].output_schema
             if schema is not None:
