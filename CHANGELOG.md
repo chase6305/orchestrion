@@ -5,6 +5,8 @@
 - Log and drop invalid or oversized optional workflow progress instead of raising
   into device handlers. Count these reports and contain cancelled progress sinks
   without changing action outcomes or releasing uncertain device claims.
+- Drain nested workflow cleanup through repeated adapter cancellation; keep the
+  outer worker counted and block reconciliation until all inner handlers exit.
 
 - Drain owned remote RPC and cancellation-monitor tasks through startup failures,
   timeouts and repeated caller cancellation. Close rejected coroutines, recover

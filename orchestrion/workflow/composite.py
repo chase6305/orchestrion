@@ -33,6 +33,20 @@ def _report_optional(context: ActionContext, feedback: Any) -> None:
         pass
 
 
+async def _close_scope(
+    engine: WorkflowEngine, context: ActionContext
+) -> Optional[ActionOutcome]:
+    """Keep inner work in the outer adapter's accounting through repeated cancel."""
+    interrupted = None
+    while True:
+        try:
+            await engine.aclose()
+            return interrupted
+        except asyncio.CancelledError as exc:
+            context._request_cancel("adapter_interrupted")
+            interrupted = ActionOutcome.unknown(exception_description(exc))
+
+
 class WorkflowActionError(RuntimeError):
     """A scoped workflow failed after all of its known operations stopped."""
 
@@ -219,7 +233,8 @@ class _WorkflowAction:
         )
         try:
             failure = None
-            async with engine:
+            cancel_inner = None
+            try:
                 if context.cancel_requested:
                     return ActionOutcome.cancelled(context.cancel_reason)
                 run = engine.submit(self._workflow)
@@ -228,15 +243,22 @@ class _WorkflowAction:
                 try:
                     result = await run.wait()
                 except asyncio.CancelledError as exc:
+                    context._request_cancel("adapter_interrupted")
                     run.cancel()
                     failure = ActionOutcome.unknown(exception_description(exc))
                 except Exception as exc:
-                    # The context manager still drains the cancelled graph before
+                    # The owned engine still drains the cancelled graph before
                     # returning an outcome to the outer engine.
                     run.cancel()
                     failure = ActionOutcome.failed(exception_description(exc))
+            finally:
+                try:
+                    cleanup_failure = await _close_scope(engine, context)
+                    if cleanup_failure is not None:
+                        failure = cleanup_failure
                 finally:
-                    context._remove_cancel_callback(cancel_inner)
+                    if cancel_inner is not None:
+                        context._remove_cancel_callback(cancel_inner)
             if failure is not None:
                 if engine.resource_snapshot()["quarantined"]:
                     return ActionOutcome.unknown(

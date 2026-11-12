@@ -197,6 +197,64 @@ def test_scope_cancellation_retains_all_resources_until_inner_cleanup(uncertain)
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("depth", [1, 3])
+def test_repeated_scope_task_cancellation_keeps_inner_cleanup_in_accounting(depth):
+    async def scenario():
+        entered, stopping, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def device(context, inputs):
+            entered.set()
+            await context.wait_cancelled()
+            stopping.set()
+            await release.wait()
+            return ActionOutcome.cancelled(context.cancel_reason)
+
+        scoped = Action("device", device, (ResourceClaim("arm"),))
+        for _ in range(depth):
+            scoped = workflow_action(
+                "scope",
+                Workflow((Node("device", scoped.name),)),
+                [scoped],
+                [Resource("arm")],
+            )
+        async with WorkflowEngine(
+            [scoped], [Resource("arm")], stop_timeout=0.01
+        ) as engine:
+            run = engine.submit(Workflow((Node("scope", "scope"),)))
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                worker = next(iter(engine._workers))
+                worker.cancel()
+                await asyncio.wait_for(stopping.wait(), 1)
+                assert (await run.wait(1)).status == RunStatus.NEEDS_ATTENTION
+                for _ in range(3):
+                    worker.cancel()
+                    await asyncio.sleep(0)
+                    assert not worker.done()
+                    snapshot = engine.scheduler_snapshot()
+                    assert snapshot["draining_adapters"] == 1
+                    assert snapshot["running_actions"] == 1
+                    assert snapshot["resources"]["arm"]["used"] == 1
+                    with pytest.raises(RuntimeError, match="still draining"):
+                        engine.confirm_quiescent(
+                            run.operation_id("scope"), evidence="unconfirmed cleanup"
+                        )
+            finally:
+                release.set()
+            await asyncio.wait_for(asyncio.shield(worker), 1)
+            # The done callback runs after the task's last step.
+            await asyncio.sleep(0)
+            assert engine.scheduler_snapshot()["draining_adapters"] == 0
+            assert engine.scheduler_snapshot()["running_actions"] == 0
+            assert run.snapshot().nodes["scope"].status == NodeStatus.UNKNOWN
+            engine.confirm_quiescent(
+                run.operation_id("scope"), evidence="all scoped handlers exited"
+            )
+            assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
+
+    asyncio.run(scenario())
+
+
 def test_scope_failure_stops_siblings_and_exposes_diagnostics():
     async def scenario():
         async def bad(context, inputs):
