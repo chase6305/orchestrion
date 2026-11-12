@@ -37,6 +37,21 @@ aliases are rejected. The `-1` movement sentinel means no move yet. Invalid
 submission counters reject new requests; invalid completion counters fail waiting
 requests before a peripheral is invoked.
 
+Submission captures a validated copy of the synchronization option, including
+mutable options changed after construction. Rejected options log and return `-1`
+without reserving an ID or idempotency key. Completion reads and failures are
+shared by requests waiting on the same component within one scheduler pass;
+later passes read fresh state so a recovered adapter can make progress.
+Transient main-state query failures keep dependent requests waiting and log only
+when the diagnostic changes; successful queries reset that suppression.
+
+An unexpected pilot scheduler failure logs the error, closes admission, cancels
+nonterminal local requests and attempts cleanup of every peripheral and the robot.
+It does not escape the background thread. After cleanup finishes, a pilot without
+an owned executor can be explicitly initialized again. An owned executor is shut
+down during cleanup and requires a new pilot. As with ordinary cancellation,
+local request cancellation does not confirm a physical device has stopped.
+
 An unexpected built-in motion-worker failure stops local scheduling, cancels
 unfinished move IDs and wakes waiters. Restart explicitly with `initialize()`
 after the worker exits. Device adapters must handle physical stopping themselves.
