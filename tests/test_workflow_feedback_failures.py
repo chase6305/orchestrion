@@ -21,7 +21,10 @@ from orchestrion.workflow import (
 
 
 @pytest.mark.parametrize("threaded", [False, True])
-def test_feedback_delivery_failure_preserves_unknown_outcome(threaded, monkeypatch):
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+def test_feedback_delivery_failure_preserves_unknown_outcome(
+    threaded, error_type, monkeypatch
+):
     async def scenario():
         async def device(context, inputs):
             if threaded:
@@ -41,7 +44,7 @@ def test_feedback_delivery_failure_preserves_unknown_outcome(threaded, monkeypat
 
             def faulty_emit(node_id, kind, detail=None):
                 if kind == "feedback":
-                    raise RuntimeError("progress sink unavailable")
+                    raise error_type("progress sink unavailable")
                 return emit(node_id, kind, detail)
 
             monkeypatch.setattr(run, "_emit", faulty_emit)
@@ -55,7 +58,74 @@ def test_feedback_delivery_failure_preserves_unknown_outcome(threaded, monkeypat
     asyncio.run(scenario())
 
 
-def test_failed_sdk_notification_drops_accepted_reports_and_recovers(monkeypatch, caplog):
+@pytest.mark.parametrize("threaded", [False, True])
+@pytest.mark.parametrize(
+    "invalid_kind", ["nonfinite", "keys", "cycle", "budget", "cancelled"]
+)
+def test_invalid_feedback_logs_and_drops_without_changing_device_outcome(
+    threaded, invalid_kind, caplog
+):
+    async def scenario():
+        cycle = []
+        cycle.append(cycle)
+
+        class CancelledMapping(dict):
+            def items(self):
+                raise asyncio.CancelledError("progress snapshot cancelled")
+
+        bad = {
+            "nonfinite": {"value": float("nan")},
+            "keys": {1: "bad key"},
+            "cycle": cycle,
+            "budget": {"image": "x" * 1000},
+            "cancelled": CancelledMapping(value=1),
+        }[invalid_kind]
+        errors = []
+
+        async def device(context, inputs):
+            def report():
+                try:
+                    context.report(bad)
+                    context.report({"ok": True})
+                except BaseException as exc:
+                    errors.append(exc)
+
+            if threaded:
+                producer = threading.Thread(target=report)
+                producer.start()
+                producer.join(1)
+                assert not producer.is_alive()
+            else:
+                report()
+            return ActionOutcome.unknown("device stop unconfirmed")
+
+        async with WorkflowEngine(
+            [Action("device", device, (ResourceClaim("arm"),))],
+            [Resource("arm")],
+            max_feedback_bytes_per_report=32,
+        ) as engine:
+            run = engine.submit(Workflow((Node("device", "device"),)))
+            result = await run.wait(1)
+            assert errors == []
+            assert result.status == RunStatus.NEEDS_ATTENTION
+            assert result.nodes["device"].error == "device stop unconfirmed"
+            assert result.nodes["device"].feedback_dropped == 1
+            assert [e.detail for e in run.events() if e.kind == "feedback"] == [
+                {"ok": True}
+            ]
+            assert engine.resource_snapshot()["resources"]["arm"]["used"] == 1
+            assert "feedback was rejected" in caplog.text
+            engine.confirm_quiescent(
+                run.operation_id("device"), evidence="controller idle"
+            )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+def test_failed_sdk_notification_drops_accepted_reports_and_recovers(
+    error_type, monkeypatch, caplog
+):
     async def scenario():
         delivered, errors = [], []
         context = ActionContext("run", "device", delivered.append)
@@ -63,7 +133,7 @@ def test_failed_sdk_notification_drops_accepted_reports_and_recovers(monkeypatch
         original_notify = loop.call_soon_threadsafe
 
         def broken_notify(callback, *args, **kwargs):
-            raise RuntimeError("notification unavailable")
+            raise error_type("notification unavailable")
 
         def produce(values):
             try:

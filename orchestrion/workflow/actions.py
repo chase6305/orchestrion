@@ -146,10 +146,18 @@ class ActionContext:
         self.raise_if_cancelled()
 
     def report(self, feedback: Any) -> None:
-        """Report small JSON; SDK-thread overflow drops oldest pending progress."""
+        """Report JSON; invalid or undeliverable optional progress logs and drops."""
         if not self._active:
             return
-        snapshot = _snapshot(feedback, max_bytes=self._max_feedback_bytes)
+        try:
+            snapshot = _snapshot(feedback, max_bytes=self._max_feedback_bytes)
+        except (Exception, asyncio.CancelledError) as exc:
+            with self._feedback_lock:
+                if not self._active:
+                    return
+                self._direct_feedback_dropped += 1
+            log_error("Workflow feedback was rejected: %s", exception_description(exc))
+            return
         try:
             current_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -157,7 +165,8 @@ class ActionContext:
         if current_loop is self._loop:
             if self._active:
                 if not deliver_feedback(self._feedback, snapshot):
-                    self._direct_feedback_dropped += 1
+                    with self._feedback_lock:
+                        self._direct_feedback_dropped += 1
             return
         channel = self._feedback_channel
         if channel is not None:
@@ -214,14 +223,16 @@ class ActionContext:
                 retired += (self._checkpoint,)
                 self._checkpoint = None
             channel = self._feedback_channel
+            direct_drops = self._direct_feedback_dropped
         del retired
-        return self._direct_feedback_dropped + (0 if channel is None else channel.close())
+        return direct_drops + (0 if channel is None else channel.close())
 
     def _feedback_snapshot(self) -> Dict[str, int]:
         with self._feedback_lock:
             channel = self._feedback_channel
+            direct_drops = self._direct_feedback_dropped
         snapshot = {"pending": 0, "dropped": 0} if channel is None else channel.snapshot()
-        snapshot["dropped"] += self._direct_feedback_dropped
+        snapshot["dropped"] += direct_drops
         return snapshot
 
     def _thread_cancellation(self) -> threading.Event:

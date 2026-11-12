@@ -81,6 +81,8 @@ delivered immediately; SDK-thread reports use a per-action bounded queue
 (`max_pending_feedback_per_action=128` by default). Overflow drops the oldest
 pending report and increments `NodeResult.feedback_dropped`. Late reports are
 dropped. Required results belong in final outputs or the device protocol.
+Invalid JSON and oversized reports also log and count as dropped feedback;
+`report()` returns without interrupting the device handler or SDK callback.
 
 Optional progress callback failures are logged and counted in
 `feedback_dropped`; they cannot rewrite an action result or release its device

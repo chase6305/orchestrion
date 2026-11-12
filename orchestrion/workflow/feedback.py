@@ -13,7 +13,7 @@ def deliver_feedback(callback: Callable[[Any], None], value: Any) -> bool:
     """Optional progress cannot decide whether a physical operation has stopped."""
     try:
         callback(value)
-    except Exception as exc:
+    except (Exception, asyncio.CancelledError) as exc:
         log_error("Workflow feedback callback failed: %s", exception_description(exc))
         return False
     return True
@@ -46,7 +46,7 @@ class FeedbackChannel:
         try:
             schedule = self._loop.call_soon_threadsafe if threadsafe else self._loop.call_soon
             schedule(self._drain)
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             abandoned, self._pending = self._pending, None
             lost = len(abandoned) if abandoned is not None else 0
             self._dropped += lost

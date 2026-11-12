@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Log and drop invalid or oversized optional workflow progress instead of raising
+  into device handlers. Count these reports and contain cancelled progress sinks
+  without changing action outcomes or releasing uncertain device claims.
+
 - Drain owned remote RPC and cancellation-monitor tasks through startup failures,
   timeouts and repeated caller cancellation. Close rejected coroutines, recover
   tasks created by failing factories, preserve late accepted tickets and distinguish
