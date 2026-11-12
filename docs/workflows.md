@@ -83,6 +83,11 @@ Oversized outputs fail before retention or downstream dispatch. Keep images and
 point clouds in artifact storage and pass references; these limits do not bound
 total process memory.
 
+Resource quantities, priorities and timer budgets capture their base numeric
+values before asynchronous scheduling. Numeric subclass hooks cannot interrupt
+resource arithmetic or timer setup. Integral timeout values keep their JSON type
+so existing durable submission identities remain compatible.
+
 `context.report()` accepts JSON progress. Reports on the owning event loop are
 delivered immediately; SDK-thread reports use a per-action bounded queue
 (`max_pending_feedback_per_action=128` by default). Overflow drops the oldest

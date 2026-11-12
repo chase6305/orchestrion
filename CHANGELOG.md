@@ -9,6 +9,9 @@
 - Roll back failed initial queue preparation, recheck admission after input
   preparation, and retain real worker owners after partial task-factory failures.
   Completion queue faults log and stop pending work without rewriting success.
+- Capture primitive resource quantities and timer budgets before asynchronous
+  arithmetic; preserve integral durable fingerprints. Isolate native cancellation
+  raised by log sinks and SDK exception formatters from operation accounting.
 - Ignore completed inner nodes' late progress, isolate rejected scope checkpoint
   updates, capture SDK checkpoint data once and release it after scope cleanup.
 

@@ -92,10 +92,20 @@ def test_remote_completion_uses_protocol_key_and_durable_ticket_checkpoint(tmp_p
     asyncio.run(scenario())
 
 
-def test_cancel_acceptance_does_not_release_resource_before_final_stop():
+@pytest.mark.parametrize(
+    "captured_budget", [None, "poll_interval", "rpc_timeout", "stop_timeout"]
+)
+def test_cancel_acceptance_does_not_release_resource_before_final_stop(captured_budget):
+    class Budget(float):
+        def __radd__(self, other):
+            raise RuntimeError("custom remote budget arithmetic")
+
     async def scenario():
         backend = FakeBackend(OperationStatus.RUNNING)
-        adapter = TicketAction(backend, poll_interval=0.001, stop_timeout=1)
+        options = {"poll_interval": 0.001, "rpc_timeout": 1, "stop_timeout": 1}
+        if captured_budget is not None:
+            options[captured_budget] = Budget(options[captured_budget])
+        adapter = TicketAction(backend, **options)
         async with WorkflowEngine(
             [Action("remote", adapter, (ResourceClaim("tool"),))], [Resource("tool")]
         ) as engine:
