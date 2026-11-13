@@ -40,6 +40,7 @@ def test_integer_and_float_backoff_agree(backoff):
     [
         pytest.param(10**1000, id="huge-int"),
         pytest.param(Fraction(10**1000, 3), id="huge-fraction"),
+        pytest.param(Fraction(1, 10**400), id="underflowing-fraction"),
     ],
 )
 def test_unrepresentable_retry_parameter_has_a_validation_error(field, value):

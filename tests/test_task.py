@@ -1,6 +1,7 @@
 """Function tasks, retries, telemetry, result retention, and lifecycle races."""
 
 import concurrent.futures
+import json
 import threading
 import time
 import weakref
@@ -28,6 +29,21 @@ class InPlaceTaskStub(InPlaceFunctionCallTask):
 class ThreadedPoolTaskStub(ThreadedPoolFunctionCallTask):
     def _call_fn(self, request_id, content):
         return {"result": content["value"] + 1}
+
+
+def test_fractional_retry_settings_have_a_json_compatible_description():
+    policy = RetryPolicy(
+        max_attempts=2,
+        delay=Fraction(1, 2),
+        backoff=Fraction(3, 2),
+        max_delay=Fraction(5, 2),
+    )
+    task = CallableTask(lambda request_id, content: content, retry_policy=policy)
+    retry = json.loads(json.dumps(task.describe(), allow_nan=False))["retry"]
+    assert retry["delay"] == 0.5
+    assert retry["backoff"] == 1.5
+    assert retry["max_delay"] == 2.5
+    assert isinstance(policy.delay, Fraction)
 
 
 def test_polling_releases_a_rejected_sample_before_the_next_poll():

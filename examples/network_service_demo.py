@@ -2,9 +2,7 @@
 
 import concurrent.futures
 import json
-import math
 import time
-from numbers import Real
 from typing import Dict
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -20,6 +18,7 @@ from orchestrion import (
     SimulatedRobotTask,
     TaskPilot,
 )
+from orchestrion.utils.numeric import is_positive_finite_real
 
 
 class NetworkDeviceClient:
@@ -28,12 +27,7 @@ class NetworkDeviceClient:
     def __init__(self, base_url: str, request_timeout: float = 0.5) -> None:
         if not isinstance(base_url, str) or not base_url.strip():
             raise ValueError("base_url must be a non-empty string")
-        if (
-            isinstance(request_timeout, bool)
-            or not isinstance(request_timeout, Real)
-            or not math.isfinite(request_timeout)
-            or request_timeout <= 0
-        ):
+        if not is_positive_finite_real(request_timeout):
             raise ValueError("request_timeout must be positive and finite")
         self.base_url = base_url.rstrip("/")
         self.request_timeout = float(request_timeout)
