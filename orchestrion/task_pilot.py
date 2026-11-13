@@ -92,6 +92,7 @@ class TaskPilot:
         self._request_waiters: Dict[int, int] = {}
         self._timeline: deque[TimelineEvent] = deque(maxlen=timeline_capacity)
         self._running_requests: Dict[int, TaskPilot.BackgroundRequest] = {}
+        self._running_service_counts: Counter[str] = Counter()
         self._cancelling_requests: Dict[
             int, Optional[Tuple[RequestStatus, Any, Optional[str]]]
         ] = {}
@@ -1001,7 +1002,9 @@ class TaskPilot:
                 )
             )
             if status.terminal:
-                self._running_requests.pop(request_id, None)
+                running_request = self._running_requests.pop(request_id, None)
+                if running_request is not None:
+                    self._running_service_counts[running_request.service_name] -= 1
             self._record_event_locked(request_id, status, error)
             self._mark_health_changed_locked()
             return True
@@ -1017,6 +1020,7 @@ class TaskPilot:
             ):
                 return
             self._running_requests[request.request_id] = request
+            self._running_service_counts[request.service_name] += 1
             now = time.time()
             self._store_request_locked(
                 replace(current, status=RequestStatus.RUNNING, started_at=now)
@@ -1043,6 +1047,13 @@ class TaskPilot:
 
     def _refresh_running(self, service_names: Optional[Set[str]] = None) -> None:
         with self._state_condition:
+            if service_names is not None:
+                # Telemetry updates can arrive with no requests for that service.
+                service_names = {
+                    name for name in service_names if self._running_service_counts[name]
+                }
+                if not service_names:
+                    return
             running = [
                 request for request in self._running_requests.values()
                 if service_names is None or request.service_name in service_names
