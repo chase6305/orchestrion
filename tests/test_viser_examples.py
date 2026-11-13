@@ -3,6 +3,7 @@ import importlib
 import threading
 import time
 from collections import deque
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -1235,3 +1236,129 @@ def test_gripper_timeout_reports_wait_context_even_when_cancel_fails(
     assert "request_id=7, move_id=4" in result.error
     assert "elapsed=2.5s, timeout=0.25s" in result.error
     cancel.assert_called_once_with("gripper", 4)
+
+
+def test_viser_startup_advertises_the_actual_bound_port(monkeypatch, capsys):
+    runtime = SimpleNamespace(
+        server=SimpleNamespace(get_port=lambda: 8081),
+        set_status=Mock(),
+        hold=Mock(),
+    )
+    factory = Mock(return_value=nullcontext(runtime))
+    module = importlib.import_module("examples.viser.common")
+    monkeypatch.setattr(module, "ViserDemoRuntime", factory)
+    module.run_demo(
+        "demo", Mock(),
+        argv=["--port", "8080", "--duration", "0", "--startup-delay", "0"],
+    )
+    output = capsys.readouterr().out
+    assert "Open http://localhost:8081" in output
+    assert "ssh -L 8081:localhost:8081" in output
+    assert factory.call_args.kwargs["port"] == 8080
+
+
+def test_replay_cursor_uses_bounded_indexed_reads_for_long_recordings():
+    class IndexedFrames:
+        reads = 0
+
+        def __len__(self):
+            return 1000000
+
+        def __getitem__(self, index):
+            assert 0 <= index < len(self)
+            self.reads += 1
+            return SimpleNamespace(elapsed=index * 0.01)
+
+        def __iter__(self):
+            raise AssertionError("replay lookup must not scan every frame")
+
+    frames = IndexedFrames()
+    assert replay_frame_index(frames, 1234.565) == 123456
+    assert frames.reads <= 21
+
+
+@pytest.mark.parametrize("owners", [[], ["left_arm"], ["left_arm", "right_arm"]])
+def test_replay_capture_uses_one_event_snapshot_for_stage_and_payload(owners):
+    events = [
+        {"event": "payload_owner_changed", "owner": owner} for owner in owners
+    ]
+    events.append({"event": "snapshot-stage"})
+
+    class Runtime(DualArmViserRuntime):
+        event_reads = 0
+
+        @property
+        def events(self):
+            self.event_reads += 1
+            if self.event_reads == 1:
+                return events
+            return [{"event": "payload_owner_changed", "owner": "output_table"}]
+
+    runtime = object.__new__(Runtime)
+    runtime._capture_started_at = None
+    runtime._replay_lock = threading.Lock()
+    runtime._replay_frames = []
+    frame = runtime._capture_frame(
+        {"left": [0.0] * 3, "right": [0.0] * 3},
+        {"left": 0.0, "right": 0.0},
+        None,
+    )
+    assert frame.payload_owner == (owners[-1] if owners else "table")
+    assert frame.event == "snapshot-stage"
+    assert runtime.event_reads == 1
+    assert runtime.replay_frames == [frame]
+
+
+def test_concurrent_replay_capture_keeps_timestamps_in_append_order(monkeypatch):
+    reading, release = threading.Event(), threading.Event()
+    event_lock = threading.Lock()
+
+    class Runtime(DualArmViserRuntime):
+        event_reads = 0
+
+        @property
+        def events(self):
+            with event_lock:
+                self.event_reads += 1
+                first_read = self.event_reads == 1
+            if first_read:
+                reading.set()
+                assert release.wait(2)
+            return []
+
+    clock = iter([10.0, 20.0])
+    module = importlib.import_module("examples.dual_arm.viser")
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    runtime = object.__new__(Runtime)
+    runtime._capture_started_at = None
+    runtime._replay_lock = threading.Lock()
+    runtime._replay_frames = []
+    arguments = (
+        {"left": [0.0] * 3, "right": [0.0] * 3},
+        {"left": 0.0, "right": 0.0},
+        None,
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(runtime._capture_frame, *arguments)
+        try:
+            assert reading.wait(1)
+            executor.submit(runtime._capture_frame, *arguments).result(timeout=1)
+        finally:
+            release.set()
+        first.result(timeout=1)
+    frames = runtime.replay_frames
+    assert frames[0].elapsed == 0.0
+    assert frames[1].elapsed >= frames[0].elapsed
+
+
+def test_viser_interpolation_keeps_finite_endpoints_and_independent_points():
+    start = np.array([1e308, -1e308])
+    end = -start
+    trajectory = interpolate(start, end, 5)
+    assert trajectory[0] == start.tolist()
+    assert trajectory[-1] == end.tolist()
+    assert trajectory[2] == [0.0, 0.0]
+    assert np.isfinite(trajectory).all()
+    trajectory[0][0] = 0.0
+    assert start[0] == 1e308
+    assert trajectory[1][0] != 0.0
