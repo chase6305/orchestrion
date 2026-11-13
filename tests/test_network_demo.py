@@ -4,6 +4,7 @@ import subprocess
 import sys
 import threading
 import time
+from fractions import Fraction
 
 import pytest
 
@@ -50,9 +51,10 @@ def test_network_workflow_waits_for_remote_operation():
     assert summary["health"]["running_operations"] == 0
 
 
-def test_network_client_health_endpoint():
+@pytest.mark.parametrize("request_timeout", [0.5, Fraction(1, 2)])
+def test_network_client_health_endpoint(request_timeout):
     with NetworkDeviceServer() as server:
-        status = NetworkDeviceClient(server.base_url).status()
+        status = NetworkDeviceClient(server.base_url, request_timeout).status()
     assert status["health"] == "online"
     assert status["available"]
 
@@ -64,7 +66,13 @@ def test_network_client_rejects_invalid_base_url(base_url):
 
 
 @pytest.mark.parametrize(
-    "request_timeout", [0, -1, float("nan"), float("inf"), "0.5", True]
+    "request_timeout",
+    [
+        0, -1, float("nan"), float("inf"), "0.5", True,
+        pytest.param(10**400, id="overflowing-integer"),
+        pytest.param(Fraction(10**400, 3), id="overflowing-fraction"),
+        pytest.param(Fraction(1, 10**400), id="underflowing-fraction"),
+    ],
 )
 def test_network_client_rejects_invalid_request_timeout(request_timeout):
     with pytest.raises(ValueError, match="request_timeout"):

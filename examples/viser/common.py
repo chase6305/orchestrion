@@ -38,7 +38,9 @@ PAYLOAD_GRASP_POSITION = 0.37
 def interpolate(start: np.ndarray, end: np.ndarray, steps: int) -> List[List[float]]:
     if steps < 2:
         raise ValueError("steps must be at least 2")
-    return [((1.0 - t) * start + t * end).tolist() for t in np.linspace(0, 1, steps)]
+    # One weight per point broadcasts across all joints.
+    progress = np.linspace(0, 1, steps)[:, None]
+    return ((1.0 - progress) * start + progress * end).tolist()
 
 
 def add_common_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -181,14 +183,23 @@ class ViserDemoRuntime:
         self.set_status("client connected; preparing workflow")
 
     def __enter__(self) -> "ViserDemoRuntime":
-        self.pilot.initialize()
-        self._monitor_stop.clear()
-        self._monitor_thread = threading.Thread(
-            target=self._monitor_gripper,
-            name="viser-gripper-monitor",
-            daemon=True,
-        )
-        self._monitor_thread.start()
+        try:
+            self.pilot.initialize()
+            self._monitor_stop.clear()
+            self._monitor_thread = threading.Thread(
+                target=self._monitor_gripper,
+                name="viser-gripper-monitor",
+                daemon=True,
+            )
+            self._monitor_thread.start()
+        except Exception as error:
+            # An unstarted monitor cannot be joined by __exit__ during rollback.
+            self._monitor_thread = None
+            try:
+                self.__exit__(type(error), error, error.__traceback__)
+            finally:
+                self.executor.shutdown(wait=False, cancel_futures=True)
+            raise
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
@@ -366,14 +377,15 @@ def run_demo(
         port=args.port,
         scheduler_interval=args.interval,
     ) as runtime:
+        server_port = runtime.server.get_port()
         print(
-            "Open http://localhost:{} in your browser.".format(args.port),
+            "Open http://localhost:{} in your browser.".format(server_port),
             flush=True,
         )
         if args.host == "0.0.0.0":
             print(
                 "Remote session? Use: ssh -L {0}:localhost:{0} user@host".format(
-                    args.port
+                    server_port
                 ),
                 flush=True,
             )

@@ -3,6 +3,7 @@
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from fractions import Fraction
 
 import pytest
 
@@ -227,6 +228,24 @@ def test_number_fields_accept_finite_integers_larger_than_float_range():
     field.validate("counter", value)
     with pytest.raises(CommandValidationError):
         field.validate("counter", value + 1)
+
+
+@pytest.mark.parametrize("bound", ["minimum", "maximum"])
+def test_numeric_bounds_report_unrepresentable_fractions_as_validation_errors(bound):
+    with pytest.raises(ValueError, match=bound):
+        FieldSpec("number", **{bound: Fraction(10**400, 3)})
+
+
+def test_number_payloads_report_overflow_as_command_validation_errors():
+    schema = RequestSchema({"value": FieldSpec("number")})
+    with pytest.raises(CommandValidationError, match="must be number"):
+        schema.validate({"value": Fraction(10**400, 3)})
+
+
+def test_number_payloads_preserve_representable_fractions():
+    schema = RequestSchema({"value": FieldSpec("number", minimum=0, maximum=1)})
+    value = Fraction(1, 3)
+    assert schema.validate({"value": value}) == {"value": value}
 
 
 def test_schema_snapshots_field_constraints_at_construction():
