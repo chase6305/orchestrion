@@ -8,6 +8,7 @@ import concurrent.futures
 import logging
 import math
 import threading
+import time
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -18,6 +19,7 @@ from orchestrion.tasks.function_call_task import (
     TaskFailure,
     ThreadedPoolFunctionCallTask,
     _submission_request_id,
+    _validate_request_id,
 )
 from orchestrion.tasks.modular_reduced_robot_task import (
     ModularReducedRobotTask,
@@ -72,6 +74,7 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
     """Animate a Robotiq gripper and report completion at the target position."""
 
     MIN_ANIMATION_INTERVAL = 1.0 / 60.0
+    MAX_ANIMATION_POINTS = 4096
 
     task_kind = "actuator"
 
@@ -182,17 +185,27 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
             return TaskFailure("Gripper speed must be positive")
 
         current = self._robot_task.query_submodule_state("gripper").positions[0]
-        timeout = float(content.get("timeout", abs(target - current) / speed + 2.0))
+        motion_duration = abs(target - current) / speed
+        if not math.isfinite(motion_duration):
+            return TaskFailure("Gripper motion duration must be finite")
+        # Rendering hundreds of configurations per second only adds WebSocket and
+        # browser overhead. Bound both update rate and precomputed points; slower
+        # sampling preserves travel time for long motions.
+        interval = max(
+            self._robot_task.scheduler_interval,
+            self.MIN_ANIMATION_INTERVAL,
+            motion_duration / (self.MAX_ANIMATION_POINTS - 1),
+        )
+        steps = min(
+            self.MAX_ANIMATION_POINTS,
+            max(2, math.ceil(motion_duration / interval) + 1),
+        )
+        # Each sample, including the final hold, can wait another scheduler tick.
+        estimated_duration = steps * (interval + self._robot_task.scheduler_interval)
+        timeout = float(content.get("timeout", estimated_duration + 2.0))
         if not math.isfinite(timeout) or timeout <= 0:
             return TaskFailure("Gripper timeout must be positive")
-        # Rendering hundreds of configurations per second only adds WebSocket and
-        # browser overhead. Keep the command speed stable when a demo uses a very
-        # small robot scheduler interval for headless smoke tests.
-        interval = max(
-            self._robot_task.scheduler_interval, self.MIN_ANIMATION_INTERVAL
-        )
-        steps = max(2, math.ceil(abs(target - current) / (speed * interval)) + 1)
-        trajectory = [[float(value)] for value in np.linspace(current, target, steps)]
+        trajectory = np.linspace(current, target, steps).reshape(-1, 1).tolist()
         with self._lock:
             if request_id in self._cancelled_requests:
                 return TaskFailure("Gripper request cancelled", cancelled=True)
@@ -208,14 +221,42 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
         if cancel_requested:
             self._robot_task.cancel_submodule_move("gripper", move_id)
             return TaskFailure("Gripper request cancelled", cancelled=True)
-        if not self._robot_task.wait_submodule_move("gripper", move_id, timeout):
-            with self._lock:
-                cancel_requested = request_id in self._cancelled_requests
-            self._robot_task.cancel_submodule_move("gripper", move_id)
-            return TaskFailure(
-                "Gripper movement was cancelled or timed out",
-                cancelled=cancel_requested,
-            )
+        wait_started = time.monotonic()
+        try:
+            if not self._robot_task.wait_submodule_move("gripper", move_id, timeout):
+                with self._lock:
+                    cancel_requested = request_id in self._cancelled_requests
+                try:
+                    self._robot_task.cancel_submodule_move("gripper", move_id)
+                except Exception:
+                    # A cleanup failure must not hide the wait outcome.
+                    logger.exception(
+                        "Failed to cancel gripper move %s for request %s",
+                        move_id,
+                        request_id,
+                    )
+                return TaskFailure(
+                    "Gripper movement was cancelled or timed out "
+                    "(request_id={}, move_id={}, elapsed={:.6g}s, "
+                    "timeout={:.6g}s)".format(
+                        request_id,
+                        move_id,
+                        time.monotonic() - wait_started,
+                        timeout,
+                    ),
+                    cancelled=cancel_requested,
+                )
+        except BaseException:
+            try:
+                self._robot_task.cancel_submodule_move("gripper", move_id)
+            except Exception:
+                # A cleanup failure must not hide the original wait error.
+                logger.exception(
+                    "Failed to cancel gripper move %s for request %s",
+                    move_id,
+                    request_id,
+                )
+            raise
         return {
             "request_id": request_id,
             "action": action or "position",
@@ -259,6 +300,7 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
         return status
 
     def cancel_request(self, request_id: int) -> bool:
+        _validate_request_id(request_id)
         with self._lock:
             future = self._future_map.get(request_id)
             if future is None or future.done():
