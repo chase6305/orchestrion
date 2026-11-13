@@ -8,7 +8,8 @@ from dataclasses import dataclass, field
 from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 from orchestrion.tasks.reduced_robot_task_interface import ReducedRobotTaskInterface
-from orchestrion.utils.logger import logger
+from orchestrion.utils.errors import exception_message
+from orchestrion.utils.logger import log_error, logger
 
 
 class SubModuleTask:
@@ -151,8 +152,10 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         if callback is not None:
             try:
                 callback()
-            except Exception:
-                logger.exception("Robot state-change callback failed")
+            except Exception as exc:
+                log_error(
+                    "Robot state-change callback failed: %s", exception_message(exc)
+                )
 
     def initialize(self):
         """Start the motion-processing worker."""
@@ -246,19 +249,19 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
             return -1
         with self._lock:
             submission_epoch = self._motion_epoch
-        motion_target = copy.deepcopy(motion_target)
+        motion_target = self._copy_motion_input(motion_target)
+        if not motion_target or not self._is_finite_trajectory(motion_target):
+            return -1
         segment_endpoints = (
             [len(motion_target)]
             if endpoint_index is None
-            else copy.deepcopy(endpoint_index)
+            else self._copy_motion_input(endpoint_index)
         )
         if not self._check_assigned_endpoint_index(
             motion_target, segment_endpoints
         ):
             return -1
 
-        if not motion_target or not self._is_finite_trajectory(motion_target):
-            return -1
         if any(len(point) != self._main_task.n_dof for point in motion_target):
             return -1
         with self._lock:
@@ -308,7 +311,7 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
             return -1
         with self._lock:
             submission_epoch = self._motion_epoch
-        motion_target = copy.deepcopy(motion_target)
+        motion_target = self._copy_motion_input(motion_target)
         if not motion_target or not self._is_finite_trajectory(motion_target):
             return -1
         if any(len(point) != module.n_dof for point in motion_target):
@@ -348,7 +351,9 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
         # Snapshot the whole batch before assigning any move IDs. This preserves
         # all-or-nothing submission even if a caller mutates its input concurrently
         # or a custom container fails during copying.
-        targets = copy.deepcopy(motion_targets)
+        targets = self._copy_motion_input(motion_targets)
+        if not isinstance(targets, dict) or not targets:
+            return {}
         for submodule_name, motion_target in targets.items():
             module = self._sub_task_map.get(submodule_name)
             if (
@@ -687,13 +692,11 @@ class ModularReducedRobotTask(ReducedRobotTaskInterface):
     def _bg_thread_loop(self) -> None:
         try:
             self._process_motion()
-        except Exception:
-            try:
-                logger.exception("Robot motion worker failed")
-            finally:
-                # Stop software scheduling and release waiters. The device
-                # adapter remains responsible for confirming physical shutdown.
-                self._stop_locked(0.0)
+        except Exception as exc:
+            log_error("Robot motion worker failed: %s", exception_message(exc))
+            # Stop software scheduling and release waiters. The device
+            # adapter remains responsible for confirming physical shutdown.
+            self._stop_locked(0.0)
 
     def _process_motion(self) -> None:
         """Advance due points and publish the combined main/submodule snapshot."""

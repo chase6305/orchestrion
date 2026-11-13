@@ -10,7 +10,7 @@ import time
 from collections import Counter, deque
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Any, Container, Dict, List, Optional, Set, Tuple
+from typing import Any, Container, Dict, List, Optional, Set, Tuple, Union
 
 from orchestrion.health import DeviceHealth
 from orchestrion.move_sync_option import MoveSyncOption
@@ -18,7 +18,7 @@ from orchestrion.request import RequestResult, RequestStatus, TimelineEvent
 from orchestrion.tasks.generic_task import GenericTask
 from orchestrion.tasks.reduced_robot_task_interface import ReducedRobotTaskInterface
 from orchestrion.utils.errors import exception_message
-from orchestrion.utils.logger import logger
+from orchestrion.utils.logger import log_error, logger
 from orchestrion.utils.numeric import is_finite_real
 from orchestrion.utils.types import PeekResponseResult, PeekResponseResultType
 
@@ -94,6 +94,8 @@ class TaskPilot:
         self._dirty_services: Set[str] = set()
         self._wake_event = threading.Event()
         self._stop_event = threading.Event()
+        self._scheduler_ready = threading.Event()
+        self._last_motion_query_error: Optional[str] = None
         self._bg_thread: Optional[threading.Thread] = None
         self._initialized = False
         self._lifecycle_epoch = 0
@@ -153,30 +155,43 @@ class TaskPilot:
         for task in reversed(initialized_tasks):
             try:
                 task.stop()
-            except Exception:
-                logger.exception("Failed to roll back peripheral task")
+            except Exception as exc:
+                log_error(
+                    "Failed to roll back peripheral task: %s", exception_message(exc)
+                )
         for _, task in self._lifecycle_tasks:
-            set_completion_callback = getattr(task, "set_completion_callback", None)
-            if callable(set_completion_callback):
-                try:
-                    set_completion_callback(None)
-                except Exception:
-                    logger.exception("Failed to clear task completion callback")
-        set_state_callback = getattr(
-            self._robot_task, "set_state_change_callback", None
-        )
-        if callable(set_state_callback):
             try:
+                set_completion_callback = getattr(task, "set_completion_callback", None)
+                if callable(set_completion_callback):
+                    set_completion_callback(None)
+            except Exception as exc:
+                log_error(
+                    "Failed to clear task completion callback: %s",
+                    exception_message(exc),
+                )
+        try:
+            set_state_callback = getattr(
+                self._robot_task, "set_state_change_callback", None
+            )
+            if callable(set_state_callback):
                 set_state_callback(None)
-            except Exception:
-                logger.exception("Failed to clear robot state callback")
+        except Exception as exc:
+            log_error(
+                "Failed to clear robot state callback: %s", exception_message(exc)
+            )
         try:
             self._robot_task.stop()
-        except Exception:
-            logger.exception("Failed to roll back robot task")
+        except Exception as exc:
+            log_error("Failed to roll back robot task: %s", exception_message(exc))
 
     def initialize(self) -> None:
         """Initialize the pilot once, serializing concurrent lifecycle calls."""
+        if threading.current_thread() is self._bg_thread:
+            # A concurrent stop can hold the lifecycle lock while joining this
+            # thread. An inline callback must not wait for that cleanup owner.
+            if not self._initialized:
+                log_error("TaskPilot cannot initialize from its stopping scheduler")
+            return
         with self._lifecycle_lock:
             self._initialize_locked()
 
@@ -192,13 +207,17 @@ class TaskPilot:
             )
         self._stop_event.clear()
         self._wake_event.clear()
+        self._last_motion_query_error = None
         try:
             self._robot_task.initialize()
         except Exception:
             try:
                 self._robot_task.stop()
-            except Exception:
-                logger.exception("Failed to roll back robot task initialization")
+            except Exception as exc:
+                log_error(
+                    "Failed to roll back robot task initialization: %s",
+                    exception_message(exc),
+                )
             raise
         initialized_tasks = []
         try:
@@ -214,6 +233,7 @@ class TaskPilot:
             self._rollback_initialization(initialized_tasks)
             raise
 
+        self._scheduler_ready.clear()
         try:
             set_callback = getattr(
                 self._robot_task, "set_state_change_callback", None
@@ -228,9 +248,20 @@ class TaskPilot:
                 self._initialized = True
                 self._mark_health_changed_locked()
         except Exception:
+            with self._state_condition:
+                self._initialized = False
+                self._lifecycle_epoch += 1
+                self._stop_event.set()
+            self._cancel_nonterminal("TaskPilot initialization failed")
             self._rollback_initialization(initialized_tasks)
-            self._bg_thread = None
+            # An instrumented start() can launch the worker before reporting a
+            # failure. Retain that owner until it exits so a retry cannot publish
+            # running state that resurrects the old scheduler behind its gate.
+            if self._bg_thread is None or not self._bg_thread.is_alive():
+                self._bg_thread = None
             raise
+        finally:
+            self._scheduler_ready.set()
 
     def stop(self, timeout: float = 5.0) -> None:
         """Stop the pilot, serializing against initialization and other stops."""
@@ -240,7 +271,9 @@ class TaskPilot:
         with self._lifecycle_lock:
             self._stop_locked(timeout)
 
-    def _stop_locked(self, timeout: float) -> None:
+    def _stop_locked(
+        self, timeout: float, *, reason: str = "TaskPilot stopped"
+    ) -> None:
         if not is_finite_real(timeout) or timeout < 0:
             raise ValueError("timeout must be non-negative and finite")
         if timeout > threading.TIMEOUT_MAX:
@@ -278,7 +311,7 @@ class TaskPilot:
             self._bg_thread.join(timeout=timeout)
             thread_timed_out = self._bg_thread.is_alive()
 
-        self._cancel_nonterminal("TaskPilot stopped")
+        self._cancel_nonterminal(reason)
         while True:
             try:
                 self._task_queue.get_nowait()
@@ -290,18 +323,23 @@ class TaskPilot:
                 try:
                     task.stop()
                 except Exception as exc:
-                    logger.exception("Failed to stop peripheral task")
+                    log_error(
+                        "Failed to stop peripheral task: %s", exception_message(exc)
+                    )
                     if task_stop_error is None:
                         task_stop_error = exc
                 finally:
-                    set_completion_callback = getattr(
-                        task, "set_completion_callback", None
-                    )
-                    if callable(set_completion_callback):
-                        try:
+                    try:
+                        set_completion_callback = getattr(
+                            task, "set_completion_callback", None
+                        )
+                        if callable(set_completion_callback):
                             set_completion_callback(None)
-                        except Exception:
-                            logger.exception("Failed to clear task completion callback")
+                    except Exception as exc:
+                        log_error(
+                            "Failed to clear task completion callback: %s",
+                            exception_message(exc),
+                        )
         finally:
             try:
                 if self._executor is not None:
@@ -311,14 +349,17 @@ class TaskPilot:
                     self._executor.shutdown(wait=False, cancel_futures=True)
                     self._executor_shutdown = True
             finally:
-                set_callback = getattr(
-                    self._robot_task, "set_state_change_callback", None
-                )
-                if callable(set_callback):
-                    try:
+                try:
+                    set_callback = getattr(
+                        self._robot_task, "set_state_change_callback", None
+                    )
+                    if callable(set_callback):
                         set_callback(None)
-                    except Exception:
-                        logger.exception("Failed to clear robot state callback")
+                except Exception as exc:
+                    log_error(
+                        "Failed to clear robot state callback: %s",
+                        exception_message(exc),
+                    )
                 try:
                     self._robot_task.stop()
                 finally:
@@ -337,20 +378,49 @@ class TaskPilot:
         priority: int = 0,
         idempotency_key: Optional[str] = None,
     ) -> int:
-        if srv_name not in self._task_map:
-            raise KeyError("Unknown service: {}".format(srv_name))
-        if not self._initialized:
-            raise RuntimeError(
-                "TaskPilot must be initialized before accepting requests"
+        """Queue a service request; log and return -1 when submission is rejected.
+
+        Failed preparation does not consume a request ID or idempotency key.
+        Accepted requests expose execution failures through wait_request().
+        """
+        try:
+            result = self._submit_service_request(
+                srv_name, content, sync_option, priority, idempotency_key
             )
+        except Exception as exc:
+            result = exception_message(exc)
+        if isinstance(result, str):
+            log_error("Service request was not submitted: %s", result)
+            return -1
+        return result
+
+    def _submit_service_request(
+        self,
+        srv_name: str,
+        content: Optional[Dict],
+        sync_option: Optional[MoveSyncOption],
+        priority: int,
+        idempotency_key: Optional[str],
+    ) -> Union[int, str]:
+        """Prepare and atomically admit a request behind the nonthrowing boundary."""
+        if not isinstance(srv_name, str):
+            return "srv_name must be a string"
+        srv_name = str.__str__(srv_name)
+        if srv_name not in self._task_map:
+            return "Unknown service: {}".format(srv_name)
+        if not self._initialized:
+            return "TaskPilot must be initialized before accepting requests"
         with self._state_condition:
             submission_epoch = self._lifecycle_epoch
         if isinstance(priority, bool) or not isinstance(priority, int):
-            raise TypeError("priority must be an integer")
+            return "priority must be an integer"
+        priority = int.__int__(priority)
         if idempotency_key is not None and not isinstance(idempotency_key, str):
-            raise TypeError("idempotency_key must be a string or None")
+            return "idempotency_key must be a string or None"
+        if idempotency_key is not None:
+            idempotency_key = str.__str__(idempotency_key)
         if idempotency_key == "":
-            raise ValueError("idempotency_key must not be empty")
+            return "idempotency_key must not be empty"
         deduplication_key = (
             None if idempotency_key is None else (srv_name, idempotency_key)
         )
@@ -362,7 +432,15 @@ class TaskPilot:
         if sync_option is None:
             sync_option = MoveSyncOption.sync_w_latest_move()
         elif not isinstance(sync_option, MoveSyncOption):
-            raise TypeError("sync_option must be a MoveSyncOption or None")
+            return "sync_option must be a MoveSyncOption or None"
+        else:
+            # Options are intentionally mutable. Validate a plain-value snapshot
+            # before SDK callbacks can mutate them or invalid fields reach the
+            # background scheduler's hash keys and movement comparisons.
+            snapshot = MoveSyncOption._snapshot(sync_option)
+            if isinstance(snapshot, str):
+                return snapshot
+            sync_option = snapshot
 
         associated_move_id = -1
         associated_submodule = sync_option.submodule_name
@@ -372,9 +450,7 @@ class TaskPilot:
                     self._robot_task, "query_submodule_state", None
                 )
                 if not callable(query_submodule_state):
-                    raise TypeError(
-                        "Robot task does not support submodule synchronization"
-                    )
+                    return "Robot task does not support submodule synchronization"
                 submodule_state = query_submodule_state(associated_submodule)
                 associated_move_id = (
                     sync_option.associated_move_id
@@ -386,21 +462,20 @@ class TaskPilot:
             else:
                 robot_state = self._robot_task.query_state()
                 if robot_state is None:
-                    raise RuntimeError("Robot state is unavailable")
+                    return "Robot state is unavailable"
                 associated_move_id = robot_state.latest_sent_id
             if isinstance(associated_move_id, bool) or not isinstance(
                 associated_move_id, int
             ):
-                raise TypeError("associated_move_id must be an integer")
+                return "associated_move_id must be an integer"
+            associated_move_id = int.__int__(associated_move_id)
             if associated_move_id < -1:
-                raise ValueError("associated_move_id must be -1 or non-negative")
+                return "associated_move_id must be -1 or non-negative"
 
         request_content = copy.deepcopy(content)
         with self._state_condition:
             if not self._initialized or submission_epoch != self._lifecycle_epoch:
-                raise RuntimeError(
-                    "TaskPilot stopped while the request was being prepared"
-                )
+                return "TaskPilot stopped while the request was being prepared"
             if deduplication_key is not None:
                 existing_id = self._idempotency_requests.get(deduplication_key)
                 if existing_id is not None:
@@ -777,9 +852,10 @@ class TaskPilot:
             except KeyError:
                 continue
             except Exception as exc:
-                logger.error(
+                log_error(
                     "Failed to cancel request %s: %s",
-                    request_id, exception_message(exc),
+                    request_id,
+                    exception_message(exc),
                 )
         return cancelled
 
@@ -930,18 +1006,17 @@ class TaskPilot:
                 request.request_id, request.content
             )
             if not accepted:
-                self._transition(
-                    request.request_id, RequestStatus.FAILED,
-                    error="Task rejected request",
-                )
+                self._fail_request(request, "Task rejected request")
         except Exception as exc:
-            logger.exception(
-                "Task %s failed to accept request %s",
+            self._fail_request(request, exception_message(exc))
+
+    def _fail_request(self, request: BackgroundRequest, error: str) -> None:
+        if self._transition(request.request_id, RequestStatus.FAILED, error=error):
+            log_error(
+                "Task %s request %s failed: %s",
                 request.service_name,
                 request.request_id,
-            )
-            self._transition(
-                request.request_id, RequestStatus.FAILED, error=exception_message(exc)
+                error,
             )
 
     def _refresh_running(self, service_names: Optional[Set[str]] = None) -> None:
@@ -970,54 +1045,76 @@ class TaskPilot:
             if not isinstance(response, PeekResponseResult) or not isinstance(
                 response.result_type, PeekResponseResultType
             ):
-                raise TypeError("Task returned an invalid response envelope")
+                self._fail_request(
+                    request, "Task returned an invalid response envelope"
+                )
+                return
             if isinstance(response.request_id, bool) or not isinstance(
                 response.request_id, int
             ):
-                raise TypeError("Task response request_id must be an integer")
+                self._fail_request(
+                    request, "Task response request_id must be an integer"
+                )
+                return
             if response.request_id not in (-1, request.request_id):
-                raise ValueError("Task returned a response for a different request")
+                self._fail_request(
+                    request, "Task returned a response for a different request"
+                )
+                return
+            if response.error is not None and not isinstance(response.error, str):
+                self._fail_request(
+                    request, "Task response error must be a string or None"
+                )
+                return
+            if not isinstance(response.cancelled, bool) or (
+                response.cancelled
+                and response.result_type is not PeekResponseResultType.ErrorUnknown
+            ):
+                self._fail_request(
+                    request, "Task response has an invalid cancellation flag"
+                )
+                return
             if response.result_type is PeekResponseResultType.ResponseFound:
                 try:
                     content = copy.deepcopy(response.content)
                 except Exception as exc:
-                    raise ValueError(
+                    self._fail_request(
+                        request,
                         "Task response could not be copied: {}".format(
                             exception_message(exc)
-                        )
-                    ) from exc
+                        ),
+                    )
+                    return
                 self._transition(
                     request.request_id,
                     RequestStatus.SUCCEEDED,
                     content=content,
                 )
             elif response.result_type is PeekResponseResultType.ErrorUnknown:
-                self._transition(
-                    request.request_id,
-                    RequestStatus.FAILED,
-                    error=response.error or "Task execution failed",
-                )
+                if response.cancelled:
+                    self._transition(
+                        request.request_id,
+                        RequestStatus.CANCELLED,
+                        error=response.error or "Task execution cancelled",
+                    )
+                else:
+                    self._fail_request(
+                        request, response.error or "Task execution failed"
+                    )
             elif (
                 response.result_type
                 is PeekResponseResultType.ResponseReceivedButFlushed
             ):
-                self._transition(
-                    request.request_id,
-                    RequestStatus.FAILED,
-                    error="Task result was flushed before collection",
-                )
+                self._fail_request(request, "Task result was flushed before collection")
             elif response.result_type is PeekResponseResultType.ErrorRequestNotSent:
-                self._transition(
-                    request.request_id, RequestStatus.FAILED,
-                    error="Task has no record of the accepted request",
+                self._fail_request(
+                    request, "Task has no record of the accepted request"
                 )
         except NotImplementedError:
             # Legacy adapters may only implement fire-and-forget invocation.
             return
         except Exception as exc:
-            self._transition(
-                request.request_id, RequestStatus.FAILED, error=exception_message(exc)
-            )
+            self._fail_request(request, exception_message(exc))
 
     def _cancel_nonterminal(self, reason: str) -> None:
         with self._state_condition:
@@ -1031,14 +1128,18 @@ class TaskPilot:
                 request = self._running_requests.get(request_id)
                 cancellation_in_progress = request_id in self._cancelling_requests
             if request is not None and not cancellation_in_progress:
-                cancel = getattr(
-                    self._task_map[request.service_name], "cancel_request", None
-                )
-                if callable(cancel):
-                    try:
+                try:
+                    cancel = getattr(
+                        self._task_map[request.service_name], "cancel_request", None
+                    )
+                    if callable(cancel):
                         cancel(request_id)
-                    except Exception:
-                        logger.exception("Failed to cancel request %s", request_id)
+                except Exception as exc:
+                    log_error(
+                        "Failed to cancel request %s: %s",
+                        request_id,
+                        exception_message(exc),
+                    )
             self._transition(request_id, RequestStatus.CANCELLED, error=reason)
 
     def _admit_queued_requests(
@@ -1082,13 +1183,20 @@ class TaskPilot:
         if None in dependency_counts:
             try:
                 main_state = self._robot_task.query_state()
-            except Exception:
+            except Exception as exc:
                 # A transient main-state failure leaves its requests waiting.
-                logger.exception("Failed to query robot state")
+                error = exception_message(exc)
+                if error != self._last_motion_query_error:
+                    log_error("Failed to query robot state: %s", error)
+                    self._last_motion_query_error = error
+            else:
+                self._last_motion_query_error = None
 
         # Index shared sequences only within this pass. Sets and short batches
         # keep their existing membership lookup without an extra allocation.
-        progress_by_submodule: Dict[Optional[str], Tuple[int, Container[int]]] = {}
+        progress_by_submodule: Dict[
+            Optional[str], Union[Tuple[int, Container[int]], str]
+        ] = {}
         still_waiting = []
         for queue_entry in waiting_for_motion:
             request = queue_entry[2]
@@ -1097,42 +1205,28 @@ class TaskPilot:
             if result is None or result.status.terminal:
                 continue
             submodule_name = request.associated_submodule
+            if submodule_name is None and main_state is None:
+                still_waiting.append(queue_entry)
+                continue
+            if submodule_name not in progress_by_submodule:
+                progress = self._read_motion_progress(
+                    submodule_name, main_state, dependency_counts[submodule_name]
+                )
+                progress_by_submodule[submodule_name] = progress
+                if isinstance(progress, str):
+                    log_error(
+                        "Failed to read motion progress for %s: %s",
+                        "main robot" if submodule_name is None else submodule_name,
+                        progress,
+                    )
+            progress = progress_by_submodule[submodule_name]
+            if isinstance(progress, str):
+                self._transition(
+                    request.request_id, RequestStatus.FAILED, error=progress
+                )
+                continue
             try:
-                if submodule_name not in progress_by_submodule:
-                    if submodule_name is None:
-                        if main_state is None:
-                            still_waiting.append(queue_entry)
-                            continue
-                        cancelled_move_ids = getattr(
-                            main_state, "cancelled_move_ids", ()
-                        )
-                        latest_finished_id = main_state.latest_finished_id
-                    else:
-                        submodule_state = self._robot_task.query_submodule_state(
-                            submodule_name
-                        )
-                        cancelled_move_ids = submodule_state.cancelled_move_ids
-                        latest_finished_id = submodule_state.latest_finished_id
-                    if isinstance(latest_finished_id, bool) or not isinstance(
-                        latest_finished_id, int
-                    ):
-                        raise TypeError("Robot latest_finished_id must be an integer")
-                    if latest_finished_id < -1:
-                        raise ValueError(
-                            "Robot latest_finished_id must be -1 or non-negative"
-                        )
-                    cancellation_lookup = (
-                        set(cancelled_move_ids)
-                        if dependency_counts[submodule_name] >= 4
-                        and isinstance(cancelled_move_ids, (list, tuple))
-                        else cancelled_move_ids
-                    )
-                    progress_by_submodule[submodule_name] = (
-                        latest_finished_id, cancellation_lookup
-                    )
-                latest_finished_id, cancelled_moves = progress_by_submodule[
-                    submodule_name
-                ]
+                latest_finished_id, cancelled_moves = progress
                 if request.associated_move_id in cancelled_moves:
                     self._transition(
                         request.request_id,
@@ -1145,16 +1239,45 @@ class TaskPilot:
                     continue
                 move_finished = request.associated_move_id <= latest_finished_id
             except Exception as exc:
-                self._transition(
-                    request.request_id, RequestStatus.FAILED,
-                    error=exception_message(exc),
-                )
+                self._fail_request(request, exception_message(exc))
                 continue
             if move_finished:
                 heapq.heappush(ready_to_dispatch, queue_entry)
             else:
                 still_waiting.append(queue_entry)
         return still_waiting
+
+    def _read_motion_progress(
+        self,
+        submodule_name: Optional[str],
+        main_state: Optional[ReducedRobotTaskInterface.ReducedRobotState],
+        dependency_count: int,
+    ) -> Union[Tuple[int, Container[int]], str]:
+        """Return a progress snapshot or one reusable error for this scheduler pass."""
+        try:
+            if submodule_name is None:
+                cancelled_move_ids = getattr(main_state, "cancelled_move_ids", ())
+                latest_finished_id = main_state.latest_finished_id
+            else:
+                state = self._robot_task.query_submodule_state(submodule_name)
+                cancelled_move_ids = state.cancelled_move_ids
+                latest_finished_id = state.latest_finished_id
+            if isinstance(latest_finished_id, bool) or not isinstance(
+                latest_finished_id, int
+            ):
+                return "Robot latest_finished_id must be an integer"
+            latest_finished_id = int.__int__(latest_finished_id)
+            if latest_finished_id < -1:
+                return "Robot latest_finished_id must be -1 or non-negative"
+            cancellation_lookup = (
+                set(cancelled_move_ids)
+                if dependency_count >= 4
+                and isinstance(cancelled_move_ids, (list, tuple))
+                else cancelled_move_ids
+            )
+            return latest_finished_id, cancellation_lookup
+        except Exception as exc:
+            return exception_message(exc)
 
     def _dispatch_next_request(self, ready_to_dispatch: List[_QueueEntry]) -> None:
         request = heapq.heappop(ready_to_dispatch)[2]
@@ -1163,6 +1286,25 @@ class TaskPilot:
         self._refresh_request(request)
 
     def _bg_thread_loop(self) -> None:
+        # Startup must publish admission before the worker can report a failure;
+        # otherwise an early worker exit could be overwritten by initialize().
+        self._scheduler_ready.wait()
+        if not self._initialized:
+            return
+        try:
+            self._run_scheduler()
+        except Exception as exc:
+            message = exception_message(exc)
+            log_error("TaskPilot scheduler failed: %s", message)
+            try:
+                self._stop_locked(0.0, reason="TaskPilot scheduler failed: " + message)
+            except Exception as cleanup_error:
+                log_error(
+                    "TaskPilot scheduler cleanup failed: %s",
+                    exception_message(cleanup_error),
+                )
+
+    def _run_scheduler(self) -> None:
         waiting_for_motion: List[_QueueEntry] = []
         ready_to_dispatch: List[_QueueEntry] = []
         next_poll_at = time.monotonic()

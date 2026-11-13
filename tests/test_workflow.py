@@ -603,8 +603,17 @@ def test_run_identity_and_operation_identity_are_read_only():
 
 
 @pytest.mark.parametrize("seed", range(10))
-def test_randomized_workflows_preserve_capacity_dependencies_and_single_execution(seed):
+@pytest.mark.parametrize("eager", [False, True])
+def test_randomized_workflows_preserve_capacity_dependencies_and_single_execution(
+    seed, eager
+):
+    if eager and not hasattr(asyncio, "eager_task_factory"):
+        pytest.skip("requires eager task support")
+
     async def scenario():
+        if eager:
+            # asyncio.run owns this fresh loop and its factory for the scenario.
+            asyncio.get_running_loop().set_task_factory(asyncio.eager_task_factory)
         rng = random.Random(seed)
         capacities = {"arm": 1, "camera": 2, "gpu": 3}
         active = dict.fromkeys(capacities, 0)
@@ -616,7 +625,7 @@ def test_randomized_workflows_preserve_capacity_dependencies_and_single_executio
             key = (context.run_id, context.node_id)
             assert key not in executed
             executed.add(key)
-            node = manifests[context.run_id][context.node_id]
+            node = manifests[inputs["manifest"]][context.node_id]
             assert all(
                 (context.run_id, predecessor) in completed for predecessor in node.after
             )
@@ -638,7 +647,7 @@ def test_randomized_workflows_preserve_capacity_dependencies_and_single_executio
             max_concurrency=5,
         ) as engine:
             runs = []
-            for _ in range(12):
+            for manifest in range(12):
                 nodes = []
                 for i in range(20):
                     claims = tuple(
@@ -650,6 +659,7 @@ def test_randomized_workflows_preserve_capacity_dependencies_and_single_executio
                             str(i),
                             "work",
                             {
+                                "manifest": manifest,
                                 "delay": 0.0001 + rng.random() * 0.0001,
                                 "fail": rng.random() < 0.04,
                             },
@@ -659,8 +669,8 @@ def test_randomized_workflows_preserve_capacity_dependencies_and_single_executio
                         )
                     )
                 workflow = Workflow(tuple(nodes), FailurePolicy.CONTINUE_INDEPENDENT)
+                manifests[manifest] = {node.node_id: node for node in nodes}
                 run = engine.submit(workflow)
-                manifests[run.run_id] = {node.node_id: node for node in nodes}
                 runs.append(run)
             await asyncio.sleep(0.002)
             for run in runs[::4]:

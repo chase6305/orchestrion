@@ -7,6 +7,7 @@ import pytest
 
 from orchestrion.workflow import (
     Action,
+    ExecutionUncertain,
     JournalError,
     Node,
     NodeStatus,
@@ -91,10 +92,20 @@ def test_remote_completion_uses_protocol_key_and_durable_ticket_checkpoint(tmp_p
     asyncio.run(scenario())
 
 
-def test_cancel_acceptance_does_not_release_resource_before_final_stop():
+@pytest.mark.parametrize(
+    "captured_budget", [None, "poll_interval", "rpc_timeout", "stop_timeout"]
+)
+def test_cancel_acceptance_does_not_release_resource_before_final_stop(captured_budget):
+    class Budget(float):
+        def __radd__(self, other):
+            raise RuntimeError("custom remote budget arithmetic")
+
     async def scenario():
         backend = FakeBackend(OperationStatus.RUNNING)
-        adapter = TicketAction(backend, poll_interval=0.001, stop_timeout=1)
+        options = {"poll_interval": 0.001, "rpc_timeout": 1, "stop_timeout": 1}
+        if captured_budget is not None:
+            options[captured_budget] = Budget(options[captured_budget])
+        adapter = TicketAction(backend, **options)
         async with WorkflowEngine(
             [Action("remote", adapter, (ResourceClaim("tool"),))], [Resource("tool")]
         ) as engine:
@@ -153,6 +164,273 @@ def test_definite_rejection_is_failed_without_quarantine():
     asyncio.run(scenario())
 
 
+def test_explicit_backend_uncertainty_is_returned_without_query_retry():
+    async def scenario():
+        backend = FakeBackend()
+        backend.query_effects = [ExecutionUncertain("controller state is unknown")]
+        async with WorkflowEngine([Action("remote", TicketAction(backend))]) as engine:
+            run = engine.submit(Workflow((Node("remote", "remote"),)))
+            result = await run.wait(1)
+            assert result.status == RunStatus.NEEDS_ATTENTION
+            assert backend.queries == 1
+            assert result.nodes["remote"].error == (
+                "ExecutionUncertain: controller state is unknown"
+            )
+            engine.confirm_quiescent(run.operation_id("remote"), evidence="controller idle")
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stage", ["submit", "query", "wait_cancelled"])
+@pytest.mark.parametrize("interruption", [False, True], ids=["factory-error", "factory-cancel"])
+def test_rpc_task_start_failure_closes_coroutines_and_drains_helpers(stage, interruption):
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        original_factory = loop.get_task_factory()
+        rejected, queries = [], []
+        backend = FakeBackend(OperationStatus.RUNNING)
+
+        async def query(ticket):
+            task = asyncio.current_task()
+            queries.append(task)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                queries.remove(task)
+
+        backend.query = query
+
+        def factory(loop, coroutine, **kwargs):
+            if coroutine.cr_code.co_name == stage:
+                rejected.append(coroutine)
+                if interruption:
+                    raise asyncio.CancelledError("RPC task startup interrupted")
+                raise RuntimeError("RPC task startup failed")
+            return asyncio.Task(coroutine, loop=loop, **kwargs)
+
+        engine = WorkflowEngine(
+            [Action("remote", TicketAction(backend, rpc_timeout=0.01, max_query_errors=1),
+                    (ResourceClaim("arm"),))],
+            [Resource("arm")],
+        )
+        loop.set_task_factory(factory)
+        try:
+            run = engine.submit(Workflow((Node("remote", "remote"),)))
+            result = await run.wait(1)
+            assert rejected
+            assert all(coroutine.cr_frame is None for coroutine in rejected)
+            assert not queries
+            expected = RunStatus.FAILED if stage == "submit" else RunStatus.NEEDS_ATTENTION
+            assert result.status == expected
+            assert len(backend.submissions) == (0 if stage == "submit" else 1)
+            assert not any(not task.done() for task in queries)
+            if stage != "submit":
+                engine.confirm_quiescent(run.operation_id("remote"), evidence="controller idle")
+        finally:
+            loop.set_task_factory(original_factory)
+            for coroutine in rejected:
+                coroutine.close()
+            for task in list(queries):
+                task.cancel()
+            await asyncio.gather(*list(queries), return_exceptions=True)
+            await engine.aclose(1)
+
+    asyncio.run(scenario())
+
+
+def test_late_submit_acknowledgement_during_timeout_cleanup_keeps_its_ticket():
+    async def scenario():
+        class Backend(FakeBackend):
+            async def submit(self, operation_id, inputs):
+                self.submissions.append((operation_id, inputs))
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    return "accepted-during-cleanup"
+
+            async def query(self, ticket):
+                return OperationUpdate(ticket, OperationStatus.SUCCEEDED, {"done": True})
+
+        backend = Backend()
+        async with WorkflowEngine([
+            Action("remote", TicketAction(backend, rpc_timeout=0.005))
+        ]) as engine:
+            run = engine.submit(Workflow((Node("remote", "remote"),)))
+            result = await run.wait(1)
+            assert result.status == RunStatus.SUCCEEDED
+            assert result.nodes["remote"].checkpoint["ticket"] == "accepted-during-cleanup"
+            assert len(backend.submissions) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(not hasattr(asyncio, "eager_task_factory"), reason="requires eager task support")
+def test_factory_failure_after_eager_submit_preserves_unknown_device_lease():
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        original_factory = loop.get_task_factory()
+        backend = FakeBackend()
+
+        def factory(loop, coroutine, **kwargs):
+            if coroutine.cr_code.co_name == "submit":
+                asyncio.eager_task_factory(loop, coroutine, **kwargs)
+                raise RuntimeError("factory failed after submit ran")
+            return asyncio.Task(coroutine, loop=loop, **kwargs)
+
+        async with WorkflowEngine(
+            [Action("remote", TicketAction(backend), (ResourceClaim("arm"),))],
+            [Resource("arm")],
+        ) as engine:
+            loop.set_task_factory(factory)
+            try:
+                run = engine.submit(Workflow((Node("remote", "remote"),)))
+                result = await run.wait(1)
+                assert result.status == RunStatus.NEEDS_ATTENTION
+                assert len(backend.submissions) == 1
+                assert engine.resource_snapshot()["resources"]["arm"]["used"] == 1
+                engine.confirm_quiescent(run.operation_id("remote"), evidence="controller idle")
+            finally:
+                loop.set_task_factory(original_factory)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("eager", [False, True])
+def test_factory_failure_after_creating_submit_task_drains_its_owner(eager):
+    if eager and not hasattr(asyncio, "eager_task_factory"):
+        pytest.skip("requires eager task support")
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        original_factory = loop.get_task_factory()
+        created, unhandled = [], []
+        old_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda loop, detail: unhandled.append(detail))
+        closed = asyncio.Event()
+
+        class Backend(FakeBackend):
+            async def submit(self, operation_id, inputs):
+                self.submissions.append((operation_id, inputs))
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    closed.set()
+
+        backend = Backend()
+
+        def factory(loop, coroutine, **kwargs):
+            if coroutine.cr_code.co_name == "submit":
+                task = (asyncio.eager_task_factory(loop, coroutine, **kwargs) if eager
+                        else asyncio.Task(coroutine, loop=loop, **kwargs))
+                created.append(task)
+                raise RuntimeError("factory failed after creating its task")
+            return asyncio.Task(coroutine, loop=loop, **kwargs)
+
+        async with WorkflowEngine([
+            Action("remote", TicketAction(backend), (ResourceClaim("arm"),))
+        ], [Resource("arm")]) as engine:
+            loop.set_task_factory(factory)
+            try:
+                run = engine.submit(Workflow((Node("remote", "remote"),)))
+                result = await run.wait(1)
+                assert result.status == (RunStatus.NEEDS_ATTENTION if eager else RunStatus.FAILED)
+                assert created and all(task.done() for task in created)
+                assert len(backend.submissions) == int(eager)
+                assert closed.is_set() is eager
+                if eager:
+                    engine.confirm_quiescent(run.operation_id("remote"), evidence="controller idle")
+                await asyncio.sleep(0)
+                assert not unhandled
+            finally:
+                loop.set_task_factory(original_factory)
+                for task in created:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*created, return_exceptions=True)
+                loop.set_exception_handler(old_handler)
+
+    asyncio.run(scenario())
+
+
+def test_rejected_cancel_rpc_is_closed_before_retrying_stop():
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        original_factory = loop.get_task_factory()
+        rejected = []
+
+        class Backend(FakeBackend):
+            async def cancel(self, ticket):
+                await super().cancel(ticket)
+                self.status = OperationStatus.CANCELLED
+
+        def factory(loop, coroutine, **kwargs):
+            if coroutine.cr_code.co_name == "cancel" and not rejected:
+                rejected.append(coroutine)
+                raise RuntimeError("could not start cancellation RPC")
+            return asyncio.Task(coroutine, loop=loop, **kwargs)
+
+        backend = Backend(OperationStatus.RUNNING)
+        async with WorkflowEngine([
+            Action("remote", TicketAction(backend, poll_interval=0.001))
+        ]) as engine:
+            loop.set_task_factory(factory)
+            try:
+                run = engine.submit(Workflow((Node("remote", "remote"),)))
+                await asyncio.wait_for(backend.submitted.wait(), 1)
+                run.cancel()
+                result = await run.wait(1)
+                assert result.status == RunStatus.CANCELLED
+                assert backend.cancels == 1
+                assert rejected[0].cr_frame is None
+            finally:
+                loop.set_task_factory(original_factory)
+                for coroutine in rejected:
+                    coroutine.close()
+
+    asyncio.run(scenario())
+
+
+def test_repeated_worker_cancellation_cannot_detach_remote_query_cleanup():
+    async def scenario():
+        entered, cleaning, release, drained = (asyncio.Event() for _ in range(4))
+
+        class Backend(FakeBackend):
+            async def query(self, ticket):
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cleaning.set()
+                    await release.wait()
+                    drained.set()
+
+        engine = WorkflowEngine(
+            [Action("remote", TicketAction(Backend()), (ResourceClaim("arm"),))],
+            [Resource("arm")], stop_timeout=0.005,
+        )
+        try:
+            run = engine.submit(Workflow((Node("remote", "remote"),)))
+            await asyncio.wait_for(entered.wait(), 1)
+            worker = next(iter(engine._workers))
+            worker.cancel()
+            await asyncio.wait_for(cleaning.wait(), 1)
+            worker.cancel()
+            assert (await run.wait(1)).status == RunStatus.NEEDS_ATTENTION
+            assert engine.scheduler_snapshot()["draining_adapters"] == 1
+            assert not drained.is_set()
+            with pytest.raises(RuntimeError, match="still draining"):
+                engine.confirm_quiescent(run.operation_id("remote"), evidence="controller idle")
+        finally:
+            release.set()
+            await engine.aclose(1)
+        assert drained.is_set()
+        assert engine.scheduler_snapshot()["draining_adapters"] == 0
+        assert engine.resource_snapshot()["resources"]["arm"]["used"] == 1
+        engine.confirm_quiescent(run.operation_id("remote"), evidence="query cleanup completed")
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "status,expected",
     [
@@ -180,8 +458,19 @@ def test_final_remote_outcomes_map_to_execution_and_resource_states(status, expe
     asyncio.run(scenario())
 
 
-def test_query_retries_are_bounded_and_reset_after_successful_observations():
+@pytest.mark.parametrize("captured_limit", [False, True])
+def test_query_retries_are_bounded_and_reset_after_successful_observations(
+    captured_limit,
+):
+    class Limit(int):
+        def __le__(self, other):
+            raise RuntimeError("custom query-error comparison")
+
+        def __int__(self):
+            raise RuntimeError("custom query-error conversion")
+
     async def scenario():
+        limit = Limit(2) if captured_limit else 2
         backend = FakeBackend()
         backend.query_effects = [
             ConnectionError("transient"),
@@ -193,7 +482,7 @@ def test_query_retries_are_bounded_and_reset_after_successful_observations():
             [
                 Action(
                     "remote",
-                    TicketAction(backend, poll_interval=0.001, max_query_errors=2),
+                    TicketAction(backend, poll_interval=0.001, max_query_errors=limit),
                 )
             ]
         ) as engine:
@@ -206,14 +495,20 @@ def test_query_retries_are_bounded_and_reset_after_successful_observations():
             [
                 Action(
                     "remote",
-                    TicketAction(backend, poll_interval=0.001, max_query_errors=2),
+                    TicketAction(backend, poll_interval=0.001, max_query_errors=limit),
+                    (ResourceClaim("tool"),),
                 )
-            ]
+            ],
+            [Resource("tool")],
         ) as engine:
             run = engine.submit(Workflow((Node("remote", "remote"),)))
             assert (await run.wait(1)).status == RunStatus.NEEDS_ATTENTION
             assert backend.queries == 2
             assert len(backend.submissions) == 1
+            assert engine.resource_snapshot()["resources"]["tool"]["used"] == 1
+            engine.confirm_quiescent(
+                run.operation_id("remote"), evidence="tool stopped"
+            )
 
     asyncio.run(scenario())
 

@@ -7,28 +7,44 @@ from dataclasses import replace
 from typing import Any, Callable, Dict, Iterable, Optional
 
 from orchestrion.schema import RequestSchema
+from orchestrion.utils.errors import exception_description
+from orchestrion.utils.logger import log_error
 
 from .actions import Action, ActionContext
 from .compiler import compile_workflow, submission_fingerprint
 from .engine import WorkflowEngine
 from .model import (
     ActionCancelled,
+    ActionOutcome,
     ExecutionUncertain,
     Resource,
     ResourceClaim,
     RunStatus,
     Workflow,
     _operation_id,
-    _snapshot,
 )
 
 
 def _report_optional(context: ActionContext, feedback: Any) -> None:
     try:
         context.report(feedback)
-    except Exception:
+    except (Exception, asyncio.CancelledError) as exc:
         # Mirrored progress cannot decide whether a device has stopped.
-        pass
+        log_error("Scoped feedback delivery failed: %s", exception_description(exc))
+
+
+async def _close_scope(
+    engine: WorkflowEngine, context: ActionContext
+) -> Optional[ActionOutcome]:
+    """Keep inner work in the outer adapter's accounting through repeated cancel."""
+    interrupted = None
+    while True:
+        try:
+            await engine.aclose()
+            return interrupted
+        except asyncio.CancelledError as exc:
+            context._request_cancel("adapter_interrupted")
+            interrupted = ActionOutcome.unknown(exception_description(exc))
 
 
 class WorkflowActionError(RuntimeError):
@@ -82,17 +98,36 @@ class _ScopedContext(ActionContext):
         self._delegate.raise_if_cancelled()
 
     def report(self, feedback: Any) -> None:
-        self._delegate.report(feedback)
-        _report_optional(
-            self._parent, {"scope_node": self.node_id, "feedback": feedback}
-        )
+        if not self._delegate._active:
+            return
+        snapshot = self._delegate._report_feedback(feedback)
+        # An SDK-thread snapshot can overlap the inner node finishing.
+        if self._delegate._active:
+            _report_optional(
+                self._parent,
+                {
+                    "scope_node": self.node_id,
+                    # Successful capture must not invoke SDK hooks a second time.
+                    # Rejected progress keeps independent parent drop accounting.
+                    "feedback": feedback if snapshot is None else snapshot,
+                },
+            )
 
     def _thread_cancellation(self):
         return self._delegate._thread_cancellation()
 
+    def _request_cancel(self, reason: str) -> bool:
+        return self._delegate._request_cancel(reason)
+
+    def _add_cancel_callback(self, callback) -> None:
+        self._delegate._add_cancel_callback(callback)
+
+    def _remove_cancel_callback(self, callback) -> None:
+        self._delegate._remove_cancel_callback(callback)
+
     def checkpoint(self, data: Any) -> None:
-        self._delegate.checkpoint(data)
-        self._scope_checkpoint(self.node_id, data)
+        snapshot = self._delegate._record_checkpoint(data)
+        self._scope_checkpoint(self.node_id, snapshot)
 
 
 def workflow_action(
@@ -174,19 +209,32 @@ class _WorkflowAction:
 
     async def __call__(self, context: ActionContext, inputs: Dict[str, Any]) -> Any:
         if inputs:
-            raise ValueError("workflow_action uses a fixed plan and accepts no inputs")
-        context.raise_if_cancelled()
+            return ActionOutcome.failed(
+                "workflow_action uses a fixed plan and accepts no inputs"
+            )
+        context._check_loop()
+        if context.cancel_requested:
+            return ActionOutcome.cancelled(context.cancel_reason)
         checkpoints = {}
 
         def checkpoint(node_id, data):
-            checkpoints[node_id] = _snapshot(data)
-            context.checkpoint({"scope_nodes": checkpoints})
+            # Publish the accumulator only after the parent accepts and commits
+            # the whole snapshot. A rejected update must not poison later ones.
+            # The delegate already captured data, so SDK hooks run only once.
+            candidate = dict(checkpoints)
+            candidate[node_id] = data
+            context.checkpoint({"scope_nodes": candidate})
+            checkpoints[node_id] = candidate[node_id]
 
         def wrap(action):
             async def invoke(inner_context, inner_inputs):
+                if context.cancel_requested:
+                    return ActionOutcome.cancelled(context.cancel_reason)
                 _report_optional(
                     context, {"scope_node": inner_context.node_id, "kind": "started"}
                 )
+                if context.cancel_requested:
+                    return ActionOutcome.cancelled(context.cancel_reason)
                 return await action.handler(
                     _ScopedContext(inner_context, context, checkpoint), inner_inputs
                 )
@@ -199,23 +247,39 @@ class _WorkflowAction:
             **self._options,
         )
         try:
-            async with engine:
+            failure = None
+            cancel_inner = None
+            try:
+                if context.cancel_requested:
+                    return ActionOutcome.cancelled(context.cancel_reason)
                 run = engine.submit(self._workflow)
-
-                async def forward_cancel():
-                    await context.wait_cancelled()
-                    run.cancel()
-
-                cancellation = asyncio.create_task(forward_cancel())
+                cancel_inner = run.cancel
+                context._add_cancel_callback(cancel_inner)
                 try:
                     result = await run.wait()
-                except BaseException:
-                    # Cancelling the wrapper cannot silently orphan its inner graph.
+                except asyncio.CancelledError as exc:
+                    context._request_cancel("adapter_interrupted")
                     run.cancel()
-                    raise
+                    failure = ActionOutcome.unknown(exception_description(exc))
+                except Exception as exc:
+                    # The owned engine still drains the cancelled graph before
+                    # returning an outcome to the outer engine.
+                    run.cancel()
+                    failure = ActionOutcome.failed(exception_description(exc))
+            finally:
+                try:
+                    cleanup_failure = await _close_scope(engine, context)
+                    if cleanup_failure is not None:
+                        failure = cleanup_failure
                 finally:
-                    cancellation.cancel()
-                    await asyncio.gather(cancellation, return_exceptions=True)
+                    if cancel_inner is not None:
+                        context._remove_cancel_callback(cancel_inner)
+            if failure is not None:
+                if engine.resource_snapshot()["quarantined"]:
+                    return ActionOutcome.unknown(
+                        "scoped workflow contains unresolved device operations"
+                    )
+                return failure
             # wait() already isolated these outputs; the outer engine snapshots
             # the returned detail before retaining or binding it to later nodes.
             detail = {
@@ -240,24 +304,35 @@ class _WorkflowAction:
                 },
             )
             if engine.resource_snapshot()["quarantined"]:
-                raise ExecutionUncertain(
+                return ActionOutcome.unknown(
                     "scoped workflow contains unresolved device operations"
                 )
             if result.status == RunStatus.CANCELLED:
-                raise ActionCancelled("scoped workflow stopped")
+                return ActionOutcome.cancelled("scoped workflow stopped")
             if result.status != RunStatus.SUCCEEDED:
                 errors = "; ".join(
                     "{}: {}".format(node_id, node.error)
                     for node_id, node in result.nodes.items()
                     if node.error
                 )
-                raise WorkflowActionError(errors or "scoped workflow failed")
+                return ActionOutcome.failed(
+                    "WorkflowActionError: " + (errors or "scoped workflow failed")
+                )
             return detail
-        except ExecutionUncertain:
-            raise
+        except asyncio.CancelledError as exc:
+            return ActionOutcome.unknown(exception_description(exc))
+        except ExecutionUncertain as exc:
+            return ActionOutcome.unknown(exception_description(exc))
+        except ActionCancelled as exc:
+            return ActionOutcome.cancelled(exception_description(exc))
         except Exception as exc:
             if engine._quarantined or engine._workers or engine._runs:
-                raise ExecutionUncertain(
-                    "scoped workflow could not confirm all operations stopped"
-                ) from exc
-            raise
+                return ActionOutcome.unknown(
+                    "scoped workflow could not confirm all operations stopped: "
+                    + exception_description(exc)
+                )
+            return ActionOutcome.failed(exception_description(exc))
+        finally:
+            # SDKs may retain scoped contexts after completion. Their checkpoint
+            # callback must not keep the completed scope's recovery data alive.
+            checkpoints.clear()

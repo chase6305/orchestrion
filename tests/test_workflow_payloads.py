@@ -502,7 +502,7 @@ def test_feedback_budget_is_checked_before_enqueueing_from_sdk_thread():
         def sdk():
             try:
                 context.report({"image": "x" * 1000})
-            except PayloadLimitError as exc:
+            except BaseException as exc:
                 errors.append(str(exc))
             context.report({"progress": 1})
             loop.call_soon_threadsafe(finished.set)
@@ -515,7 +515,8 @@ def test_feedback_budget_is_checked_before_enqueueing_from_sdk_thread():
             thread.join(1)
             context._finish()
         assert delivered == [{"progress": 1}]
-        assert errors
+        assert errors == []
+        assert context._feedback_snapshot()["dropped"] == 1
         assert not context._feedback_snapshot()["pending"]
 
     asyncio.run(scenario())

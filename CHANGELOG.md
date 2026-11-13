@@ -2,6 +2,67 @@
 
 ## Unreleased
 
+- Bound workflow scheduling turns so eager action bursts yield to cancellation
+  and timers; reuse the starting scheduler for reentrant follow-up submissions.
+- Retire completed graphs without scanning unrelated waiting adapters, and reuse
+  stable output-reference scans during validation while rechecking custom schemas.
+  Recompile schema-rewritten bindings before dependency and cycle checks.
+- Release quiescent node contexts during long graphs while preserving feedback
+  counters, draining adapter accounting and late ticket checkpoints.
+- Roll back failed initial queue preparation, recheck admission after input
+  preparation, and retain real worker owners after partial task-factory failures.
+  Completion queue faults log and stop pending work while committing confirmed
+  outcomes so durable recovery stays consistent.
+- Capture primitive resource quantities and timer budgets before asynchronous
+  arithmetic; preserve integral durable fingerprints. Isolate native cancellation
+  raised by log sinks and SDK exception formatters from operation accounting.
+- Ignore completed inner nodes' late progress, isolate rejected scope checkpoint
+  updates, capture successful SDK progress and checkpoint data once, and release
+  checkpoints after scope cleanup.
+
+- Log and drop invalid or oversized optional workflow progress instead of raising
+  into device handlers. Count these reports and contain cancelled progress sinks
+  without changing action outcomes or releasing uncertain device claims.
+- Drain nested workflow cleanup through repeated adapter cancellation; keep the
+  outer worker counted and block reconciliation until all inner handlers exit.
+
+- Drain owned remote RPC and cancellation-monitor tasks through startup failures,
+  timeouts and repeated caller cancellation. Close rejected coroutines, recover
+  tasks created by failing factories, preserve late accepted tickets and distinguish
+  unstarted submission failures from uncertain device effects.
+- Keep interrupted blocking SDK calls in engine accounting until they exit. Apply
+  stop-confirmation budgets to adapter interruption, and keep their concurrency
+  slots and resource claims quarantined while draining.
+- Isolate optional feedback callback and notification failures with logged return
+  paths. Count lost reports, recover notification delivery, flush in-flight batches
+  in order during reentrant completion, and release retired scalar values outside
+  queue locks. Scoped contexts forward cancellation to their owning context.
+
+- Return explicit `TaskFailure` and `ActionOutcome` values for asynchronous
+  failures, cooperative cancellation and uncertain device states. Built-in task,
+  blocking, ticket and composite adapters contain SDK errors; workflow UNKNOWN
+  outcomes continue to quarantine resources, including with invalid diagnostics.
+- Log and return `False` from rejected function-task submissions and `-1` from
+  rejected `TaskPilot.call_srv_async()` submissions without consuming request IDs
+  or idempotency keys. Accepted inline failures remain queryable and return True.
+- Preserve confirmed cancellation through task response envelopes and pilot
+  results. Keep gripper wait timeouts as failures while cancelling their motion.
+- Keep completion and resource accounting independent of log-handler failures;
+  format threaded SDK errors once and log changed polling errors without floods.
+  Durable dispatch barriers return commit errors instead of failing waiter futures.
+  Motion input copy failures log and reject before allocating any movement IDs;
+  failed robot workers still cancel queued motion when log handlers fail.
+
+- Validate and capture mutable motion synchronization options before admission;
+  share bad completion snapshots across dependent requests within each pass.
+  Contain pilot scheduler failures, close admission, cancel local pending results
+  and attempt all device cleanup even when logging fails.
+  Log changed transient main-state query errors and reset suppression on recovery.
+  Capture plain scalar request identifiers and priorities before asynchronous
+  admission so subclass hooks cannot fail after reserving an ID.
+  Avoid waiting on the lifecycle lock when an inline callback initializes a pilot
+  that an external caller is stopping and joining.
+
 - Reduce JSON snapshot overhead with direct string encoding and one-pass
   dictionary copying. Count actual copied entries and ignore custom string lengths
   when enforcing workflow payload budgets.

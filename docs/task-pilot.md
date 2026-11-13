@@ -6,7 +6,13 @@ Start with the [README example](../README.md#move-then-grip) or run
 
 ## Motion synchronization
 
-Pass a `MoveSyncOption` to `pilot.call_srv_async(service, content, sync_option)`:
+`pilot.call_srv_async(service, content, sync_option)` returns a nonnegative
+integer for an accepted request;
+`-1` means submission failed and an error was logged. Invalid arguments, missing
+services, unavailable motion state, preparation errors and concurrent shutdown
+leave request IDs and idempotency keys reusable. Do not pass `-1` to a result wait.
+
+Pass a `MoveSyncOption` to select synchronization:
 
 | Policy | Request becomes eligible when… |
 | --- | --- |
@@ -30,6 +36,27 @@ Adapter request IDs and movement counters must be Python integers; boolean and f
 aliases are rejected. The `-1` movement sentinel means no move yet. Invalid
 submission counters reject new requests; invalid completion counters fail waiting
 requests before a peripheral is invoked.
+Function tasks capture integer subclasses as plain IDs before history updates
+and SDK invocation. Pilot service names, idempotency keys, priorities and captured
+movement IDs similarly use plain string/integer values.
+
+Submission captures a validated copy of the synchronization option, including
+mutable options changed after construction. Rejected options log and return `-1`
+without reserving an ID or idempotency key. Completion reads and failures are
+shared by requests waiting on the same component within one scheduler pass;
+later passes read fresh state so a recovered adapter can make progress.
+Transient main-state query failures keep dependent requests waiting and log only
+when the diagnostic changes; successful queries reset that suppression.
+
+An unexpected pilot scheduler failure logs the error, closes admission, cancels
+nonterminal local requests and attempts cleanup of every peripheral and the robot.
+It does not escape the background thread. After cleanup finishes, a pilot without
+an owned executor can be explicitly initialized again. An owned executor is shut
+down during cleanup and requires a new pilot. As with ordinary cancellation,
+local request cancellation does not confirm a physical device has stopped.
+Initialization from an inline scheduler callback is already satisfied while the
+pilot runs. During concurrent shutdown it logs and returns, allowing the external
+stop caller to finish joining the scheduler.
 
 An unexpected built-in motion-worker failure stops local scheduling, cancels
 unfinished move IDs and wakes waiters. Restart explicitly with `initialize()`
@@ -95,6 +122,33 @@ callback exposes device facts; metadata and schemas appear in
 `pilot.describe_services()` without device I/O. Run
 `python -m examples.simulated_multi_peripheral` for command, telemetry and health
 adapters.
+
+Return `TaskFailure` for a known device failure or confirmed cancellation:
+
+```python
+from orchestrion import TaskFailure
+
+
+def grip(request_id, command):
+    if not device.is_ready():
+        return TaskFailure("gripper is offline")
+    return {"closed": device.close_and_wait()}
+```
+
+Inline and threaded tasks contain SDK exceptions, retain an error response and
+log a failure once. `invoke_async()` reports acceptance, so it returns `True` even
+if accepted execution immediately fails. Invalid request IDs, unbound tasks and
+executor submission errors log and return `False` without consuming the ID.
+Read `peek_response()` for the actual outcome. `TaskFailure(..., cancelled=True)`
+sets the response's `cancelled` flag and maps to `RequestStatus.CANCELLED` in the
+pilot; ordinary failures map to `FAILED`. Running Python callbacks still need
+cooperative device cancellation. A timeout alone does not establish cancellation.
+
+Error messages are formatted once at the execution boundary, avoiding retained
+SDK tracebacks and repeated formatter calls during polling. A failing logging
+handler cannot suppress result storage or completion notifications. `PollingTask`
+logs changed polling errors once, preserves its last valid sample and resumes
+sampling after failures.
 
 Threaded tasks report `health="offline"` until bound to an executor and after
 stop. A `CallableTask` status callback may refine device health and availability;

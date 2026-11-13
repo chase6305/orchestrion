@@ -1,13 +1,14 @@
 """TaskPilot synchronization, dispatch, cancellation, and lifecycle races."""
 
 import concurrent.futures
+import logging
 import threading
 import time
 import weakref
 
 import pytest
 
-from orchestrion import RequestStatus, SimulatedRobotTask
+from orchestrion import RequestStatus, SimulatedRobotTask, TaskFailure
 from orchestrion.move_sync_option import MoveSyncOption
 from orchestrion.task_pilot import TaskPilot
 from orchestrion.tasks import CallableTask, GenericTask, InPlaceFunctionCallTask
@@ -141,6 +142,494 @@ class RecordingTask(InPlaceFunctionCallTask):
             self.started.set()
             assert self.release.wait(2.0)
         return content
+
+
+@pytest.mark.parametrize(
+    "submodule, failure",
+    [
+        (None, "counter"),
+        (None, "history"),
+        ("arm", "counter"),
+        ("arm", "history"),
+        ("arm", "sdk"),
+    ],
+)
+def test_motion_progress_failures_are_shared_within_one_pass_and_recover(
+    submodule, failure, caplog
+):
+    reads, field_reads, formatted = [], [], []
+
+    class DeviceProgressError(RuntimeError):
+        def __str__(self):
+            formatted.append(True)
+            raise ValueError("SDK error formatter failed")
+
+    class InvalidState:
+        @property
+        def latest_finished_id(self):
+            if failure == "counter":
+                field_reads.append(True)
+                return True
+            return 0
+
+        @property
+        def cancelled_move_ids(self):
+            if failure == "history":
+                field_reads.append(True)
+                return [[]]
+            return ()
+
+    class Robot(SubmoduleRobotTaskStub):
+        bad = False
+
+        def query_state(self):
+            if self.bad and submodule is None:
+                reads.append(True)
+                return InvalidState()
+            return super().query_state()
+
+        def query_submodule_state(self, name):
+            if self.bad and submodule is not None:
+                reads.append(True)
+                if failure == "sdk":
+                    raise DeviceProgressError()
+                return InvalidState()
+            return super().query_submodule_state(name)
+
+    robot = Robot()
+    blocker, synced, working = RecordingTask(), RecordingTask(), RecordingTask()
+    option = (
+        MoveSyncOption.sync_w_explicit_id(0)
+        if submodule is None
+        else MoveSyncOption.sync_w_submodule(submodule, 0)
+    )
+    with TaskPilot(
+        robot, {"blocker": blocker, "synced": synced, "working": working}
+    ) as pilot:
+        try:
+            pilot.call_srv_async("blocker", {"block": True}, MoveSyncOption.no_sync())
+            assert blocker.started.wait(1)
+            ids = [
+                pilot.call_srv_async("synced", {"index": i}, option) for i in range(8)
+            ]
+            robot.bad = True
+            immediate = pilot.call_srv_async(
+                "working", {"alive": True}, MoveSyncOption.no_sync()
+            )
+        finally:
+            blocker.release.set()
+        results = pilot.wait_requests(ids, timeout=1)
+        assert all(result.status is RequestStatus.FAILED for result in results)
+        assert len({result.error for result in results}) == 1
+        assert len(reads) == 1
+        assert len(field_reads) == (0 if failure == "sdk" else 1)
+        assert len(formatted) == (1 if failure == "sdk" else 0)
+        assert synced.calls == []
+        assert pilot.wait_request(immediate, timeout=1).content == {"alive": True}
+        assert len([r for r in caplog.records if r.levelno >= logging.ERROR]) == 1
+        robot.bad = False
+        retry = pilot.call_srv_async("synced", {"retry": True}, option)
+        assert pilot.wait_request(retry, timeout=1).status is RequestStatus.SUCCEEDED
+        assert synced.calls == [{"retry": True}]
+
+
+def test_repeated_main_progress_errors_log_changes_and_reset_after_recovery(caplog):
+    class Robot(RobotTaskStub):
+        failure = "controller offline"
+
+        def query_state(self):
+            if self.failure is not None:
+                raise RuntimeError(self.failure)
+            return super().query_state()
+
+    robot = Robot()
+    synchronized, working = RecordingTask(), RecordingTask()
+    with TaskPilot(
+        robot, {"synced": synchronized, "working": working}, poll_interval=5
+    ) as pilot:
+        request_id = pilot.call_srv_async(
+            "synced", sync_option=MoveSyncOption.sync_w_explicit_id(0)
+        )
+
+        def next_pass():
+            pilot._on_component_change()
+            marker = pilot.call_srv_async(
+                "working", sync_option=MoveSyncOption.no_sync()
+            )
+            assert (
+                pilot.wait_request(marker, timeout=1).status is RequestStatus.SUCCEEDED
+            )
+
+        for _ in range(3):
+            next_pass()
+        assert pilot.query_request(request_id).status is RequestStatus.WAITING_FOR_MOVE
+
+        def errors():
+            return [
+                record.getMessage()
+                for record in caplog.records
+                if "Failed to query robot state" in record.getMessage()
+            ]
+
+        assert errors() == ["Failed to query robot state: controller offline"]
+
+        robot.failure = "controller timed out"
+        next_pass()
+        assert errors()[-1] == "Failed to query robot state: controller timed out"
+        assert len(errors()) == 2
+        robot.failure = None
+        next_pass()
+        assert (
+            pilot.wait_request(request_id, timeout=1).status is RequestStatus.SUCCEEDED
+        )
+
+        robot.failure = "controller offline"
+        request_id = pilot.call_srv_async(
+            "synced", sync_option=MoveSyncOption.sync_w_explicit_id(0)
+        )
+        next_pass()
+        assert errors()[-1] == "Failed to query robot state: controller offline"
+        assert len(errors()) == 3
+        robot.failure = None
+        next_pass()
+        assert (
+            pilot.wait_request(request_id, timeout=1).status is RequestStatus.SUCCEEDED
+        )
+        assert pilot.is_running
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"need_sync": "yes"},
+        {"associated_move_id": True},
+        {"associated_move_id": -2},
+        {"submodule_name": []},
+        {"submodule_name": ""},
+        {"need_sync": False, "associated_move_id": 0},
+        {"need_sync": False, "submodule_name": "arm"},
+    ],
+)
+def test_mutated_sync_options_are_rejected_before_reserving_request_identity(changes):
+    task = RecordingTask()
+    option = MoveSyncOption.sync_w_latest_move()
+    for name, value in changes.items():
+        setattr(option, name, value)
+    with TaskPilot(SubmoduleRobotTaskStub(), {"device": task}) as pilot:
+        assert (
+            pilot.call_srv_async("device", sync_option=option, idempotency_key="retry")
+            == -1
+        )
+        assert pilot.timeline() == []
+        request_id = pilot.call_srv_async(
+            "device", {"ok": True}, MoveSyncOption.no_sync(), idempotency_key="retry"
+        )
+        assert request_id == 0
+        assert pilot.wait_request(request_id, timeout=1).content == {"ok": True}
+
+
+def test_sync_option_snapshot_is_stable_across_sdk_state_callbacks():
+    option = MoveSyncOption.sync_w_submodule("arm", 0)
+
+    class Robot(SubmoduleRobotTaskStub):
+        def query_submodule_state(self, name):
+            option.associated_move_id = 999
+            return super().query_submodule_state(name)
+
+    with TaskPilot(Robot(), {"device": RecordingTask()}) as pilot:
+        request_id = pilot.call_srv_async("device", sync_option=option)
+        result = pilot.wait_request(request_id, timeout=1)
+        assert result.status is RequestStatus.SUCCEEDED
+        assert result.associated_move_id == 0
+        assert option.associated_move_id == 999
+
+
+def test_submodule_name_snapshot_uses_plain_string_keys():
+    class Name(str):
+        __hash__ = None
+
+    with TaskPilot(SubmoduleRobotTaskStub(), {"device": RecordingTask()}) as pilot:
+        request_id = pilot.call_srv_async(
+            "device", sync_option=MoveSyncOption.sync_w_submodule(Name("arm"), 0)
+        )
+        result = pilot.wait_request(request_id, timeout=1)
+        assert result.status is RequestStatus.SUCCEEDED
+        assert result.associated_submodule == "arm"
+        assert type(result.associated_submodule) is str
+
+
+@pytest.mark.parametrize(
+    "field", ["priority", "latest_sent", "latest_finished", "explicit"]
+)
+def test_submission_captures_plain_integer_values_before_queueing(field):
+    class Number(int):
+        def __int__(self):
+            raise RuntimeError("custom integer conversion")
+
+        def __neg__(self):
+            raise RuntimeError("custom queue priority")
+
+        def __lt__(self, other):
+            raise RuntimeError("custom movement comparison")
+
+        def __le__(self, other):
+            raise RuntimeError("custom movement comparison")
+
+    robot = RobotTaskStub()
+    priority = Number(5) if field == "priority" else 0
+    option = MoveSyncOption.sync_w_latest_move()
+    if field == "latest_sent":
+        robot.latest_sent_id = Number(10)
+    elif field == "latest_finished":
+        robot.latest_finished_id = Number(10)
+    elif field == "explicit":
+        option.associated_move_id = Number(0)
+    with TaskPilot(robot, {"device": RecordingTask()}) as pilot:
+        request_id = pilot.call_srv_async(
+            "device", sync_option=option, priority=priority
+        )
+        assert request_id == 0
+        result = pilot.wait_request(request_id, timeout=1)
+        assert result.status is RequestStatus.SUCCEEDED
+        assert type(result.priority) is int
+        assert type(result.associated_move_id) is int
+
+
+def test_submission_captures_plain_service_names_and_idempotency_keys():
+    class Text(str):
+        __hash__ = None
+
+        def __eq__(self, other):
+            raise RuntimeError("custom key comparison")
+
+    task = RecordingTask()
+    with TaskPilot(RobotTaskStub(), {"device": task}) as pilot:
+        request_id = pilot.call_srv_async(
+            Text("device"), {"ok": True}, idempotency_key=Text("once")
+        )
+        assert request_id == 0
+        assert pilot.call_srv_async("device", idempotency_key="once") == request_id
+        result = pilot.wait_request(request_id, timeout=1)
+        assert result.content == {"ok": True}
+        assert type(result.service_name) is str
+        assert type(result.idempotency_key) is str
+        assert task.calls == [{"ok": True}]
+
+
+@pytest.mark.parametrize("initialization_fails", [False, True])
+def test_cleanup_contains_optional_hook_lookup_and_logging_failures(
+    initialization_fails, monkeypatch
+):
+    cleaning = threading.Event()
+    admitted = threading.Event()
+
+    class Task(GenericTaskStub):
+        @property
+        def set_completion_callback(self):
+            if cleaning.is_set():
+                raise RuntimeError("callback hook unavailable")
+            return lambda callback: None
+
+        @property
+        def cancel_request(self):
+            raise RuntimeError("cancel hook unavailable")
+
+        def stop(self):
+            super().stop()
+            cleaning.set()
+
+        def invoke_async(self, request_id, content=None):
+            result = super().invoke_async(request_id, content)
+            admitted.set()
+            return result
+
+    class Robot(RobotTaskStub):
+        @property
+        def set_state_change_callback(self):
+            if cleaning.is_set():
+                raise RuntimeError("robot callback hook unavailable")
+            return lambda callback: None
+
+    class FailingTask(GenericTaskStub):
+        def initialize(self, **kwargs):
+            raise ValueError("original initialization failure")
+
+    def broken_logger(*args, **kwargs):
+        raise RuntimeError("log handler unavailable")
+
+    monkeypatch.setattr("orchestrion.utils.logger.logger.error", broken_logger)
+    monkeypatch.setattr("orchestrion.utils.logger.logger.exception", broken_logger)
+    robot, first, second = Robot(), Task(), GenericTaskStub()
+    services = {"first": first, "second": second}
+    if initialization_fails:
+        services["broken"] = FailingTask()
+    pilot = TaskPilot(robot, services)
+    try:
+        if initialization_fails:
+            with pytest.raises(ValueError, match="original initialization failure"):
+                pilot.initialize()
+        else:
+            pilot.initialize()
+            request_id = pilot.call_srv_async("first")
+            assert admitted.wait(1)
+            pilot.stop()
+            assert (
+                pilot.wait_request(request_id, timeout=0).status
+                is RequestStatus.CANCELLED
+            )
+        assert first.stopped and second.stopped and robot.stopped
+    finally:
+        pilot.stop(timeout=1)
+
+
+@pytest.mark.parametrize("immediate_failure", [False, True])
+def test_scheduler_failure_closes_admission_cancels_pending_and_allows_restart(
+    immediate_failure, monkeypatch, caplog
+):
+    release = threading.Event()
+    entered = threading.Event()
+    formatted = []
+
+    class SchedulerError(RuntimeError):
+        def __str__(self):
+            formatted.append(True)
+            raise ValueError("broken scheduler error formatter")
+
+    robot, task = RobotTaskStub(), RecordingTask()
+    pilot = TaskPilot(robot, {"device": task})
+    original_scheduler = pilot._run_scheduler
+
+    def fail_scheduler():
+        entered.set()
+        if not immediate_failure:
+            assert release.wait(2)
+        raise SchedulerError()
+
+    monkeypatch.setattr(pilot, "_run_scheduler", fail_scheduler)
+    try:
+        pilot.initialize()
+        assert entered.wait(1)
+        if not immediate_failure:
+            request_id = pilot.call_srv_async("device", {"old": True})
+            assert request_id >= 0
+        release.set()
+        pilot._bg_thread.join(1)
+        assert not pilot._bg_thread.is_alive()
+        assert not pilot.is_running
+        assert not pilot._initialized
+        assert robot.stopped
+        assert pilot.call_srv_async("device") == -1
+        assert formatted == [True]
+        assert task.calls == []
+        if not immediate_failure:
+            result = pilot.wait_request(request_id, timeout=0)
+            assert result.status is RequestStatus.CANCELLED
+            assert "scheduler failed" in result.error
+        assert any("scheduler failed" in record.message for record in caplog.records)
+
+        monkeypatch.setattr(pilot, "_run_scheduler", original_scheduler)
+        pilot.initialize()
+        fresh = pilot.call_srv_async("device", {"fresh": True})
+        assert pilot.wait_request(fresh, timeout=1).content == {"fresh": True}
+        assert task.calls == [{"fresh": True}]
+    finally:
+        release.set()
+        pilot.stop(timeout=1)
+
+
+def test_start_failure_retains_a_launched_scheduler_until_it_exits(monkeypatch):
+    release = threading.Event()
+    launched = []
+    robot, task = RobotTaskStub(), RecordingTask()
+    pilot = TaskPilot(robot, {"device": task})
+    original_loop = pilot._bg_thread_loop
+    original_start = threading.Thread.start
+
+    def parked_scheduler():
+        assert release.wait(2)
+        original_loop()
+
+    def failed_start(thread):
+        original_start(thread)
+        launched.append(thread)
+        raise RuntimeError("thread started before instrumentation failed")
+
+    monkeypatch.setattr(pilot, "_bg_thread_loop", parked_scheduler)
+    try:
+        with monkeypatch.context() as failure:
+            failure.setattr(threading.Thread, "start", failed_start)
+            with pytest.raises(RuntimeError, match="instrumentation failed"):
+                pilot.initialize()
+        assert len(launched) == 1
+        assert pilot._bg_thread is launched[0]
+        assert pilot._bg_thread.is_alive()
+        assert not pilot.is_running
+        assert robot.stopped
+        assert pilot.call_srv_async("device") == -1
+        with pytest.raises(RuntimeError, match="still stopping"):
+            pilot.initialize()
+        release.set()
+        launched[0].join(1)
+        assert not launched[0].is_alive()
+        monkeypatch.setattr(pilot, "_bg_thread_loop", original_loop)
+        pilot.initialize()
+        request_id = pilot.call_srv_async("device", {"fresh": True})
+        assert request_id == 0
+        assert pilot.wait_request(request_id, timeout=1).content == {"fresh": True}
+        assert task.calls == [{"fresh": True}]
+    finally:
+        release.set()
+        pilot.stop(timeout=1)
+        for thread in launched:
+            thread.join(1)
+
+
+def test_scheduler_cleanup_attempts_all_devices_when_stop_and_logging_fail(monkeypatch):
+    release = threading.Event()
+    entered = threading.Event()
+    stops = []
+
+    class Task(RecordingTask):
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+
+        def stop(self):
+            stops.append(self.name)
+            if self.name == "first":
+                raise RuntimeError("device stop failed")
+
+    def broken_logger(*args, **kwargs):
+        raise RuntimeError("log handler failed")
+
+    robot = RobotTaskStub()
+    pilot = TaskPilot(robot, {"first": Task("first"), "second": Task("second")})
+
+    def fail_scheduler():
+        entered.set()
+        assert release.wait(2)
+        raise RuntimeError("scheduler failed")
+
+    monkeypatch.setattr(pilot, "_run_scheduler", fail_scheduler)
+    monkeypatch.setattr("orchestrion.utils.logger.logger.error", broken_logger)
+    monkeypatch.setattr("orchestrion.utils.logger.logger.exception", broken_logger)
+    try:
+        pilot.initialize()
+        assert entered.wait(1)
+        request_id = pilot.call_srv_async("second")
+        release.set()
+        pilot._bg_thread.join(1)
+        assert not pilot._bg_thread.is_alive()
+        assert not pilot.is_running
+        assert stops == ["first", "second"]
+        assert robot.stopped
+        assert (
+            pilot.wait_request(request_id, timeout=0).status is RequestStatus.CANCELLED
+        )
+        assert pilot.call_srv_async("second") == -1
+    finally:
+        release.set()
+        pilot.stop(timeout=1)
 
 
 def test_lifecycle_and_immediate_request():
@@ -302,18 +791,69 @@ def test_motion_waiters_preserve_priority_and_fifo_across_submission_batches():
         ]
 
 
-def test_unknown_service_is_rejected():
+def test_unknown_service_is_rejected(caplog):
     pilot = TaskPilot(RobotTaskStub())
-    with pytest.raises(KeyError):
-        pilot.call_srv_async("missing", {}, MoveSyncOption.no_sync())
+    assert pilot.call_srv_async("missing", {}, MoveSyncOption.no_sync()) == -1
+    assert "Unknown service" in caplog.text
 
 
-def test_call_rejects_invalid_sync_option():
+@pytest.mark.parametrize("threaded", [False, True])
+def test_returned_device_cancellation_is_not_a_failed_pilot_request(threaded):
+    def call(request_id, content):
+        return TaskFailure("controller confirmed stop", cancelled=True)
+
+    class InlineTask(InPlaceFunctionCallTask):
+        def _call_fn(self, request_id, content):
+            return call(request_id, content)
+
+    task = CallableTask(call) if threaded else InlineTask()
+    executor = (
+        concurrent.futures.ThreadPoolExecutor(max_workers=1) if threaded else None
+    )
+    with TaskPilot(
+        SimulatedRobotTask([0.0]), {"device": task}, executor_owned=executor
+    ) as pilot:
+        request_id = pilot.call_srv_async(
+            "device", sync_option=MoveSyncOption.no_sync()
+        )
+        result = pilot.wait_request(request_id, timeout=1)
+        assert result.status is RequestStatus.CANCELLED
+        assert result.error == "controller confirmed stop"
+        assert task.peek_response(request_id).cancelled is True
+        assert pilot.is_running
+
+
+def test_preparation_failure_logs_outside_locks_and_preserves_submission_identity(
+    monkeypatch,
+):
+    class BrokenContent(dict):
+        def __deepcopy__(self, memo):
+            raise RuntimeError("content copy failed")
+
+    messages = []
+    with TaskPilot(SimulatedRobotTask([0.0]), {"device": RecordingTask()}) as pilot:
+
+        def log(message, *args):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                assert executor.submit(lambda: pilot.timeline()).result(1) == []
+            messages.append(message % args)
+
+        monkeypatch.setattr("orchestrion.utils.logger.logger.error", log)
+        assert (
+            pilot.call_srv_async("device", BrokenContent(), idempotency_key="key") == -1
+        )
+        assert messages == ["Service request was not submitted: content copy failed"]
+        request_id = pilot.call_srv_async("device", {"ok": True}, idempotency_key="key")
+        assert request_id == 0
+        assert pilot.wait_request(request_id, timeout=1).content == {"ok": True}
+
+
+def test_call_rejects_invalid_sync_option(caplog):
     pilot = TaskPilot(RobotTaskStub(), {"task": GenericTaskStub()})
     pilot.initialize()
     try:
-        with pytest.raises(TypeError, match="sync_option"):
-            pilot.call_srv_async("task", sync_option=object())
+        assert pilot.call_srv_async("task", sync_option=object()) == -1
+        assert "sync_option" in caplog.text
     finally:
         pilot.stop()
 
@@ -321,7 +861,7 @@ def test_call_rejects_invalid_sync_option():
 @pytest.mark.parametrize("submodule_name", [None, "arm"], ids=["main", "submodule"])
 @pytest.mark.parametrize("invalid_id", _INVALID_PROGRESS_IDS)
 def test_invalid_latest_sent_id_does_not_reserve_a_request_or_idempotency_key(
-    submodule_name, invalid_id
+    submodule_name, invalid_id, caplog
 ):
     robot = SubmoduleRobotTaskStub()
     robot.latest_sent_id = invalid_id
@@ -333,11 +873,13 @@ def test_invalid_latest_sent_id_does_not_reserve_a_request_or_idempotency_key(
         else MoveSyncOption.sync_w_submodule(submodule_name)
     )
     with TaskPilot(robot, {"device": task}) as pilot:
-        error_type = ValueError if invalid_id == -2 else TypeError
-        with pytest.raises(error_type, match="associated_move_id"):
+        assert (
             pilot.call_srv_async(
                 "device", {"invalid": True}, sync_option, idempotency_key="retry"
             )
+            == -1
+        )
+        assert "associated_move_id" in caplog.text
         assert task.calls == []
         robot.latest_sent_id = 0
         request_id = pilot.call_srv_async(
@@ -449,10 +991,10 @@ def test_malformed_submodule_state_fails_request_without_stopping_scheduler():
         pilot.stop()
 
 
-def test_request_before_initialization_is_rejected():
+def test_request_before_initialization_is_rejected(caplog):
     pilot = TaskPilot(RobotTaskStub(), {"task": GenericTaskStub()})
-    with pytest.raises(RuntimeError):
-        pilot.call_srv_async("task", {}, MoveSyncOption.no_sync())
+    assert pilot.call_srv_async("task", {}, MoveSyncOption.no_sync()) == -1
+    assert "initialized" in caplog.text
 
 
 @pytest.mark.parametrize("move_id", [True, 1.5, "1"])
@@ -769,7 +1311,10 @@ def test_completion_during_cancellation_preserves_the_final_outcome(accepted):
 
 
 @pytest.mark.parametrize("broken_formatter", [False, True])
-def test_bulk_cancellation_continues_after_backend_error(broken_formatter, caplog):
+@pytest.mark.parametrize("broken_logger", [False, True])
+def test_bulk_cancellation_continues_after_backend_error(
+    broken_formatter, broken_logger, caplog, monkeypatch
+):
     class CancelError(Exception):
         def __str__(self):
             if broken_formatter:
@@ -778,6 +1323,13 @@ def test_bulk_cancellation_continues_after_backend_error(broken_formatter, caplo
 
     admitted = threading.Event()
     attempts = []
+
+    if broken_logger:
+
+        def fail_log(*args, **kwargs):
+            raise RuntimeError("log handler unavailable")
+
+        monkeypatch.setattr("orchestrion.utils.logger.logger.error", fail_log)
 
     class Task(GenericTaskStub):
         def invoke_async(self, request_id, content=None):
@@ -801,7 +1353,8 @@ def test_bulk_cancellation_continues_after_backend_error(broken_formatter, caplo
         for request_id in ids[1:]:
             assert pilot.query_request(request_id).status is RequestStatus.CANCELLED
         assert not pilot._cancelling_requests
-        assert "Failed to cancel request 0" in caplog.text
+        if not broken_logger:
+            assert "Failed to cancel request 0" in caplog.text
 
 
 def test_request_prepared_before_stop_cannot_enter_a_restarted_pilot():
@@ -826,8 +1379,7 @@ def test_request_prepared_before_stop_cannot_enter_a_restarted_pilot():
                 pilot.initialize()
             finally:
                 resume.set()
-            with pytest.raises(RuntimeError, match="stopped"):
-                submission.result(1.0)
+            assert submission.result(1.0) == -1
         assert task.calls == []
         request_id = pilot.call_srv_async("device", {"fresh": True})
         assert pilot.wait_request(request_id, timeout=1.0).content == {"fresh": True}
@@ -841,6 +1393,18 @@ def test_request_prepared_before_stop_cannot_enter_a_restarted_pilot():
             "different request",
         ),
         (PeekResponseResult(PeekResponseResultType.ErrorRequestNotSent), "no record"),
+        (
+            PeekResponseResult(PeekResponseResultType.ErrorUnknown, error={}),
+            "error must be a string",
+        ),
+        (
+            PeekResponseResult(PeekResponseResultType.ErrorUnknown, cancelled="yes"),
+            "invalid cancellation flag",
+        ),
+        (
+            PeekResponseResult(PeekResponseResultType.ResponseFound, cancelled=True),
+            "invalid cancellation flag",
+        ),
         *[
             pytest.param(
                 PeekResponseResult(PeekResponseResultType.ResponseFound, request_id),
@@ -1257,3 +1821,37 @@ def test_inline_stop_does_not_wait_for_an_external_caller_joining_the_scheduler(
         assert pilot.query_request(request_id).status is RequestStatus.SUCCEEDED
     finally:
         pilot.stop()
+
+
+@pytest.mark.parametrize("broken_logger", [False, True])
+def test_inline_initialize_does_not_wait_for_a_caller_joining_the_scheduler(
+    broken_logger, monkeypatch
+):
+    started = threading.Event()
+    returned = threading.Event()
+
+    class InitializingTask(RecordingTask):
+        def _call_fn(self, request_id, content):
+            started.set()
+            assert pilot._stop_event.wait(2)
+            pilot.initialize()
+            returned.set()
+            return content
+
+    if broken_logger:
+        def fail_log(*args, **kwargs):
+            raise RuntimeError("log handler unavailable")
+
+        monkeypatch.setattr("orchestrion.utils.logger.logger.error", fail_log)
+    pilot = TaskPilot(SimulatedRobotTask([0.0]), {"device": InitializingTask()})
+    pilot.initialize()
+    try:
+        request_id = pilot.call_srv_async("device")
+        assert started.wait(1)
+        pilot.stop(timeout=1)
+        assert returned.is_set()
+        assert not pilot._bg_thread.is_alive()
+        assert not pilot.is_running
+        assert pilot.query_request(request_id).status is RequestStatus.SUCCEEDED
+    finally:
+        pilot.stop(timeout=1)

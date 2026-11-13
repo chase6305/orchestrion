@@ -1,5 +1,6 @@
 """Shared motion contracts and lifecycle races for the built-in robot backends."""
 
+import asyncio
 import concurrent.futures
 import threading
 import weakref
@@ -49,17 +50,20 @@ class UncopyableTrajectory(list):
         raise RuntimeError("trajectory copy failed")
 
 
-def test_copy_failure_does_not_consume_main_move_id(robot):
-    with pytest.raises(RuntimeError, match="copy failed"):
-        robot.move_joint_trajectory_async(UncopyableTrajectory([[1.0]]))
+def test_copy_failure_does_not_consume_main_move_id(robot, caplog):
+    assert robot.move_joint_trajectory_async(UncopyableTrajectory([[1.0]])) == -1
+    assert "trajectory copy failed" in caplog.text
     assert robot.query_state().latest_sent_id == -1
     assert robot.move_joint_trajectory_async([[2.0]]) == 0
 
 
-def test_copy_failure_does_not_consume_submodule_move_id():
+def test_copy_failure_does_not_consume_submodule_move_id(caplog):
     robot = ModularRobot()
-    with pytest.raises(RuntimeError, match="copy failed"):
+    assert (
         robot.move_submodule_trajectory_async("gripper", UncopyableTrajectory([[1.0]]))
+        == -1
+    )
+    assert "trajectory copy failed" in caplog.text
     assert robot.query_submodule_state("gripper").latest_sent_id == -1
     assert robot.move_submodule_trajectory_async("gripper", [[2.0]]) == 0
     robot.stop()
@@ -182,8 +186,9 @@ def test_worker_failure_cancels_queued_motion_and_wakes_waiters(robot, monkeypat
 
 
 @pytest.mark.parametrize("observer_fails", [False, True])
+@pytest.mark.parametrize("logging_failure", [RuntimeError, asyncio.CancelledError])
 def test_worker_logging_failure_discards_queued_motion_before_restart(
-    robot, monkeypatch, observer_fails
+    robot, monkeypatch, observer_fails, logging_failure
 ):
     simulated = isinstance(robot, SimulatedRobotTask)
     step_name = "_run_next_trajectory" if simulated else "_process_motion"
@@ -193,7 +198,7 @@ def test_worker_logging_failure_discards_queued_motion_before_restart(
         raise ValueError("device failure")
 
     def fail_log(*args, **kwargs):
-        raise RuntimeError("log sink unavailable")
+        raise logging_failure("log sink unavailable")
 
     def fail_observer():
         raise ValueError("state observer failed")
@@ -208,9 +213,8 @@ def test_worker_logging_failure_discards_queued_motion_before_restart(
         robot.set_state_change_callback(fail_observer)
     with monkeypatch.context() as failure:
         failure.setattr(robot, step_name, fail_step)
-        failure.setattr(logger, "exception", fail_log)
-        with pytest.raises(RuntimeError, match="log sink unavailable"):
-            worker()
+        failure.setattr(logger, "error", fail_log)
+        assert worker() is None
     assert {first, second}.issubset(robot.query_state().cancelled_move_ids)
     assert robot.move_joint_trajectory_async([[4.0]]) == -1
     if not simulated:

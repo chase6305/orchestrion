@@ -8,7 +8,7 @@ from fractions import Fraction
 
 import pytest
 
-from orchestrion import RetryPolicy
+from orchestrion import RetryPolicy, TaskFailure
 from orchestrion.tasks.function_call_task import (
     CallableTask,
     InPlaceFunctionCallTask,
@@ -508,14 +508,45 @@ def test_inline_response_copy_can_query_task_status():
     assert task.peek_response(1).content == {"status": 1}
 
 
-@pytest.mark.parametrize(
-    "request_id, expected",
-    [(True, TypeError), (1.5, TypeError), (-1, ValueError)],
-)
-def test_function_tasks_reject_invalid_request_ids(request_id, expected, function_task):
+@pytest.mark.parametrize("request_id", [True, 1.5, -1, [], None])
+def test_function_tasks_reject_invalid_request_ids(request_id, function_task, caplog):
     task, _ = function_task
-    with pytest.raises(expected, match="request_id"):
-        task.invoke_async(request_id)
+    assert task.invoke_async(request_id) is False
+    assert "request_id" in caplog.text
+    assert task.peek_status()["latest_request_id"] == -1
+    assert task.invoke_async(0, {"value": 1})
+
+
+def test_function_task_submission_uses_plain_integer_ids(function_task):
+    class RequestId(int):
+        __hash__ = None
+
+        def __int__(self):
+            raise RuntimeError("custom ID conversion")
+
+        def __lt__(self, other):
+            raise RuntimeError("custom ID comparison")
+
+        def __divmod__(self, other):
+            raise RuntimeError("custom ID history lookup")
+
+    task, completed = function_task
+    observed = []
+
+    def call(request_id, content):
+        observed.append(request_id)
+        assert type(request_id) is int
+        return content
+
+    task._call_fn = call
+    assert task.invoke_async(RequestId(-1)) is False
+    assert task.peek_status()["latest_request_id"] == -1
+    assert task.invoke_async(RequestId(0), {"ok": True})
+    assert completed.wait(1)
+    assert task.peek_response(0).content == {"ok": True}
+    assert not task.invoke_async(0, {"duplicate": True})
+    assert observed == [0]
+    assert type(task.peek_status()["latest_request_id"]) is int
 
 
 def test_out_of_order_request_does_not_mark_gap_as_flushed():
@@ -613,8 +644,7 @@ def test_threaded_submit_failure_releases_request_id_for_retry():
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         task = ThreadedPoolTaskStub()
         task.initialize(executor=FailOnceExecutor(executor))
-        with pytest.raises(RuntimeError, match="submit failed"):
-            task.invoke_async(1, {"value": 1})
+        assert not task.invoke_async(1, {"value": 1})
         assert (
             task.peek_response(1).result_type
             is PeekResponseResultType.ErrorRequestNotSent
@@ -659,8 +689,7 @@ def test_threaded_task_rejects_requests_after_stop_until_reinitialized():
         task = ThreadedPoolTaskStub()
         task.initialize(executor=executor)
         task.stop()
-        with pytest.raises(RuntimeError, match="initialized"):
-            task.invoke_async(1, {"value": 1})
+        assert not task.invoke_async(1, {"value": 1})
         task.initialize(executor=executor)
         assert task.invoke_async(1, {"value": 1})
 
@@ -693,8 +722,9 @@ def test_stopped_callable_does_not_retry_an_old_invocation(delay, restart):
                 assert task._future_map[1].result(1.0) == {"new": True}
         finally:
             release.set()
-        with pytest.raises(concurrent.futures.CancelledError, match="stopped"):
-            task._future_map[0].result(1.0)
+        outcome = task._future_map[0].result(1.0)
+        assert isinstance(outcome, TaskFailure) and outcome.cancelled
+        assert "stopped" in outcome.error
         task.stop()
     assert attempts.count(0) == 1
 
@@ -775,8 +805,7 @@ def test_inline_failure_is_retained_and_notified():
     completed = threading.Event()
     task = FailingTask(max_result_count=1)
     task.set_completion_callback(completed.set)
-    with pytest.raises(ValueError, match="device rejected"):
-        task.invoke_async(0)
+    assert task.invoke_async(0)
     assert completed.is_set()
     response = task.peek_response(0)
     assert response.result_type is PeekResponseResultType.ErrorUnknown

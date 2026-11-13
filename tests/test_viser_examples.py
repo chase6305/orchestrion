@@ -423,12 +423,20 @@ class RobotStub:
         return True
 
 
-def test_viser_gripper_task_reports_result():
+@pytest.mark.parametrize("integer_subclass", [False, True])
+def test_viser_gripper_task_reports_result(integer_subclass):
+    class RequestId(int):
+        __hash__ = None
+
+        def __lt__(self, other):
+            raise RuntimeError("custom request ID comparison")
+
     robot = RobotStub()
     task = ViserGripperTask(robot)
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         task.initialize(executor=executor)
-        assert task.invoke_async(0, {"action": "close"})
+        request_id = RequestId(0) if integer_subclass else 0
+        assert task.invoke_async(request_id, {"action": "close"})
         deadline = time.monotonic() + 0.5
         while (
             task.peek_response(0).result_type
@@ -438,6 +446,7 @@ def test_viser_gripper_task_reports_result():
             time.sleep(0.005)
         response = task.peek_response(0)
     assert response.result_type is PeekResponseResultType.ResponseFound
+    assert type(response.content["request_id"]) is int
     assert response.content == {
         "request_id": 0,
         "action": "close",

@@ -28,6 +28,71 @@ async def reached(event):
     await asyncio.wait_for(event.wait(), 1)
 
 
+@pytest.mark.skipif(
+    not hasattr(asyncio, "eager_task_factory"), reason="requires eager task support"
+)
+@pytest.mark.parametrize("topology", ["wide", "chain"])
+@pytest.mark.parametrize("notification", ["ready", "timer"])
+def test_eager_action_bursts_allow_scheduled_cancellation_before_more_device_calls(
+    topology, notification
+):
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        previous_factory = loop.get_task_factory()
+        calls, accepted = [], []
+        count = 512
+
+        async def device(context, inputs):
+            calls.append(context.node_id)
+            if len(calls) == 1:
+                run = engine.get_run_by_key("burst")
+
+                def cancel():
+                    accepted.append(run.cancel())
+
+                if notification == "timer":
+                    loop.call_later(0, cancel)
+                else:
+                    loop.call_soon(cancel)
+
+        engine = WorkflowEngine(
+            [Action("device", device, (ResourceClaim("arm"),))],
+            [Resource("arm")],
+            max_concurrency=1,
+        )
+        try:
+            loop.set_task_factory(asyncio.eager_task_factory)
+            run = engine.submit(
+                Workflow(
+                    tuple(
+                        Node(
+                            str(index),
+                            "device",
+                            after=(
+                                (str(index - 1),)
+                                if topology == "chain" and index
+                                else ()
+                            ),
+                        )
+                        for index in range(count)
+                    )
+                ),
+                idempotency_key="burst",
+            )
+            result = await run.wait(2)
+            await asyncio.sleep(0)
+            assert accepted == [True]
+            assert 0 < len(calls) < count
+            assert result.status is RunStatus.CANCELLED
+            assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
+            assert engine.scheduler_snapshot()["running_actions"] == 0
+        finally:
+            loop.set_task_factory(previous_factory)
+            await engine.aclose(2)
+
+    asyncio.run(scenario())
+
+
 def test_workflow_budget_expires_while_waiting_for_another_runs_resource():
     async def scenario():
         entered, release = asyncio.Event(), asyncio.Event()
@@ -232,6 +297,39 @@ def test_delayed_timer_does_not_report_success_after_elapsed_budget(scope):
             result = await run.wait(1)
             assert result.nodes["stall"].status == NodeStatus.TIMED_OUT
             assert result.nodes["stall"].output == {"applied": True}
+
+    asyncio.run(scenario())
+
+
+def test_delayed_workflow_timer_expires_before_new_resource_reservations():
+    async def scenario():
+        calls = []
+
+        async def record(context, inputs):
+            calls.append(context.node_id)
+
+        async with WorkflowEngine(
+            [Action("record", record, (ResourceClaim("arm"),))], [Resource("arm")]
+        ) as engine:
+            run = engine.submit(
+                Workflow(
+                    (Node("first", "record"), Node("second", "record")), timeout=0.001
+                )
+            )
+            # The driver is ready before the due timer. Neither may run until the
+            # caller yields, after this deliberately elapsed workflow budget.
+            time.sleep(0.01)
+            result = await run.wait(1)
+            assert result.status is RunStatus.FAILED
+            assert all(
+                node.status is NodeStatus.TIMED_OUT for node in result.nodes.values()
+            )
+            assert all(node.started_at is None for node in result.nodes.values())
+            assert calls == []
+            assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
+            followup = engine.submit(Workflow((Node("next", "record"),)))
+            assert (await followup.wait(1)).status is RunStatus.SUCCEEDED
+            assert calls == ["next"]
 
     asyncio.run(scenario())
 

@@ -1,6 +1,8 @@
 """One event-loop-turn barrier for durable, atomic dispatch intent commits."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
+
+from orchestrion.utils.errors import exception_message
 
 from .journal import JournalError
 from .model import NodeResult
@@ -23,19 +25,20 @@ class DispatchBarrier:
         self._pending = []
         self._scheduled = False
 
-    async def commit(self, run: "WorkflowRun", result: NodeResult) -> None:
+    async def commit(self, run: "WorkflowRun", result: NodeResult) -> Optional[str]:
+        """Return a commit error rather than injecting exceptions into waiters."""
         future = self._engine._loop.create_future()
         entry = (run, result, future)
         self._pending.append(entry)
         if not self._scheduled:
             try:
                 self._engine._loop.call_soon(self._flush)
-            except BaseException:
+            except Exception as exc:
                 self._pending.remove(entry)
                 future.cancel()
-                raise
+                return "could not schedule dispatch commit: " + exception_message(exc)
             self._scheduled = True
-        await future
+        return await future
 
     def _flush(self) -> None:
         pending, self._pending = self._pending, []
@@ -68,7 +71,9 @@ class DispatchBarrier:
                 )
         except JournalError as exc:
             for _, _, future in entries:
-                future.set_exception(JournalError(str(exc)))
+                if not future.done():
+                    future.set_result(exception_message(exc))
         else:
             for _, _, future in entries:
-                future.set_result(None)
+                if not future.done():
+                    future.set_result(None)

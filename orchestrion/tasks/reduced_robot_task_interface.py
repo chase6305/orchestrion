@@ -1,7 +1,10 @@
+import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, List, Optional
 
+from orchestrion.utils.errors import exception_message
+from orchestrion.utils.logger import log_error
 from orchestrion.utils.numeric import is_finite_real
 
 
@@ -54,6 +57,15 @@ class ReducedRobotTaskInterface(ABC):
     def full_task(self):
         """Return this backend for legacy full-task callers."""
         return self
+
+    @staticmethod
+    def _copy_motion_input(value: Any) -> Any:
+        """Return None on copy failure so async submissions can reject atomically."""
+        try:
+            return copy.deepcopy(value)
+        except Exception as exc:
+            log_error("Motion input could not be copied: %s", exception_message(exc))
+            return None
 
     @staticmethod
     def _check_assigned_endpoint_index(

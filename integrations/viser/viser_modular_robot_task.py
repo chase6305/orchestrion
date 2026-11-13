@@ -4,7 +4,6 @@
 # All rights reserved.
 # ----------------------------------------------------------------------------
 
-import concurrent.futures
 import logging
 import math
 import threading
@@ -13,7 +12,12 @@ from typing import Dict, List, Optional
 import numpy as np
 from viser.extras import ViserUrdf
 
-from orchestrion.tasks.function_call_task import ThreadedPoolFunctionCallTask
+from orchestrion.tasks.function_call_task import (
+    CallResult,
+    TaskFailure,
+    ThreadedPoolFunctionCallTask,
+    _submission_request_id,
+)
 from orchestrion.tasks.modular_reduced_robot_task import (
     ModularReducedRobotTask,
     SubModuleTask,
@@ -94,6 +98,9 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
         self._finished_sequences = set()
 
     def invoke_async(self, request_id: int, content: Optional[Dict] = None) -> bool:
+        request_id = _submission_request_id(request_id)
+        if request_id is None:
+            return False
         # Reserve sequence numbers and submit atomically. Otherwise two concurrent
         # calls (or a duplicate ID) can overwrite a queued request's sequence.
         with self._submission_lock:
@@ -117,7 +124,7 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
                     self._finish_sequence_locked(sequence)
                 raise
 
-    def _call_fn(self, request_id: int, content: Optional[Dict] = None) -> Dict:
+    def _call_fn(self, request_id: int, content: Optional[Dict] = None) -> CallResult:
         with self._order_condition:
             sequence = self._request_sequences[request_id]
             self._order_condition.wait_for(
@@ -127,7 +134,7 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
         try:
             with self._lock:
                 if request_id in self._cancelled_requests:
-                    raise concurrent.futures.CancelledError("Gripper request cancelled")
+                    return TaskFailure("Gripper request cancelled", cancelled=True)
             return self._execute_call(request_id, content)
         finally:
             with self._order_condition:
@@ -144,9 +151,9 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
             self._next_running_sequence += 1
         self._order_condition.notify_all()
 
-    def _execute_call(self, request_id: int, content: Optional[Dict]) -> Dict:
+    def _execute_call(self, request_id: int, content: Optional[Dict]) -> CallResult:
         if not content:
-            raise ValueError("Gripper request requires content")
+            return TaskFailure("Gripper request requires content")
         action = content.get("action")
         if "position" in content:
             target = float(content["position"])
@@ -155,23 +162,23 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
         elif action == "close":
             target = self.CLOSED_POSITION
         else:
-            raise ValueError("Use action=open/close or provide position")
+            return TaskFailure("Use action=open/close or provide position")
         if not math.isfinite(target) or not (
             self.OPEN_POSITION <= target <= self.POSITION_LIMIT
         ):
-            raise ValueError(
+            return TaskFailure(
                 "Gripper position must be in [{}, {}]".format(
                     self.OPEN_POSITION, self.POSITION_LIMIT
                 )
             )
         speed = float(content.get("speed", 1.0))
         if not math.isfinite(speed) or speed <= 0:
-            raise ValueError("Gripper speed must be positive")
+            return TaskFailure("Gripper speed must be positive")
 
         current = self._robot_task.query_submodule_state("gripper").positions[0]
         timeout = float(content.get("timeout", abs(target - current) / speed + 2.0))
         if not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError("Gripper timeout must be positive")
+            return TaskFailure("Gripper timeout must be positive")
         # Rendering hundreds of configurations per second only adds WebSocket and
         # browser overhead. Keep the command speed stable when a demo uses a very
         # small robot scheduler interval for headless smoke tests.
@@ -182,23 +189,26 @@ class ViserGripperTask(ThreadedPoolFunctionCallTask):
         trajectory = [[float(value)] for value in np.linspace(current, target, steps)]
         with self._lock:
             if request_id in self._cancelled_requests:
-                raise concurrent.futures.CancelledError("Gripper request cancelled")
+                return TaskFailure("Gripper request cancelled", cancelled=True)
         move_id = self._robot_task.move_submodule_trajectory_async(
             "gripper", trajectory, interval=interval
         )
         if move_id < 0:
-            raise RuntimeError("Gripper trajectory was rejected")
+            return TaskFailure("Gripper trajectory was rejected")
         # Cancellation may arrive before the backend returns its move ID.
         with self._lock:
             self._request_move_ids[request_id] = move_id
             cancel_requested = request_id in self._cancelled_requests
         if cancel_requested:
             self._robot_task.cancel_submodule_move("gripper", move_id)
-            raise concurrent.futures.CancelledError("Gripper request cancelled")
+            return TaskFailure("Gripper request cancelled", cancelled=True)
         if not self._robot_task.wait_submodule_move("gripper", move_id, timeout):
+            with self._lock:
+                cancel_requested = request_id in self._cancelled_requests
             self._robot_task.cancel_submodule_move("gripper", move_id)
-            raise concurrent.futures.CancelledError(
-                "Gripper movement was cancelled or timed out"
+            return TaskFailure(
+                "Gripper movement was cancelled or timed out",
+                cancelled=cancel_requested,
             )
         return {
             "request_id": request_id,

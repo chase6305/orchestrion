@@ -168,9 +168,14 @@ ROS 2 Action 本身也区分取消中的状态和已取消的终态。接到取�
 当前适配器契约：
 
 - 正常返回：操作已经结束，结果是最终结果。
-- 普通异常：操作失败，并且适配器确认它不再执行。
-- `ActionCancelled`：清理结束，操作已经停止。
-- `ExecutionUncertain`：可能仍在执行，保留全部资源。
+- `return ActionOutcome.failed(message)`：操作失败，适配器确认它不再执行。
+- `return ActionOutcome.cancelled(message)`：清理结束，操作已经停止。
+- `return ActionOutcome.unknown(message)`：可能仍在执行，保留全部资源。
+
+异步适配器用返回值表达预期失败、取消和未知状态；引擎先完成状态与资源记账，
+再通过 logger 记录失败，日志处理器异常不会中断收尾。阻塞、远程票据和组合适配器
+遵循这一约定。为兼容已有适配器，执行边界仍接收普通异常、`ActionCancelled` 和
+`ExecutionUncertain`；同步配置校验和调用方等待超时仍保留异常契约。
 - 意外的 `asyncio.CancelledError`：也按未知处理，不能据此假定远端设备停止。
 
 引擎只通过 `ActionContext` 发出合作式取消，不直接 `Task.cancel()` 正常运行中的适配器。阻塞 SDK 的线程不能被 Python 可靠地停止，`BlockingAction` 会等待函数真正结束；函数必须等待设备完成，不能只发送命令后立即返回。它使用共享内存的 `ThreadPoolExecutor` 或事件循环默认线程池；SDK 包装器出队时再次检查线程安全的取消信号，已知取消的调用不会再进入 SDK。进程池任务需要单独的进程协议，不通过此线程适配器提交。

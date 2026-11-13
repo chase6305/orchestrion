@@ -3,10 +3,11 @@
 import concurrent.futures
 import threading
 import time
+import weakref
 
 import pytest
 
-from orchestrion import RetryPolicy
+from orchestrion import RetryPolicy, TaskFailure
 from orchestrion.tasks.function_call_task import CallableTask, InPlaceFunctionCallTask
 from orchestrion.tasks.polling_task import PollingTask
 from orchestrion.utils.logger import logger
@@ -18,17 +19,17 @@ class BrokenError(Exception):
         raise ValueError("formatter failed")
 
 
-def test_inline_failure_preserves_original_exception_and_records_response():
+def test_inline_failure_records_response_without_raising(caplog):
     class Task(InPlaceFunctionCallTask):
         def _call_fn(self, request_id, content):
             raise BrokenError()
 
     task = Task()
-    with pytest.raises(BrokenError):
-        task.invoke_async(1)
+    assert task.invoke_async(1)
     response = task.peek_response(1)
     assert response.result_type == PeekResponseResultType.ErrorUnknown
     assert "BrokenError" in response.error
+    assert response.error in caplog.text
 
 
 @pytest.mark.parametrize("max_attempts", [1, 2])
@@ -137,8 +138,11 @@ def test_invalid_poll_copy_preserves_cache_and_recovers(has_cached_sample):
             assert task.invoke_async(0)
             assert task.peek_response(0).content["sample"] == {"values": [1]}
         else:
-            with pytest.raises(RuntimeError, match="copied poll sample"):
-                task.invoke_async(0)
+            assert task.invoke_async(0)
+            assert (
+                task.peek_response(0).result_type is PeekResponseResultType.ErrorUnknown
+            )
+            assert "copied poll sample" in task.peek_response(0).error
 
         recover.set()
         assert recovered.wait(1)
@@ -152,7 +156,7 @@ def test_invalid_poll_copy_preserves_cache_and_recovers(has_cached_sample):
         task.stop()
 
 
-def test_failed_result_polling_logs_once_and_formats_once_per_read(caplog):
+def test_failed_result_polling_logs_and_formats_once(caplog):
     formatted = []
     completed = threading.Event()
 
@@ -177,7 +181,7 @@ def test_failed_result_polling_logs_once_and_formats_once_per_read(caplog):
             for _ in range(10):
                 response = task.peek_response(0)
                 assert response.error == "device rejected command"
-            assert len(formatted) == before + 10
+            assert len(formatted) == before == 1
             messages = [
                 record.getMessage() for record in caplog.records
                 if record.getMessage().startswith("Request 0 failed:")
@@ -206,5 +210,151 @@ def test_logging_failure_does_not_suppress_completion_notification(monkeypatch):
             assert completed.wait(1)
             assert task.peek_response(0).error == "device rejected command"
             assert task.peek_status()["failed"] == 1
+        finally:
+            task.stop()
+
+
+@pytest.mark.parametrize("threaded", [False, True])
+def test_returned_task_failure_is_retained_and_next_request_can_succeed(
+    threaded, caplog
+):
+    def call(request_id, content):
+        return TaskFailure("interlock open") if request_id == 0 else content
+
+    class InlineTask(InPlaceFunctionCallTask):
+        def _call_fn(self, request_id, content):
+            return call(request_id, content)
+
+    task = CallableTask(call) if threaded else InlineTask()
+    completed = threading.Event()
+    task.set_completion_callback(completed.set)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        try:
+            assert task.invoke_async(0)
+            assert completed.wait(1)
+            response = task.peek_response(0)
+            assert response.result_type is PeekResponseResultType.ErrorUnknown
+            assert response.error == "interlock open"
+            assert "Request 0 failed: interlock open" in caplog.text
+            if threaded:
+                assert task._future_map[0].exception(timeout=1) is None
+                assert task.peek_status()["failed"] == 1
+            completed.clear()
+            assert task.invoke_async(1, {"ok": True})
+            assert completed.wait(1)
+            assert task.peek_response(1).content == {"ok": True}
+        finally:
+            task.stop()
+
+
+def test_cooperative_cancellation_is_a_returned_outcome_without_retry():
+    completed = threading.Event()
+    calls = []
+
+    def call(request_id, content):
+        calls.append(request_id)
+        return TaskFailure("controller confirmed stop", cancelled=True)
+
+    task = CallableTask(call, retry_policy=RetryPolicy(max_attempts=3))
+    task.set_completion_callback(completed.set)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        try:
+            assert task.invoke_async(0)
+            assert completed.wait(1)
+            assert task._future_map[0].exception(timeout=1) is None
+            status = task.peek_status()
+            assert status["cancelled"] == 1
+            assert status["failed"] == status["pending"] == status["total_retries"] == 0
+            assert task.peek_response(0).error == "controller confirmed stop"
+            assert calls == [0]
+        finally:
+            task.stop()
+
+
+def test_inline_completion_and_logging_failures_do_not_escape(monkeypatch):
+    def broken(*args, **kwargs):
+        raise BrokenError()
+
+    class Task(InPlaceFunctionCallTask):
+        def _call_fn(self, request_id, content):
+            return TaskFailure("device offline")
+
+    task = Task()
+    task.set_completion_callback(broken)
+    monkeypatch.setattr(logger, "error", broken)
+    assert task.invoke_async(0)
+    assert task.peek_response(0).error == "device offline"
+    assert not task.invoke_async([])
+
+
+def test_polling_logs_changed_failures_once_and_logs_again_after_recovery(caplog):
+    samples = iter(
+        [
+            {},
+            ValueError("offline"),
+            ValueError("offline"),
+            ValueError("bad sample"),
+            {},
+            ValueError("offline"),
+        ]
+    )
+
+    def poll():
+        value = next(samples)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    task = PollingTask(poll, interval=0.001)
+    completed = threading.Event()
+    notifications = []
+
+    def next_poll():
+        notifications.append(True)
+        if len(notifications) == 6:
+            task._poll_stop.set()
+            completed.set()
+
+    task.set_completion_callback(next_poll)
+    task.initialize()
+    try:
+        assert completed.wait(1)
+    finally:
+        task.stop()
+    messages = [
+        r.getMessage() for r in caplog.records if "Device polling failed" in r.message
+    ]
+    assert messages == [
+        "Device polling failed: offline",
+        "Device polling failed: bad sample",
+        "Device polling failed: offline",
+    ]
+
+
+def test_completed_failure_does_not_retain_sdk_traceback_payload():
+    reclaimed, completed = threading.Event(), threading.Event()
+    references = []
+
+    class SDKPayload:
+        pass
+
+    def call(request_id, content):
+        payload = SDKPayload()
+        references.append(weakref.ref(payload, lambda ref: reclaimed.set()))
+        raise RuntimeError("SDK failed")
+
+    task = CallableTask(call)
+    task.set_completion_callback(completed.set)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        task.initialize(executor=executor)
+        try:
+            assert task.invoke_async(0)
+            assert completed.wait(1)
+            assert task.peek_response(0).error == "SDK failed"
+            assert task._future_map[0].exception(timeout=1) is None
+            assert reclaimed.wait(1)
+            assert references[0]() is None
         finally:
             task.stop()

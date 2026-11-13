@@ -1,18 +1,24 @@
 """Continuous resource ownership across the steps of a composite capability."""
 
 import asyncio
+import gc
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 
 import pytest
 
 from orchestrion.workflow import (
     Action,
+    ActionContext,
+    ActionOutcome,
     BlockingAction,
     ExecutionUncertain,
+    JournalInUse,
     Node,
     NodeStatus,
     OutputRef,
+    PayloadLimitError,
     Resource,
     ResourceClaim,
     RunStatus,
@@ -195,6 +201,81 @@ def test_scope_cancellation_retains_all_resources_until_inner_cleanup(uncertain)
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("depth", [1, 3])
+@pytest.mark.parametrize("durable", [False, True])
+def test_repeated_scope_task_cancellation_keeps_inner_cleanup_in_accounting(
+    depth, durable, tmp_path
+):
+    async def scenario():
+        entered, stopping, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def device(context, inputs):
+            entered.set()
+            await context.wait_cancelled()
+            stopping.set()
+            await release.wait()
+            return ActionOutcome.cancelled(context.cancel_reason)
+
+        scoped = Action("device", device, (ResourceClaim("arm"),))
+        for _ in range(depth):
+            scoped = workflow_action(
+                "scope",
+                Workflow((Node("device", scoped.name),)),
+                [scoped],
+                [Resource("arm")],
+            )
+        storage = SQLiteJournal(tmp_path / "scope.db") if durable else nullcontext(None)
+        with storage as journal:
+            async with WorkflowEngine(
+                [scoped], [Resource("arm")], stop_timeout=0.01, journal=journal
+            ) as engine:
+                run = engine.submit(Workflow((Node("scope", "scope"),)))
+                try:
+                    await asyncio.wait_for(entered.wait(), 1)
+                    worker = next(iter(engine._workers))
+                    worker.cancel()
+                    await asyncio.wait_for(stopping.wait(), 1)
+                    assert (await run.wait(1)).status == RunStatus.NEEDS_ATTENTION
+                    if journal is not None:
+                        with pytest.raises(asyncio.TimeoutError):
+                            await engine.aclose(0.001)
+                    for _ in range(3):
+                        worker.cancel()
+                        await asyncio.sleep(0)
+                        assert not worker.done()
+                        snapshot = engine.scheduler_snapshot()
+                        assert snapshot["draining_adapters"] == 1
+                        assert snapshot["running_actions"] == 1
+                        assert snapshot["resources"]["arm"]["used"] == 1
+                        with pytest.raises(RuntimeError, match="still draining"):
+                            engine.confirm_quiescent(
+                                run.operation_id("scope"),
+                                evidence="unconfirmed cleanup",
+                            )
+                        if journal is not None:
+                            with pytest.raises(JournalInUse, match="drain"):
+                                journal.close()
+                            record = journal.get_run(run.run_id)["nodes"][0]
+                            assert record["status"] == "unknown"
+                            assert record["lease_active"]
+                finally:
+                    release.set()
+                await asyncio.wait_for(asyncio.shield(worker), 1)
+                # The done callback runs after the task's last step.
+                await asyncio.sleep(0)
+                assert engine.scheduler_snapshot()["draining_adapters"] == 0
+                assert engine.scheduler_snapshot()["running_actions"] == 0
+                assert run.snapshot().nodes["scope"].status == NodeStatus.UNKNOWN
+                engine.confirm_quiescent(
+                    run.operation_id("scope"), evidence="all scoped handlers exited"
+                )
+                assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
+                if journal is not None:
+                    assert not journal.get_run(run.run_id)["nodes"][0]["lease_active"]
+
+    asyncio.run(scenario())
+
+
 def test_scope_failure_stops_siblings_and_exposes_diagnostics():
     async def scenario():
         async def bad(context, inputs):
@@ -217,6 +298,268 @@ def test_scope_failure_stops_siblings_and_exposes_diagnostics():
                 event.detail for event in run.events() if event.kind == "feedback"
             ]
             assert reports[-1]["scope_result"]["nodes"]["after"]["status"] == "skipped"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("threaded", [False, True])
+def test_completed_inner_context_does_not_mirror_late_feedback_into_an_active_scope(
+    threaded,
+):
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        contexts = []
+
+        async def first(context, inputs):
+            contexts.append(context)
+            context.report({"accepted": True})
+
+        async def hold(context, inputs):
+            entered.set()
+            await release.wait()
+
+        scoped = workflow_action(
+            "scope",
+            Workflow((Node("first", "first"), Node("hold", "hold", after=("first",)))),
+            [Action("first", first), Action("hold", hold)],
+        )
+        async with WorkflowEngine([scoped]) as engine:
+            run = engine.submit(Workflow((Node("scope", "scope"),)))
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                if threaded:
+                    producer = threading.Thread(
+                        target=lambda: contexts[0].report({"late": True})
+                    )
+                    producer.start()
+                    producer.join(1)
+                    assert not producer.is_alive()
+                    await asyncio.sleep(0)
+                else:
+                    contexts[0].report({"late": True})
+                feedback = [
+                    event.detail for event in run.events() if event.kind == "feedback"
+                ]
+                assert {
+                    "scope_node": "first",
+                    "feedback": {"accepted": True},
+                } in feedback
+                assert {
+                    "scope_node": "first",
+                    "feedback": {"late": True},
+                } not in feedback
+            finally:
+                release.set()
+            assert (await run.wait(1)).status is RunStatus.SUCCEEDED
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("durable", [False, True])
+def test_rejected_scope_checkpoint_does_not_poison_later_accepted_updates(
+    durable, tmp_path
+):
+    async def scenario():
+        rejected = []
+
+        async def update(context, inputs):
+            value = {"a": "x" * (28 * 1024), "b": "y" * (40 * 1024), "c": "ok"}[
+                context.node_id
+            ]
+            try:
+                context.checkpoint({"value": value})
+            except PayloadLimitError:
+                rejected.append(context.node_id)
+            return {"updated": context.node_id}
+
+        scoped = workflow_action(
+            "scope",
+            Workflow(
+                (
+                    Node("a", "update"),
+                    Node("b", "update", after=("a",)),
+                    Node("c", "update", after=("b",)),
+                )
+            ),
+            [Action("update", update)],
+        )
+        storage = SQLiteJournal(tmp_path / "scope.db") if durable else nullcontext(None)
+        with storage as journal:
+            async with WorkflowEngine([scoped], journal=journal) as engine:
+                run = engine.submit(Workflow((Node("scope", "scope"),)))
+                result = await run.wait(2)
+                assert result.status is RunStatus.SUCCEEDED
+                assert rejected == ["b"]
+                checkpoint = result.nodes["scope"].checkpoint
+                assert set(checkpoint["scope_nodes"]) == {"a", "c"}
+                assert checkpoint["scope_nodes"]["c"] == {"value": "ok"}
+                if journal is not None:
+                    assert (
+                        journal.get_run(run.run_id)["nodes"][0]["checkpoint"]
+                        == checkpoint
+                    )
+
+    asyncio.run(scenario())
+
+
+def test_inner_completion_during_sdk_snapshot_suppresses_the_late_outer_copy():
+    async def scenario():
+        copying, copied = threading.Event(), threading.Event()
+        entered, release = asyncio.Event(), asyncio.Event()
+        producers = []
+
+        class DelayedMapping(dict):
+            def items(self):
+                copying.set()
+                assert copied.wait(2)
+                return super().items()
+
+        async def first(context, inputs):
+            producer = threading.Thread(
+                target=lambda: context.report(DelayedMapping(late=True))
+            )
+            producers.append(producer)
+            producer.start()
+            assert copying.wait(1)
+
+        async def hold(context, inputs):
+            entered.set()
+            await release.wait()
+
+        scoped = workflow_action(
+            "scope",
+            Workflow((Node("first", "first"), Node("hold", "hold", after=("first",)))),
+            [Action("first", first), Action("hold", hold)],
+        )
+        async with WorkflowEngine([scoped]) as engine:
+            run = engine.submit(Workflow((Node("scope", "scope"),)))
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                copied.set()
+                producers[0].join(1)
+                assert not producers[0].is_alive()
+                await asyncio.sleep(0)
+                assert not any(
+                    event.kind == "feedback"
+                    and event.detail.get("feedback") == {"late": True}
+                    for event in run.events()
+                )
+            finally:
+                copied.set()
+                release.set()
+                for producer in producers:
+                    producer.join(1)
+            assert (await run.wait(1)).status is RunStatus.SUCCEEDED
+
+    asyncio.run(scenario())
+
+
+def test_completed_scope_releases_checkpoint_data_when_sdk_retains_context():
+    async def scenario():
+        released = threading.Event()
+        contexts = []
+
+        class Marker(str):
+            def __del__(self):
+                released.set()
+
+        async def update(context, inputs):
+            contexts.append(context)
+            context.checkpoint({"marker": Marker("completed scope checkpoint")})
+
+        scoped = workflow_action(
+            "scope", Workflow((Node("update", "update"),)), [Action("update", update)]
+        )
+        engine = WorkflowEngine([scoped])
+        async with engine:
+            run = engine.submit(Workflow((Node("scope", "scope"),)))
+            assert (await run.wait(1)).status is RunStatus.SUCCEEDED
+        del run, engine
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        gc.collect()
+        assert contexts
+        assert released.is_set()
+        with pytest.raises(RuntimeError, match="already completed"):
+            contexts[0].checkpoint({"late": True})
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("durable", [False, True])
+def test_scoped_checkpoint_preserves_the_first_captured_sdk_ticket(durable, tmp_path):
+    async def scenario():
+        captured = []
+
+        class Ticket(dict):
+            def items(self):
+                value = "accepted-ticket" if not captured else "changed-ticket"
+                captured.append(value)
+                return {"ticket": value}.items()
+
+        async def submit(context, inputs):
+            assert context.checkpoint(Ticket()) is None
+
+        scoped = workflow_action(
+            "scope", Workflow((Node("submit", "submit"),)), [Action("submit", submit)]
+        )
+        storage = SQLiteJournal(tmp_path / "scope.db") if durable else nullcontext(None)
+        with storage as journal:
+            async with WorkflowEngine([scoped], journal=journal) as engine:
+                run = engine.submit(Workflow((Node("scope", "scope"),)))
+                result = await run.wait(1)
+                assert result.status is RunStatus.SUCCEEDED
+                assert captured == ["accepted-ticket"]
+                expected = {"scope_nodes": {"submit": {"ticket": "accepted-ticket"}}}
+                assert result.nodes["scope"].checkpoint == expected
+                if journal is not None:
+                    assert (
+                        journal.get_run(run.run_id)["nodes"][0]["checkpoint"]
+                        == expected
+                    )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("threaded", [False, True])
+@pytest.mark.parametrize("depth", [1, 3])
+def test_scoped_feedback_reuses_the_successfully_captured_sdk_snapshot(threaded, depth):
+    async def scenario():
+        captures = []
+
+        class Feedback(dict):
+            def items(self):
+                captures.append(len(captures) + 1)
+                return {"sdk_capture": captures[-1]}.items()
+
+        async def device(context, inputs):
+            if threaded:
+                producer = threading.Thread(target=lambda: context.report(Feedback()))
+                producer.start()
+                producer.join(1)
+                assert not producer.is_alive()
+            else:
+                assert context.report(Feedback()) is None
+
+        action = Action("device", device)
+        for index in range(depth):
+            action = workflow_action(
+                "scope" + str(index), Workflow((Node("step", action.name),)), [action]
+            )
+        async with WorkflowEngine([action]) as engine:
+            run = engine.submit(Workflow((Node("scope", action.name),)))
+            assert (await run.wait(1)).status is RunStatus.SUCCEEDED
+            assert captures == [1]
+            received = []
+            for event in run.events():
+                if event.kind != "feedback":
+                    continue
+                detail = event.detail
+                while isinstance(detail, dict) and "feedback" in detail:
+                    detail = detail["feedback"]
+                if isinstance(detail, dict) and "sdk_capture" in detail:
+                    received.append(detail)
+            assert received == [{"sdk_capture": 1}]
 
     asyncio.run(scenario())
 
@@ -345,6 +688,104 @@ def test_small_feedback_budget_cannot_turn_uncertain_scope_into_released_failure
             run = engine.submit(Workflow((Node("scope", "scope"),)))
             assert (await run.wait(1)).status == RunStatus.NEEDS_ATTENTION
             assert engine.resource_snapshot()["resources"]["arm"]["used"] == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("depth", [1, 3])
+def test_scope_cancellation_reaches_nested_devices_before_returning(depth):
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        contexts, tokens = [], []
+
+        async def device(context, inputs):
+            contexts.append(context)
+            tokens.append(context._thread_cancellation())
+            entered.set()
+            await context.wait_cancelled()
+            await release.wait()
+            return ActionOutcome.cancelled(context.cancel_reason)
+
+        scoped = Action("device", device, (ResourceClaim("arm"),))
+        for _ in range(depth):
+            scoped = workflow_action(
+                "scope", Workflow((Node("device", scoped.name),)),
+                [scoped], [Resource("arm")],
+            )
+        async with WorkflowEngine([scoped], [Resource("arm")]) as engine:
+            try:
+                run = engine.submit(Workflow((Node("scope", "scope"),)))
+                await asyncio.wait_for(entered.wait(), 1)
+                run.cancel()
+                assert contexts[0].cancel_requested
+                assert tokens[0].is_set()
+                assert contexts[0].cancel_reason == "cancelled"
+                assert engine.resource_snapshot()["resources"]["arm"]["used"] == 1
+            finally:
+                release.set()
+            assert (await run.wait(1)).status == RunStatus.CANCELLED
+            assert engine.resource_snapshot()["resources"]["arm"]["used"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_scoped_context_propagates_internal_cancellation_to_its_delegate():
+    async def scenario():
+        observed = []
+
+        async def device(context, inputs):
+            token = context._thread_cancellation()
+            assert context._request_cancel("adapter_interrupted")
+            observed.append((context.cancel_requested, context.cancel_reason, token.is_set()))
+            return ActionOutcome.cancelled(context.cancel_reason)
+
+        scoped = workflow_action(
+            "scope", Workflow((Node("device", "device"),)), [Action("device", device)]
+        )
+        async with WorkflowEngine([scoped]) as engine:
+            run = engine.submit(Workflow((Node("scope", "scope"),)))
+            assert (await run.wait(1)).status == RunStatus.CANCELLED
+            assert observed == [(True, "adapter_interrupted", True)]
+
+    asyncio.run(scenario())
+
+
+def test_deep_scope_cancellation_callbacks_do_not_require_recursive_stack_growth():
+    async def scenario():
+        contexts = [ActionContext("run", str(i), lambda value: None) for i in range(1500)]
+        try:
+            for parent, child in zip(contexts, contexts[1:]):
+                parent._add_cancel_callback(lambda c=child: c._request_cancel("cancelled"))
+            contexts[0]._request_cancel("cancelled")
+            assert all(context.cancel_requested for context in contexts)
+        finally:
+            for context in contexts:
+                context._finish()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+def test_failed_cancellation_callback_does_not_skip_remaining_scope_notifications(
+    failure, caplog
+):
+    async def scenario():
+        parent = ActionContext("run", "parent", lambda feedback: None)
+        child = ActionContext("run", "child", lambda feedback: None)
+
+        def broken():
+            raise failure("scope cancellation callback interrupted")
+
+        try:
+            parent._add_cancel_callback(broken)
+            parent._add_cancel_callback(lambda: child._request_cancel("parent stopped"))
+            assert parent._request_cancel("cancelled")
+            assert child.cancel_requested and child.cancel_reason == "parent stopped"
+            assert "scope cancellation callback interrupted" in caplog.text
+            assert not parent._request_cancel("cancelled again")
+        finally:
+            parent._finish()
+            child._finish()
 
     asyncio.run(scenario())
 

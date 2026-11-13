@@ -4,7 +4,7 @@ from .request import RequestResult, RequestStatus, TimelineEvent
 from .retry import RetryPolicy
 from .schema import CommandValidationError, FieldSpec, RequestSchema
 from .task_pilot import TaskPilot
-from .tasks.function_call_task import CallableTask
+from .tasks.function_call_task import CallableTask, TaskFailure
 from .tasks.generic_task import GenericTask
 from .tasks.polling_task import PollingTask
 from .tasks.reduced_robot_task_interface import ReducedRobotTaskInterface
@@ -13,6 +13,7 @@ from .utils.logger import logger
 
 __all__ = [
     "TaskPilot",
+    "TaskFailure",
     "CallableTask",
     "CommandValidationError",
     "DeviceHealth",

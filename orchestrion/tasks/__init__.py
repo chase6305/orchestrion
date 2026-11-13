@@ -1,6 +1,7 @@
 from .function_call_task import (
     CallableTask,
     InPlaceFunctionCallTask,
+    TaskFailure,
     ThreadedPoolFunctionCallTask,
 )
 from .generic_task import GenericTask
@@ -18,6 +19,7 @@ __all__ = [
     "CallableTask",
     "InPlaceFunctionCallTask",
     "ThreadedPoolFunctionCallTask",
+    "TaskFailure",
     "ReducedRobotTaskInterface",
     "ModularReducedRobotTask",
     "PollingTask",

@@ -3,17 +3,22 @@
 import asyncio
 import copy
 import heapq
+import inspect
 import time
 import weakref
-from collections import deque
+from collections import OrderedDict, deque
 from contextvars import ContextVar
 from dataclasses import replace
 from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from orchestrion.schema import CommandValidationError
+from orchestrion.utils.errors import exception_description as _error_text
+from orchestrion.utils.errors import exception_message
+from orchestrion.utils.logger import log_error
 
 from .actions import Action, ActionContext
+from .async_tools import find_task_owner
 from .compiler import (
     CompiledNode,
     check_claims,
@@ -28,7 +33,7 @@ from .dispatch import DispatchBarrier
 from .journal import JournalError, SQLiteJournal
 from .model import (
     ActionCancelled,
-    ActionOutputError,
+    ActionOutcome,
     ExecutionUncertain,
     FailurePolicy,
     NodeStatus,
@@ -47,18 +52,12 @@ from .run import WorkflowRun
 # (-priority, sequence, run, node): descending priority, FIFO for ties.
 _ReadyEntry = Tuple[int, int, WorkflowRun, CompiledNode]
 
+# Limit one synchronous scheduling turn even when eager adapters finish inline.
+_DISPATCH_BATCH_SIZE = 128
+
 _current_execution: ContextVar = ContextVar(
     "orchestrion_workflow_execution", default=()
 )
-
-
-def _error_text(error: BaseException) -> str:
-    """A broken SDK exception formatter must not strand the scheduler."""
-    try:
-        message = str(error)
-    except Exception:
-        message = "exception message is unavailable"
-    return "{}: {}".format(type(error).__name__, message)
 
 
 class WorkflowEngine:
@@ -87,8 +86,7 @@ class WorkflowEngine:
         max_output_bytes_per_node: Optional[int] = None,
         max_feedback_bytes_per_report: Optional[int] = None,
     ) -> None:
-        _timeout(stop_timeout)
-        self._stop_timeout = stop_timeout
+        self._stop_timeout = _timeout(stop_timeout)
         self._stop_timers = {}
         self._draining = set()
         for label, limit in (
@@ -98,9 +96,21 @@ class WorkflowEngine:
         ):
             if limit is not None:
                 _positive_int(limit, label)
-        self._max_input_bytes = max_input_bytes_per_node
-        self._max_output_bytes = max_output_bytes_per_node
-        self._max_feedback_bytes = max_feedback_bytes_per_report
+        self._max_input_bytes = (
+            None
+            if max_input_bytes_per_node is None
+            else int.__int__(max_input_bytes_per_node)
+        )
+        self._max_output_bytes = (
+            None
+            if max_output_bytes_per_node is None
+            else int.__int__(max_output_bytes_per_node)
+        )
+        self._max_feedback_bytes = (
+            None
+            if max_feedback_bytes_per_report is None
+            else int.__int__(max_feedback_bytes_per_report)
+        )
         for label, value in (
             ("max_concurrency", max_concurrency),
             ("max_active_runs", max_active_runs),
@@ -131,17 +141,18 @@ class WorkflowEngine:
                 input_schema=copy.deepcopy(action.input_schema),
                 output_schema=copy.deepcopy(action.output_schema),
             )
-        self._max_concurrency = max_concurrency
-        self._max_active_runs = max_active_runs
-        self._max_nodes = max_nodes_per_run
-        self._max_events = max_events_per_run
-        self._max_idempotency_keys = max_idempotency_keys
-        self._max_pending_feedback = max_pending_feedback_per_action
+        self._max_concurrency = int.__int__(max_concurrency)
+        self._max_active_runs = int.__int__(max_active_runs)
+        self._max_nodes = int.__int__(max_nodes_per_run)
+        self._max_events = int.__int__(max_events_per_run)
+        self._max_idempotency_keys = int.__int__(max_idempotency_keys)
+        self._max_pending_feedback = int.__int__(max_pending_feedback_per_action)
         self._submissions: Dict[str, Tuple[str, WorkflowRun]] = {}
         self._used = dict.fromkeys(self._resources, 0)
         self._leases: Dict[str, Tuple[ResourceClaim, ...]] = {}
         self._quarantined: Dict[str, Tuple[WorkflowRun, str]] = {}
         self._runs: Dict[str, WorkflowRun] = {}
+        self._finished_runs: OrderedDict[str, WorkflowRun] = OrderedDict()
         self._workers = set()
         self._running_count = 0
         self._ready_sequence = 0
@@ -202,7 +213,7 @@ class WorkflowEngine:
             return
         try:
             getattr(self._journal, method)(*args)
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             self._journal_error = _error_text(exc)
             self._closed = True
             # Defer stop transitions until the current accounting update ends.
@@ -237,7 +248,31 @@ class WorkflowEngine:
     def _spawn(self, coroutine):
         try:
             return self._loop.create_task(coroutine)
-        except BaseException:
+        except BaseException as exc:
+            if isinstance(exc, (Exception, asyncio.CancelledError)):
+                owner = find_task_owner(coroutine)
+                completed = inspect.getcoroutinestate(coroutine) == inspect.CORO_CLOSED
+                if owner is not None or completed:
+                    # Instrumentation can fail after the task was created. Keep
+                    # that real owner in accounting instead of closing its frame.
+                    log_error(
+                        "Task factory failed after scheduling began: %s",
+                        _error_text(exc),
+                    )
+                    if isinstance(exc, asyncio.CancelledError):
+                        if owner is not None:
+                            owner.cancel()
+                        self._fail_scheduler(
+                            "CancelledError: task creation interrupted"
+                        )
+                    if owner is not None:
+                        return owner
+                    # Eager execution can finish before the factory throws. Its
+                    # frame has exited, but completion accounting must still run
+                    # (for example, to retire an expired stop budget's drainer).
+                    finished = self._loop.create_future()
+                    finished.set_result(None)
+                    return finished
             coroutine.close()
             raise
 
@@ -248,13 +283,18 @@ class WorkflowEngine:
         if not driver.cancelled() and exception is None and not self._runs:
             return
         if driver.cancelled():
-            self._driver_error = "CancelledError: workflow scheduler interrupted"
+            error = "CancelledError: workflow scheduler interrupted"
         elif exception is not None:
-            self._driver_error = _error_text(exception)
+            error = _error_text(exception)
         else:
-            self._driver_error = (
-                "RuntimeError: workflow scheduler exited with active runs"
-            )
+            error = "RuntimeError: workflow scheduler exited with active runs"
+        self._fail_scheduler(error)
+
+    def _fail_scheduler(self, error: str) -> None:
+        """Stop admission while independently owned actions finish their cleanup."""
+        if self._driver_error is not None:
+            return
+        self._driver_error = error
         self._closed = True
         for run in tuple(self._runs.values()):
             self._stop_run(run, "scheduler_failed")
@@ -276,6 +316,7 @@ class WorkflowEngine:
             if not run.done and run._unfinished == 0:
                 self._finish_run(run)
         self._clear_ready_queues()
+        log_error("Workflow scheduler failed: %s", error)
 
     def _check_driver(self) -> None:
         # Eager factories can enter adapters before the new driver is assigned.
@@ -286,6 +327,22 @@ class WorkflowEngine:
             and self._driver.done()
         ):
             self._driver_done(self._driver)
+
+    def _check_admission_open(self) -> None:
+        self._check_driver()
+        if self._closed:
+            raise RuntimeError("WorkflowEngine is closed")
+
+    def _check_active_run_capacity(self) -> None:
+        if len(self._runs) >= self._max_active_runs:
+            # Eager follow-ups can arrive before the scheduler's next turn.
+            self._finish_completed_runs()
+            # Retiring inputs can invoke SDK finalizers that close the engine.
+            self._check_admission_open()
+        if len(self._runs) >= self._max_active_runs:
+            raise RuntimeError(
+                "max_active_runs reached; wait for an active run to finish"
+            )
 
     def describe(self) -> Dict[str, Any]:
         """Return a side-effect-free capability catalog for planners and tooling."""
@@ -348,9 +405,7 @@ class WorkflowEngine:
         self._check_loop()
         # A completed task's callback may still be queued. Observe failure before
         # admitting another command or replacing the driver reference.
-        self._check_driver()
-        if self._closed:
-            raise RuntimeError("WorkflowEngine is closed")
+        self._check_admission_open()
         if idempotency_key is not None:
             _name(idempotency_key, "idempotency_key")
         compiled = None
@@ -363,6 +418,7 @@ class WorkflowEngine:
                 self._max_nodes,
                 self._max_input_bytes,
             )
+            self._check_admission_open()
             fingerprint = submission_fingerprint(workflow, compiled)
             retained = self._submissions.get(idempotency_key)
             if retained is not None:
@@ -375,10 +431,7 @@ class WorkflowEngine:
                 raise RuntimeError(
                     "max_idempotency_keys reached; explicitly prune completed keys"
                 )
-        if len(self._runs) >= self._max_active_runs:
-            raise RuntimeError(
-                "max_active_runs reached; wait for an active run to finish"
-            )
+        self._check_active_run_capacity()
         if compiled is None:
             compiled = compile_workflow(
                 workflow,
@@ -387,28 +440,48 @@ class WorkflowEngine:
                 self._max_nodes,
                 self._max_input_bytes,
             )
+            # A validator can invoke lifecycle APIs or submit follow-up work.
+            self._check_admission_open()
+            self._check_active_run_capacity()
         run = WorkflowRun(self, workflow, compiled, idempotency_key)
         self._record_journal("_admit", run, compiled, fingerprint, strict=True)
         self._runs[run.run_id] = run
         self._idle.clear()
         if idempotency_key is not None:
             self._submissions[idempotency_key] = (fingerprint, run)
-        for item in compiled:
-            if not item.dependencies:
-                self._make_ready(run, item)
         try:
+            for item in compiled:
+                if not item.dependencies:
+                    self._make_ready(run, item)
             if run._deadline is not None:
                 run._deadline_timer = self._loop.call_at(
                     run._deadline, self._expire_run, run
                 )
-            if self._driver is None or self._driver.done():
+            if not self._starting_driver and (
+                self._driver is None or self._driver.done()
+            ):
                 self._starting_driver = True
                 try:
                     self._driver = self._spawn(self._schedule())
                 finally:
                     self._starting_driver = False
                 self._driver.add_done_callback(self._driver_done)
-        except BaseException:
+        except BaseException as exc:
+            if isinstance(exc, (Exception, asyncio.CancelledError)) and (
+                run.done or run._contexts or run._unfinished < len(run._results)
+            ):
+                # An eager factory may run the driver before throwing. Existing
+                # reservations or results belong to an accepted operation; its
+                # key must not be reused while cleanup can still be active.
+                error = (
+                    "scheduler startup failed after work was reserved: "
+                    + _error_text(exc)
+                )
+                if self._runs:
+                    self._fail_scheduler(error)
+                else:
+                    log_error("%s", error)
+                return run
             self._stop_run(run, "scheduler_start_failed")
             self._finish_run(run)
             if idempotency_key is not None:
@@ -517,7 +590,7 @@ class WorkflowEngine:
         and must be reconciled externally even after this method returns.
         """
         self._check_loop()
-        _timeout(timeout)
+        timeout = _timeout(timeout)
         self._check_external_wait()
         self._check_driver()
         self._closed = True
@@ -569,20 +642,26 @@ class WorkflowEngine:
                 error=reason,
                 settlements=settlements,
             )
-        elif context._request_cancel(reason):
-            run._transition(node_id, NodeStatus.CANCELLING, error=reason)
-            budget = run._by_id[node_id].node.stop_timeout
-            if budget is None:
-                budget = self._stop_timeout
-            if budget is not None:
-                context._stop_deadline = self._loop.time() + budget
-                self._stop_timers[context.operation_id] = self._loop.call_at(
-                    context._stop_deadline,
-                    self._stop_confirmation_expired,
-                    run,
-                    node_id,
-                    context,
-                )
+        else:
+            context._request_cancel(reason)
+        self._wake.set()
+
+    def _context_cancelled(
+        self, run: WorkflowRun, node_id: str, context: ActionContext, reason: str
+    ) -> None:
+        """Arm the same stop budget for engine and adapter interruption requests."""
+        if run._results[node_id].status.terminal:
+            return
+        run._transition(node_id, NodeStatus.CANCELLING, error=reason)
+        budget = run._by_id[node_id].node.stop_timeout
+        if budget is None:
+            budget = self._stop_timeout
+        if budget is not None:
+            context._stop_deadline = self._loop.time() + budget
+            self._stop_timers[context.operation_id] = self._loop.call_at(
+                context._stop_deadline, self._stop_confirmation_expired,
+                run, node_id, context,
+            )
         self._wake.set()
 
     def _stop_confirmation_expired(
@@ -735,34 +814,42 @@ class WorkflowEngine:
             settlements.append(run._results[node_id])
         run._unfinished -= 1
         if not propagate:
+            if run._unfinished == 0:
+                self._finished_runs[run.run_id] = run
             if not deferred and settlements:
                 self._record_settlements(run, settlements)
             return
         completed = deque([node_id])
         # Visit affected graph edges once, rather than rescanning an entire DAG
         # after each completion. Iteration also supports very deep workflows.
-        while completed:
-            predecessor = completed.popleft()
-            succeeded = run._results[predecessor].status == NodeStatus.SUCCEEDED
-            for successor in run._successors[predecessor]:
-                if run._results[successor].status != NodeStatus.PENDING:
-                    continue
-                if succeeded:
-                    run._remaining_dependencies[successor] -= 1
-                    if run._remaining_dependencies[successor] == 0:
-                        self._make_ready(run, run._by_id[successor])
-                else:
-                    run._transition(
-                        successor,
-                        NodeStatus.SKIPPED,
-                        error="dependency did not succeed",
-                    )
-                    if self._journal is not None:
-                        settlements.append(run._results[successor])
-                    run._unfinished -= 1
-                    completed.append(successor)
-        if not deferred and settlements:
-            self._record_settlements(run, settlements)
+        try:
+            while completed:
+                predecessor = completed.popleft()
+                succeeded = run._results[predecessor].status == NodeStatus.SUCCEEDED
+                for successor in run._successors[predecessor]:
+                    if run._results[successor].status != NodeStatus.PENDING:
+                        continue
+                    if succeeded:
+                        run._remaining_dependencies[successor] -= 1
+                        if run._remaining_dependencies[successor] == 0:
+                            self._make_ready(run, run._by_id[successor])
+                    else:
+                        run._transition(
+                            successor,
+                            NodeStatus.SKIPPED,
+                            error="dependency did not succeed",
+                        )
+                        if self._journal is not None:
+                            settlements.append(run._results[successor])
+                        run._unfinished -= 1
+                        completed.append(successor)
+        finally:
+            # Confirmed outcomes must reach disk even if successor admission
+            # fails. Recovery must not see a finished run with running nodes.
+            if run._unfinished == 0:
+                self._finished_runs[run.run_id] = run
+            if not deferred and settlements:
+                self._record_settlements(run, settlements)
 
     def _record_settlements(self, run: WorkflowRun, results) -> None:
         if len(results) == 1:
@@ -771,6 +858,7 @@ class WorkflowEngine:
             self._record_journal("_settle_many", run.run_id, results)
 
     def _finish_run(self, run: WorkflowRun) -> None:
+        self._finished_runs.pop(run.run_id, None)
         if run._deadline_timer is not None:
             run._deadline_timer.cancel()
         statuses = {result.status for result in run._results.values()}
@@ -796,13 +884,35 @@ class WorkflowEngine:
         if not self._runs:
             self._idle.set()
 
+    def _finish_completed_runs(self) -> None:
+        """Retire terminal graphs without scanning unrelated running adapters."""
+        while self._finished_runs:
+            # Remove first: releasing SDK inputs can reenter admission and finish
+            # other queued graphs before this call resumes.
+            _, run = self._finished_runs.popitem(last=False)
+            self._finish_run(run)
+
     async def _schedule(self) -> None:
-        while self._runs:
-            self._wake.clear()
-            self._advance_scheduler()
-            if self._runs:
-                await self._wake.wait()
-        self._clear_ready_queues()
+        try:
+            while self._runs:
+                self._wake.clear()
+                dispatch_pending = self._advance_scheduler()
+                if self._runs:
+                    if dispatch_pending:
+                        # A set event does not yield. Allow callbacks and timers
+                        # to run before another eager dispatch batch.
+                        await asyncio.sleep(0)
+                    else:
+                        await self._wake.wait()
+            self._clear_ready_queues()
+        except (Exception, asyncio.CancelledError) as exc:
+            # Contain faults before an eager factory can discard the completed
+            # driver Task by raising its own instrumentation error.
+            self._fail_scheduler(
+                "CancelledError: workflow scheduler interrupted"
+                if isinstance(exc, asyncio.CancelledError)
+                else _error_text(exc)
+            )
 
     def _clear_ready_queues(self) -> None:
         """Release ready definitions without changing active workers or leases."""
@@ -811,23 +921,27 @@ class WorkflowEngine:
         for waiters in self._resource_waiters.values():
             waiters.clear()
 
-    def _advance_scheduler(self) -> None:
-        """Advance one turn without retaining dispatch locals across idle waits."""
-        for run in tuple(self._runs.values()):
-            self._check_run_deadline(run)
-            if run._unfinished == 0:
-                self._finish_run(run)
+    def _advance_scheduler(self) -> bool:
+        """Advance a bounded turn; report whether ready work needs another turn."""
+        self._finish_completed_runs()
 
         if self._journal_error is not None:
-            return
+            return False
 
         # Each resource exposes only its first eligible waiter. A single busy
         # arm with thousands of queued actions costs O(log N) per completion,
         # without repeatedly scanning the whole blocked backlog.
+        attempts = 0
         while self._ready_heap and self._running_count < self._max_concurrency:
+            if attempts == _DISPATCH_BATCH_SIZE:
+                return True
+            attempts += 1
             entry = heapq.heappop(self._ready_heap)
             self._ready_queued.discard(entry[1])
             _, _, run, item = entry
+            # Waiting graphs have their own timers. Check only this candidate
+            # before reserving anything, even if the loop delayed its timer.
+            self._check_run_deadline(run)
             if not self._is_ready(entry) or not self._can_start(entry):
                 continue
             node_id = item.node.node_id
@@ -845,6 +959,7 @@ class WorkflowEngine:
                 ),
             )
             run._contexts[node_id] = context
+            context._cancel_observer = partial(self._context_cancelled, run, node_id, context)
             self._leases[context.operation_id] = item.claims
             for claim in item.claims:
                 self._used[claim.resource] += claim.units
@@ -854,17 +969,28 @@ class WorkflowEngine:
             try:
                 worker = self._spawn(self._execute(run, item, context))
             except Exception as exc:
+                if run._results[node_id].status.terminal:
+                    log_error(
+                        "Task factory failed after action completion: %s",
+                        _error_text(exc),
+                    )
+                    continue
                 self._settle(
                     run,
                     item,
                     context,
-                    NodeStatus.FAILED,
+                    (
+                        NodeStatus.UNKNOWN
+                        if context._handler_started
+                        else NodeStatus.FAILED
+                    ),
                     error="could not start action: " + _error_text(exc),
                 )
             else:
                 self._workers.add(worker)
                 self._workers_drained.clear()
                 worker.add_done_callback(partial(self._worker_done, run, item, context))
+        return False
 
     def _worker_done(
         self,
@@ -879,11 +1005,22 @@ class WorkflowEngine:
         if context.operation_id in self._draining:
             self._draining.remove(context.operation_id)
             context._finish()
+            run._contexts.pop(item.node.node_id, None)
             self._running_count -= 1
             run._emit(item.node.node_id, "adapter_drained")
             self._wake.set()
         exception = None if worker.cancelled() else worker.exception()
         if run._results[item.node.node_id].status.terminal:
+            if exception is not None or worker.cancelled():
+                # The action outcome can be confirmed before successor admission
+                # fails. Preserve that outcome and stop the remaining scheduler
+                # work rather than leaving a graph waiting with no wake source.
+                error = (
+                    "CancelledError: action completion interrupted"
+                    if worker.cancelled()
+                    else "action completion failed: " + _error_text(exception)
+                )
+                self._fail_scheduler(error)
             return
         # A task cancelled before its coroutine starts cannot run its finally
         # block. No device was invoked in that case, so the reservation is free.
@@ -927,55 +1064,19 @@ class WorkflowEngine:
                     node_deadline, self._expire_node, run, node.node_id
                 )
             self._check_run_deadline(run)
-            context.raise_if_cancelled()
-            inputs = resolve_inputs(
-                node.inputs,
-                {key: run._results[key].output for key in item.dependencies},
-            )
-            if self._max_input_bytes is not None:
-                inputs = _snapshot(inputs, max_bytes=self._max_input_bytes)
-            action = self._actions[node.action]
-            if action.input_schema is not None:
-                inputs = action.input_schema.validate(inputs)
-                if not isinstance(inputs, dict):
-                    raise CommandValidationError(
-                        "validated action inputs must be a dictionary"
+            if context.cancel_requested:
+                status = NodeStatus.CANCELLED
+                error = context.cancel_reason
+            else:
+                outcome = await self._invoke_action(run, item, context, node_deadline)
+                if isinstance(outcome, ActionOutcome):
+                    status, output, error = (
+                        outcome.status,
+                        outcome.output,
+                        outcome.error,
                     )
-                # Schema copies or overrides can change the prepared payload.
-                inputs = _snapshot(inputs, max_bytes=self._max_input_bytes)
-            # Recheck after input preparation: a delayed event-loop timer must
-            # not allow a new device command to slip past an expired budget.
-            self._check_run_deadline(run)
-            if node_deadline is not None and self._loop.time() >= node_deadline:
-                self._expire_node(run, node.node_id)
-            context.raise_if_cancelled()
-            if self._journal is not None:
-                # Commit intent before effects; recheck the budget after fsync.
-                await self._dispatch_barrier.commit(run, run._results[node.node_id])
-                self._check_run_deadline(run)
-                if node_deadline is not None and self._loop.time() >= node_deadline:
-                    self._expire_node(run, node.node_id)
-                context.raise_if_cancelled()
-            context._handler_started = True
-            output = _snapshot(
-                await action.handler(context, inputs), max_bytes=self._max_output_bytes
-            )
-            if action.output_schema is not None:
-                # RequestSchema allows None as an empty command for legacy APIs;
-                # a declared object result requires an actual JSON object.
-                if not isinstance(output, dict):
-                    raise ActionOutputError("action output must be a dictionary")
-                try:
-                    validated_output = action.output_schema.validate(output)
-                except CommandValidationError as exc:
-                    raise ActionOutputError(str(exc)) from exc
-                # Retain only the final JSON copy after schema validation succeeds.
-                output = None
-                if not isinstance(validated_output, dict):
-                    raise ActionOutputError("action output must be a dictionary")
-                output = _snapshot(
-                    validated_output, max_bytes=self._max_output_bytes
-                )
+                else:
+                    output = outcome
         except ActionCancelled as exc:
             status = NodeStatus.CANCELLED
             error = _error_text(exc)
@@ -1005,20 +1106,102 @@ class WorkflowEngine:
             # A failing custom schema can mutate its diagnostic data.
             try:
                 output = _snapshot(output, max_bytes=self._max_output_bytes)
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 output = None
 
         # An adapter that monopolizes the loop can postpone timers; completion
         # still has to respect the elapsed budget. This cannot provide hard stop.
+        try:
+            self._check_run_deadline(run)
+            if node_deadline is not None and self._loop.time() >= node_deadline:
+                self._expire_node(run, node.node_id)
+            if (
+                context._stop_deadline is not None
+                and self._loop.time() >= context._stop_deadline
+            ):
+                self._stop_confirmation_expired(run, node.node_id, context)
+            self._settle(run, item, context, status, output=output, error=error)
+        except (Exception, asyncio.CancelledError) as exc:
+            # Keep accounting faults inside the owned coroutine. In particular,
+            # an eager factory can fail before returning its already-done Task.
+            error = (
+                "CancelledError: action completion interrupted"
+                if isinstance(exc, asyncio.CancelledError)
+                else "action completion failed: " + _error_text(exc)
+            )
+            self._fail_scheduler(error)
+
+    async def _invoke_action(
+        self,
+        run: WorkflowRun,
+        item: CompiledNode,
+        context: ActionContext,
+        node_deadline: Optional[float],
+    ) -> Any:
+        """Return expected validation/cancellation outcomes before final accounting."""
+        node = item.node
+        inputs = resolve_inputs(
+            node.inputs,
+            {key: run._results[key].output for key in item.dependencies},
+        )
+        if self._max_input_bytes is not None:
+            inputs = _snapshot(inputs, max_bytes=self._max_input_bytes)
+        action = self._actions[node.action]
+        if action.input_schema is not None:
+            inputs = action.input_schema.validate(inputs)
+            if not isinstance(inputs, dict):
+                return ActionOutcome.failed(
+                    "CommandValidationError: validated action inputs must be a dictionary"
+                )
+            inputs = _snapshot(inputs, max_bytes=self._max_input_bytes)
+        # Input preparation and durable fsync can delay the loop's timers.
         self._check_run_deadline(run)
         if node_deadline is not None and self._loop.time() >= node_deadline:
             self._expire_node(run, node.node_id)
-        if (
-            context._stop_deadline is not None
-            and self._loop.time() >= context._stop_deadline
-        ):
-            self._stop_confirmation_expired(run, node.node_id, context)
-        self._settle(run, item, context, status, output=output, error=error)
+        if context.cancel_requested:
+            return ActionOutcome.cancelled(context.cancel_reason)
+        if self._journal is not None:
+            commit_error = await self._dispatch_barrier.commit(
+                run, run._results[node.node_id]
+            )
+            if commit_error is not None:
+                return ActionOutcome.failed("JournalError: " + commit_error)
+            self._check_run_deadline(run)
+            if node_deadline is not None and self._loop.time() >= node_deadline:
+                self._expire_node(run, node.node_id)
+            if context.cancel_requested:
+                return ActionOutcome.cancelled(context.cancel_reason)
+        context._handler_started = True
+        result = await action.handler(context, inputs)
+        if isinstance(result, ActionOutcome):
+            if result.status != NodeStatus.SUCCEEDED:
+                return result
+            result = result.output
+        output = _snapshot(result, max_bytes=self._max_output_bytes)
+        if action.output_schema is not None:
+            if not isinstance(output, dict):
+                return ActionOutcome(
+                    NodeStatus.FAILED,
+                    output,
+                    "ActionOutputError: action output must be a dictionary",
+                )
+            try:
+                validated_output = action.output_schema.validate(output)
+            except Exception as exc:
+                error = (
+                    "ActionOutputError: " + exception_message(exc)
+                    if isinstance(exc, CommandValidationError)
+                    else _error_text(exc)
+                )
+                return ActionOutcome(NodeStatus.FAILED, output, error)
+            if not isinstance(validated_output, dict):
+                return ActionOutcome.failed(
+                    "ActionOutputError: action output must be a dictionary"
+                )
+            output = _snapshot(validated_output, max_bytes=self._max_output_bytes)
+        # Keep the ordinary success path allocation-free; explicit outcomes are
+        # needed only for failure, cancellation or uncertain device ownership.
+        return output
 
     def _settle(
         self,
@@ -1060,6 +1243,8 @@ class WorkflowEngine:
             error=error,
             feedback_dropped=feedback_dropped,
         )
+        if not draining:
+            run._contexts.pop(node.node_id, None)
         if (
             status
             in {
@@ -1077,3 +1262,5 @@ class WorkflowEngine:
         if self._driver_error is not None and run._unfinished == 0:
             self._finish_run(run)
         self._wake.set()
+        if status in (NodeStatus.FAILED, NodeStatus.UNKNOWN, NodeStatus.TIMED_OUT):
+            log_error("Operation %s %s: %s", context.operation_id, status.value, error)

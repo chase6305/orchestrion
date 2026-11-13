@@ -3,16 +3,32 @@
 import asyncio
 import inspect
 import threading
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Protocol, Tuple
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Tuple,
+)
 
 from orchestrion.schema import RequestSchema
+from orchestrion.utils.errors import exception_description
+from orchestrion.utils.logger import log_error
 
-from .feedback import FeedbackChannel
+from .feedback import FeedbackChannel, deliver_feedback
 from .model import (
     ActionCancelled,
+    ActionOutcome,
+    ExecutionUncertain,
     ResourceClaim,
     Workflow,
     _name,
@@ -21,6 +37,27 @@ from .model import (
     _snapshot,
     _timeout,
 )
+
+_cancellation_dispatch = threading.local()
+
+
+def _dispatch_cancellation(callbacks: Iterable[Callable[[], Any]]) -> None:
+    """Relay nested scope cancellation without recursive task/stack growth."""
+    pending = getattr(_cancellation_dispatch, "pending", None)
+    if pending is not None:
+        pending.extend(callbacks)
+        return
+    pending = deque(callbacks)
+    _cancellation_dispatch.pending = pending
+    try:
+        while pending:
+            callback = pending.popleft()
+            try:
+                callback()
+            except (Exception, asyncio.CancelledError) as exc:
+                log_error("Scope cancellation callback failed: %s", exception_description(exc))
+    finally:
+        _cancellation_dispatch.pending = None
 
 
 class ActionContext:
@@ -51,17 +88,22 @@ class ActionContext:
         self._cancel_reason: Optional[str] = None
         self._feedback = feedback
         self._feedback_overflow = feedback_overflow
-        self._feedback_limit = max_pending_feedback
+        self._feedback_limit = int.__int__(max_pending_feedback)
         if max_feedback_bytes is not None:
             _positive_int(max_feedback_bytes, "max_feedback_bytes")
-        self._max_feedback_bytes = max_feedback_bytes
+        self._max_feedback_bytes = (
+            None if max_feedback_bytes is None else int.__int__(max_feedback_bytes)
+        )
         self._checkpoint = checkpoint
         self._late_checkpoint = False
         self._feedback_lock = threading.Lock()
         self._feedback_channel: Optional[FeedbackChannel] = None
+        self._direct_feedback_dropped = 0
         self._active = True
         self._handler_started = False
         self._stop_deadline: Optional[float] = None
+        self._cancel_observer: Optional[Callable[[str], None]] = None
+        self._cancel_callbacks: Optional[List[Callable[[], Any]]] = None
 
     @property
     def run_id(self) -> str:
@@ -95,7 +137,7 @@ class ActionContext:
     async def sleep(self, delay: float) -> None:
         """An interruptible positive delay, useful for cooperative adapters."""
         self._check_loop()
-        _timeout(delay)
+        delay = _timeout(delay)
         if delay is None:
             raise ValueError("delay must be positive")
         self.raise_if_cancelled()
@@ -106,22 +148,36 @@ class ActionContext:
         self.raise_if_cancelled()
 
     def report(self, feedback: Any) -> None:
-        """Report small JSON; SDK-thread overflow drops oldest pending progress."""
+        """Report JSON; invalid or undeliverable optional progress logs and drops."""
+        self._report_feedback(feedback)
+
+    def _report_feedback(self, feedback: Any) -> Any:
+        """Report once and return captured JSON for enclosing scopes."""
         if not self._active:
             return
-        snapshot = _snapshot(feedback, max_bytes=self._max_feedback_bytes)
+        try:
+            snapshot = _snapshot(feedback, max_bytes=self._max_feedback_bytes)
+        except (Exception, asyncio.CancelledError) as exc:
+            with self._feedback_lock:
+                if not self._active:
+                    return
+                self._direct_feedback_dropped += 1
+            log_error("Workflow feedback was rejected: %s", exception_description(exc))
+            return
         try:
             current_loop = asyncio.get_running_loop()
         except RuntimeError:
             current_loop = None
         if current_loop is self._loop:
             if self._active:
-                self._feedback(snapshot)
-            return
+                if not deliver_feedback(self._feedback, snapshot):
+                    with self._feedback_lock:
+                        self._direct_feedback_dropped += 1
+            return snapshot
         channel = self._feedback_channel
         if channel is not None:
             channel.post(snapshot)
-            return
+            return snapshot
         with self._feedback_lock:
             if not self._active:
                 return
@@ -134,6 +190,7 @@ class ActionContext:
                 )
             channel = self._feedback_channel
         channel.post(snapshot)
+        return snapshot
 
     def checkpoint(self, data: Any) -> None:
         """Record small recovery metadata on the event loop before continuing I/O.
@@ -145,6 +202,10 @@ class ActionContext:
         A still-draining adapter may record a late ticket after a stop deadline;
         this does not change UNKNOWN or release its resources.
         """
+        self._record_checkpoint(data)
+
+    def _record_checkpoint(self, data: Any) -> Any:
+        """Record once and return the owned snapshot for enclosing scopes."""
         if not self._active and not self._late_checkpoint:
             raise RuntimeError("ActionContext has already completed")
         if asyncio.get_running_loop() is not self._loop:
@@ -154,6 +215,7 @@ class ActionContext:
         snapshot = _snapshot(data, max_bytes=65536)
         if self._checkpoint is not None:
             self._checkpoint(snapshot)
+        return snapshot
 
     def _check_loop(self) -> None:
         if not self._active:
@@ -163,18 +225,27 @@ class ActionContext:
 
     def _finish(self, *, draining: bool = False) -> int:
         with self._feedback_lock:
+            retired = (self._feedback, self._feedback_overflow, self._cancel_observer, self._cancel_callbacks)
             self._active = False
             self._feedback = self._feedback_overflow = None
+            self._cancel_observer = None
+            self._cancel_callbacks = None
             self._late_checkpoint = draining
             if not draining:
+                retired += (self._checkpoint,)
                 self._checkpoint = None
             channel = self._feedback_channel
-        return 0 if channel is None else channel.close()
+            direct_drops = self._direct_feedback_dropped
+        del retired
+        return direct_drops + (0 if channel is None else channel.close())
 
     def _feedback_snapshot(self) -> Dict[str, int]:
         with self._feedback_lock:
             channel = self._feedback_channel
-        return {"pending": 0, "dropped": 0} if channel is None else channel.snapshot()
+            direct_drops = self._direct_feedback_dropped
+        snapshot = {"pending": 0, "dropped": 0} if channel is None else channel.snapshot()
+        snapshot["dropped"] += direct_drops
+        return snapshot
 
     def _thread_cancellation(self) -> threading.Event:
         self._check_loop()
@@ -188,10 +259,33 @@ class ActionContext:
         if self.cancel_requested:
             return False
         self._cancel_reason = reason
-        if self._cancel_token is not None:
-            self._cancel_token.set()
-        self._cancelled.set()
+        callbacks, self._cancel_callbacks = self._cancel_callbacks, None
+        try:
+            if self._cancel_token is not None:
+                self._cancel_token.set()
+            self._cancelled.set()
+            if self._cancel_observer is not None:
+                self._cancel_observer(reason)
+        finally:
+            if callbacks:
+                _dispatch_cancellation(callbacks)
         return True
+
+    def _add_cancel_callback(self, callback: Callable[[], Any]) -> None:
+        if self.cancel_requested:
+            _dispatch_cancellation((callback,))
+            return
+        self._check_loop()
+        if self._cancel_callbacks is None:
+            self._cancel_callbacks = []
+        self._cancel_callbacks.append(callback)
+
+    def _remove_cancel_callback(self, callback: Callable[[], Any]) -> None:
+        callbacks = self._cancel_callbacks
+        if callbacks is not None and callback in callbacks:
+            callbacks.remove(callback)
+            if not callbacks:
+                self._cancel_callbacks = None
 
 
 ActionHandler = Callable[[ActionContext, Dict[str, Any]], Awaitable[Any]]
@@ -201,8 +295,10 @@ ActionHandler = Callable[[ActionContext, Dict[str, Any]], Awaitable[Any]]
 class Action:
     """A bound capability with mandatory resource claims and an async handler.
 
-    Ordinary exceptions assert the operation has stopped. Network ambiguity must
-    use ExecutionUncertain. Do not return an acceptance ticket as a final result.
+    Return ActionOutcome for explicit failure, cancellation or uncertain device
+    state; the engine logs failures and quarantines UNKNOWN resources. Legacy
+    exceptions are still contained at the execution boundary. Do not return an
+    acceptance ticket as a final result.
     """
 
     name: str
@@ -259,11 +355,15 @@ class BlockingAction:
         self._executor = executor
 
     async def __call__(self, context: ActionContext, inputs: Dict[str, Any]) -> Any:
-        context.raise_if_cancelled()
         cancellation = context._thread_cancellation()
-        future = asyncio.get_running_loop().run_in_executor(
-            self._executor, partial(self._invoke, context, cancellation, inputs)
-        )
+        if cancellation.is_set():
+            return ActionOutcome.cancelled(context.cancel_reason)
+        try:
+            future = asyncio.get_running_loop().run_in_executor(
+                self._executor, partial(self._invoke, context, cancellation, inputs)
+            )
+        except Exception as exc:
+            return ActionOutcome.failed(exception_description(exc))
         future.add_done_callback(self._observe_completion)
         # Unexpected coroutine cancellation becomes UNKNOWN in the engine; the
         # worker is not cancelled and its device resources remain quarantined.
@@ -274,10 +374,20 @@ class BlockingAction:
                 # Executor shutdown can cancel a queued callable before it starts.
                 # Shielding keeps cancellation of this adapter from marking the
                 # underlying future cancelled, so this is a quiescence proof.
-                raise ActionCancelled(
+                return ActionOutcome.cancelled(
                     "executor cancelled the SDK call before start"
-                ) from None
-            raise
+                )
+            context._request_cancel("adapter_interrupted")
+            # Keep the SDK wait in engine accounting until the worker exits.
+            # Repeated cancellation must not detach a still-running device call.
+            while not future.done():
+                try:
+                    await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    continue
+            return ActionOutcome.unknown(
+                "CancelledError: blocking action wait interrupted"
+            )
 
     @staticmethod
     def _observe_completion(future: asyncio.Future) -> None:
@@ -297,8 +407,15 @@ class BlockingAction:
         # thread-safe token prevents a known cancellation from becoming device I/O
         # when that wrapper eventually gets a worker. Already started calls drain.
         if cancellation.is_set():
-            raise ActionCancelled(context.cancel_reason)
-        return self._function(inputs)
+            return ActionOutcome.cancelled(context.cancel_reason)
+        try:
+            return self._function(inputs)
+        except ActionCancelled as exc:
+            return ActionOutcome.cancelled(exception_description(exc))
+        except ExecutionUncertain as exc:
+            return ActionOutcome.unknown(exception_description(exc))
+        except Exception as exc:
+            return ActionOutcome.failed(exception_description(exc))
 
 
 class Planner(Protocol):
