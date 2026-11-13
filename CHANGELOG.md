@@ -63,6 +63,25 @@
   Avoid waiting on the lifecycle lock when an inline callback initializes a pilot
   that an external caller is stopping and joining.
 
+- Reject numeric overflow and underflow before native waits: schema bounds
+  report unrepresentable values as validation errors, retry policies describe
+  fractional settings as JSON numbers, positive timing intervals that round to
+  zero are refused without consuming motion IDs, and native numbers take a fast
+  path through trajectory and schema checks.
+- Release pilot request payloads outside state locks. Pruning forgets threaded
+  responses once their futures drain, cancellation keeps SDK inputs alive until
+  the lock releases, and shutdown drops each input before reacquiring the lock.
+  Completion scans skip services without running requests.
+- Clean up gripper requests at future completion, making concurrent queued
+  cancellation idempotent. Validate cancellation IDs, cap precomputed animation
+  points, derive default timeouts from the final sample hold and scheduler ticks,
+  and cancel motion with request context when a wait fails. Uncancelled gripper
+  timeouts stay failed results.
+- Serialize Viser frame updates and replay capture. Index long recordings without
+  timestamp copies, keep replay timestamps in append order, roll back failed
+  viewer startup, finish monitor updates before the final frame and advertise the
+  actual listening port.
+
 - Reduce JSON snapshot overhead with direct string encoding and one-pass
   dictionary copying. Count actual copied entries and ignore custom string lengths
   when enforcing workflow payload budgets.
